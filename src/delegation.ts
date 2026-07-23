@@ -401,3 +401,129 @@ export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Pr
     },
   };
 }
+
+// --- Multi-owner sequential execution (ADR 0006, 0009, 0008, 0083) -----------
+
+/**
+ * One owner's slot in a multi-owner sequence. `delegated` ran to a terminal
+ * checkpoint (any of the four statuses, agent-called or synthesized);
+ * `build_failed` never spawned (a required source was missing or the bundle was
+ * oversized); `not_run` was queued behind an owner that did not complete, or was
+ * skipped because the parent cancelled before it started.
+ */
+export type SequenceStep =
+  | { kind: "delegated"; outcome: DelegationOutcome }
+  | {
+      kind: "build_failed";
+      owner: string;
+      targets: string[];
+      failureKind: "unknown_owner" | "required_missing" | "oversized";
+      diagnostics: string[];
+      warnings: InjectionWarning[];
+    }
+  | {
+      kind: "not_run";
+      owner: string;
+      targets: string[];
+      reason: "sequence_stopped" | "cancelled";
+    };
+
+/**
+ * The aggregate outcome of a multi-owner delegation sequence. A route plan is
+ * intended to succeed as a whole (ADR 0009), but the pi MVP edits in place with
+ * no transactional promotion or rollback (ADR 0077) — git is the safety net. So
+ * the honest degradation is stop-on-first-non-completed: {@link stepCompleted}
+ * gates each owner, and the moment one is not `completed` (a `needs_scope`
+ * that must return to the steward for re-resolution per ADR 0008, a `blocked`,
+ * a `failed`, a synthesized failure, or a pre-spawn build failure) the remaining
+ * owners are left `not_run` rather than applying more in-place edits behind a
+ * plan already known to be failing. This minimizes blast radius while keeping
+ * the completed owners' work (already written in place) reported and intact.
+ */
+export interface SequenceOutcome {
+  /** Per-owner results in the resolver's execution order (owner id ascending). */
+  steps: SequenceStep[];
+  /** True only when every owner ran and returned a `completed` checkpoint. */
+  allCompleted: boolean;
+  /** The first owner that did not complete (or was not run), if any. */
+  stoppedAt?: string;
+  /** True when parent cancellation cut the sequence short (ADR 0083). */
+  cancelled: boolean;
+}
+
+/** A step counts as completed only when its session returned status `completed`. */
+export function stepCompleted(step: SequenceStep): boolean {
+  return step.kind === "delegated" && step.outcome.checkpoint.status === "completed";
+}
+
+/**
+ * Run an ordered list of per-owner delegations sequentially (ADR 0006, 0077):
+ * each delegation runs only after the previous one terminates — never
+ * interleaved. Stops on the first owner that does not `complete` (see
+ * {@link SequenceOutcome}); parent cancellation aborts the in-flight session via
+ * {@link runDelegation}'s existing seam and leaves every later owner `not_run`
+ * (ADR 0083). Each delegation compiles and runs under its OWN grant carried on
+ * its {@link DelegationInputs}; this function never merges or mutates grants, so
+ * one owner's authority cannot leak into another's.
+ */
+export async function runDelegationSequence(
+  ordered: DelegationInputs[],
+  deps: RunDeps,
+): Promise<SequenceOutcome> {
+  const steps: SequenceStep[] = [];
+  let stopped = false;
+  let stoppedAt: string | undefined;
+  let cancelled = false;
+
+  const markStopped = (owner: string): void => {
+    stopped = true;
+    if (stoppedAt === undefined) stoppedAt = owner;
+  };
+
+  for (const inputs of ordered) {
+    if (stopped) {
+      steps.push({
+        kind: "not_run",
+        owner: inputs.owner,
+        targets: inputs.targets,
+        reason: cancelled ? "cancelled" : "sequence_stopped",
+      });
+      continue;
+    }
+    // Parent cancelled before this owner started: do not spawn it at all.
+    if (deps.signal?.aborted) {
+      cancelled = true;
+      markStopped(inputs.owner);
+      steps.push({ kind: "not_run", owner: inputs.owner, targets: inputs.targets, reason: "cancelled" });
+      continue;
+    }
+
+    const result = await runDelegation(inputs, deps);
+    // A cancellation observed during this delegation (its session was aborted and
+    // it ended with a synthesized failure) marks the whole sequence cancelled.
+    if (deps.signal?.aborted) cancelled = true;
+
+    if (!result.ok) {
+      steps.push({
+        kind: "build_failed",
+        owner: inputs.owner,
+        targets: inputs.targets,
+        failureKind: result.kind,
+        diagnostics: result.diagnostics,
+        warnings: result.warnings,
+      });
+      markStopped(inputs.owner);
+      continue;
+    }
+
+    steps.push({ kind: "delegated", outcome: result.outcome });
+    if (result.outcome.checkpoint.status !== "completed") markStopped(inputs.owner);
+  }
+
+  return {
+    steps,
+    allCompleted: steps.length > 0 && steps.every(stepCompleted),
+    stoppedAt,
+    cancelled,
+  };
+}

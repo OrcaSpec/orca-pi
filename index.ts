@@ -40,10 +40,11 @@ import type { DelegationSession, DelegationSessionConfig } from "./src/delegatio
 import { createRealSessionFactory } from "./src/session-runner";
 
 /**
- * Orca for pi — Phase 5: steward governance of the parent session (ADR 0080).
+ * Orca for pi — steward governance of the parent session (ADR 0080), plus the
+ * full delegation lifecycle behind `orca_delegate` (Phases 6–7).
  *
  * Phases 2–4 established the four repository states and the pure resolver behind
- * `orca_resolve` / `orca_explain`. This phase governs the parent session as the
+ * `orca_resolve` / `orca_explain`. This module governs the parent session as the
  * repository steward while — and only while — the repository is `active`:
  *
  * - **Write governance** (`tool_call` on `write`/`edit`): the steward has no
@@ -62,8 +63,9 @@ import { createRealSessionFactory } from "./src/session-runner";
  * - **Steward identity**: `before_agent_start` appends a root-first trusted
  *   system-prompt block (`steward.ts`) — role, mode, discovery scope, delegation
  *   directive, four-state context — appended to pi's own prompt, never replacing it.
- * - **Tool surface**: the steward gains `orca_delegate` (Phase 5 stub). The parent
- *   session never receives `orca_checkpoint`.
+ * - **Tool surface**: the steward gains `orca_delegate` (full lifecycle — statuses,
+ *   scope expansion, multi-owner splits, unowned handling, cancellation). The
+ *   parent session never receives `orca_checkpoint`.
  *
  * Governance activates ONLY in the `active` state; unmanaged and blocked
  * repositories see zero interception (every handler returns early), preserving
@@ -332,6 +334,24 @@ export default function orcaPi(pi: ExtensionAPI): void {
         routeLog.record(
           `delegated ${entry.owner}: ${entry.status}, ${entry.changedPaths.length} changed path(s)`,
         ),
+      // Unowned-target delegation events (ADR 0012): blocked in enforce, flagged
+      // in advisory. Recorded so /orca shows the lifecycle event (Phase 8 polishes UX).
+      onUnowned: (paths, mode, verdict) => {
+        const display = paths.join(", ");
+        violations.record({
+          verdict,
+          tool: "orca_delegate",
+          path: display,
+          owner: null,
+          mode,
+          reason:
+            verdict === "blocked"
+              ? `Delegation blocked: no domain agent owns ${display}. Unowned writes fail closed in enforce mode (ADR 0012).`
+              : `Delegation proceeded without ${display}: no domain agent owns these paths — advisory unmanaged work (ADR 0012).`,
+          timestamp: Date.now(),
+        });
+        routeLog.record(`unowned ${verdict} (${mode}): ${display}`);
+      },
     }),
   );
 }

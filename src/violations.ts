@@ -11,10 +11,17 @@ import type { GovernedTool } from "./governance";
  * human-facing trail alongside the per-call notifications.
  */
 
+/**
+ * The tool a governance event is attributed to: a governed parent tool, or
+ * `orca_delegate` when an unowned-target delegation is blocked (enforce) or
+ * flagged (advisory) per ADR 0012.
+ */
+export type ViolationTool = GovernedTool | "orca_delegate";
+
 /** One recorded governance event. `blocked` withheld the call; `flagged` let it proceed. */
 export interface ViolationRecord {
   verdict: "blocked" | "flagged";
-  tool: GovernedTool;
+  tool: ViolationTool;
   /** Display path (the raw call target, `(cwd)` for a pathless discovery call). */
   path: string;
   /** Owning agent for an owned-scope write, else null. */

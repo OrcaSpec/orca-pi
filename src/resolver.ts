@@ -90,12 +90,31 @@ function deny(scope: { deny?: string[] } | undefined): string[] {
 }
 
 /**
+ * Deep-freeze a compiled grant and its scope arrays so it is a true immutable
+ * record (ADR 0008: a live delegation grant is never broadened *or* mutated).
+ * Freezing is structural, not conventional: a delegation record holds a frozen
+ * grant, so no code path — not the resolver, the run loop, or the scope-expansion
+ * loop — can widen an existing grant in place. Scope expansion must compile a
+ * FRESH grant via a new {@link resolve} call; it cannot edit this one.
+ */
+export function freezeGrant(grant: CompiledGrant): CompiledGrant {
+  Object.freeze(grant.read.allow);
+  Object.freeze(grant.read.deny);
+  Object.freeze(grant.read);
+  Object.freeze(grant.write.allow);
+  Object.freeze(grant.write.deny);
+  Object.freeze(grant.write);
+  return Object.freeze(grant);
+}
+
+/**
  * Compile an agent's effective authority: edit-expanded ownership ∩ declared
  * permissions, minus agent denies and repository protected denies (ADR 0005,
  * 0015, 0033). `edit` contributes to both read and write; read and write stay
  * independent; every list is sorted and de-duplicated. The grant reflects the
  * agent's full authority and does not depend on which targets a delegation
- * carries.
+ * carries. The returned grant is deep-frozen (ADR 0008): it is an immutable
+ * authority record, never widened after compilation.
  */
 export function compileGrant(
   agent: DomainAgent,
@@ -105,7 +124,7 @@ export function compileGrant(
   const editAllow = allow(permissions.edit);
   const editDeny = deny(permissions.edit);
 
-  return {
+  return freezeGrant({
     read: {
       allow: sortUnique([...allow(permissions.read), ...editAllow]),
       deny: sortUnique([...deny(permissions.read), ...editDeny, ...(protectedDenies.read ?? [])]),
@@ -114,7 +133,7 @@ export function compileGrant(
       allow: sortUnique([...allow(permissions.write), ...editAllow]),
       deny: sortUnique([...deny(permissions.write), ...editDeny, ...(protectedDenies.write ?? [])]),
     },
-  };
+  });
 }
 
 interface OwnerSelection {

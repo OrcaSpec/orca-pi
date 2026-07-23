@@ -10,13 +10,17 @@ import { normalizeTarget } from "./paths";
 import { resolve, type Resolution } from "./resolver";
 import { renderExplain, renderResolvePreview, summarizeResolution } from "./render";
 import { formatStatusLines, type ActiveState, type RepositoryState } from "./state";
+import type { OperatingMode } from "./mode";
+import type { CheckpointStatus } from "./checkpoint";
 import {
-  runDelegation,
+  runDelegationSequence,
+  stepCompleted,
   type DelegationEntry,
   type DelegationInputs,
   type DelegationOutcome,
   type DelegationSession,
   type DelegationSessionConfig,
+  type SequenceOutcome,
 } from "./delegation";
 
 /**
@@ -55,9 +59,11 @@ export type ResolveToolDetails =
   | { kind: "inactive"; state: RepositoryState["kind"] }
   | { kind: "invalid"; rejections: { input: string; reason: string }[] }
   | { kind: "empty" }
-  | { kind: "phase7_pending"; resolution: Resolution }
   | { kind: "delegation"; outcome: DelegationOutcome }
-  | { kind: "delegation_failed"; failureKind: DelegationFailureKind; diagnostics: string[] };
+  | { kind: "delegation_failed"; failureKind: DelegationFailureKind; diagnostics: string[] }
+  | { kind: "delegation_sequence"; sequence: SequenceOutcome; unmanaged: string[]; mode: OperatingMode }
+  | { kind: "unowned_blocked"; unownedPaths: string[]; resolution: Resolution }
+  | { kind: "all_unmanaged"; unownedPaths: string[] };
 
 type ToolOutcome =
   | { kind: "resolution"; resolution: Resolution }
@@ -220,55 +226,86 @@ export interface DelegateDeps extends ToolDeps {
   getThinkingLevel: () => ThinkingLevel;
   /** Spawn a delegated session from an assembled config (the run-loop seam). */
   createSession: (config: DelegationSessionConfig) => Promise<DelegationSession>;
-  /** Record a completed delegation entry (Phase 8 renders/persists it). */
+  /** Record a delegation entry as it terminates (Phase 8 renders/persists it). */
   onDelegation?: (entry: DelegationEntry) => void;
+  /**
+   * Record an unowned-target delegation event (ADR 0012): `blocked` when enforce
+   * mode fails the delegation pre-spawn, `flagged` when advisory mode proceeds
+   * with the owned subset and leaves the unowned paths as unmanaged work.
+   */
+  onUnowned?: (paths: string[], mode: OperatingMode, verdict: "blocked" | "flagged") => void;
 }
 
-/** The Phase-7-pending explanation: single-owner-only executes this phase. */
-function phase7PendingResult(resolution: Resolution): AgentToolResult<ResolveToolDetails> {
-  const reasons: string[] = [];
-  if (resolution.delegations.length !== 1) {
-    reasons.push(
-      `it resolves to ${resolution.delegations.length} owner(s), and Phase 6 executes only a single-owner ` +
-        "delegation (multi-owner tasks split into sequential per-owner delegations in Phase 7)",
-    );
-  }
-  if (resolution.unownedPaths.length > 0) {
-    reasons.push(
-      `it includes unowned target(s) (${resolution.unownedPaths.join(", ")}), whose enforce/advisory ` +
-        "handling lands in Phase 7",
-    );
-  }
-  const body = [
-    "Orca delegate did not execute: " + reasons.join("; ") + ".",
-    "The resolved routing is shown below for preview; no session was spawned and no file was changed.",
-    "",
-    renderResolvePreview(resolution),
-  ].join("\n");
-  return text(body, { kind: "phase7_pending", resolution });
+/** The observed-manifest line shared by every checkpoint rendering. */
+function manifestLine(paths: string[]): string {
+  return paths.length > 0
+    ? `Observed changed paths (${paths.length}): ${paths.join(", ")}`
+    : "Observed changed paths: (none).";
 }
 
-function delegationResult(outcome: DelegationOutcome): AgentToolResult<ResolveToolDetails> {
-  const cp = outcome.checkpoint;
-  const lines = [
-    `Orca delegation to '${outcome.owner}' ended: ${cp.status}` +
-      (cp.synthesized ? " (synthesized — the session ended without calling orca_checkpoint)" : "") +
-      ".",
-    `Summary: ${cp.summary}`,
-    cp.changedPaths.length > 0
-      ? `Observed changed paths (${cp.changedPaths.length}): ${cp.changedPaths.join(", ")}`
-      : "Observed changed paths: (none).",
+/**
+ * Render how the steward re-delegates after a `needs_scope` outcome (ADR 0008).
+ * The point of the loop is a FRESH delegation with a re-resolved, separately
+ * compiled grant — never widening the paused one — so the guidance names the
+ * requested paths and the concrete combined path set to pass back to
+ * orca_delegate, which re-runs resolution.
+ */
+function scopeExpansionGuidance(outcome: DelegationOutcome): string[] {
+  const requested = outcome.checkpoint.scopeRequest ?? [];
+  if (requested.length === 0) {
+    return [
+      "The agent reported needs_scope without concrete paths. Get the specific paths it needs, then " +
+        "call orca_delegate again; Orca re-resolves ownership and issues a fresh, separately-scoped " +
+        "delegation. The paused grant is never widened (ADR 0008).",
+    ];
+  }
+  const combined = [...new Set([...outcome.targets, ...requested])].sort();
+  return [
+    `Scope requested (outside the '${outcome.owner}' grant): ${requested.join(", ")}`,
+    "To continue, call orca_delegate again with the combined target paths so Orca RE-RESOLVES ownership " +
+      "and compiles a FRESH grant for a fresh session; the original grant is never broadened (ADR 0008).",
+    `Suggested combined paths: ${combined.join(", ")}`,
   ];
-  if (cp.scopeRequest && cp.scopeRequest.length > 0) {
-    lines.push(`Scope requested: ${cp.scopeRequest.join(", ")}`);
+}
+
+/**
+ * The status-specific body for one delegated outcome, shared by the single-owner
+ * result and each per-owner block of a sequence. Each of the four terminal
+ * statuses reads distinctly and actionably: `needs_scope` shows the scope request
+ * and the re-delegation recipe; `blocked`/`failed` lead with the summary and any
+ * remaining risks alongside the manifest of whatever was already changed.
+ */
+function checkpointBody(outcome: DelegationOutcome): string[] {
+  const cp = outcome.checkpoint;
+  const synth = cp.synthesized
+    ? " (synthesized — the session ended without calling orca_checkpoint)"
+    : "";
+  const headline: Record<CheckpointStatus, string> = {
+    completed: `Status: completed${synth} — the assignment finished within the grant.`,
+    needs_scope: `Status: needs_scope${synth} — the agent needs paths outside its grant to finish.`,
+    blocked: `Status: blocked${synth} — the agent could not proceed.`,
+    failed: `Status: failed${synth}.`,
+  };
+  const lines = [headline[cp.status], `Summary: ${cp.summary}`, manifestLine(cp.changedPaths)];
+  if (cp.status === "needs_scope") lines.push(...scopeExpansionGuidance(outcome));
+  if (cp.remainingRisks && cp.remainingRisks.length > 0) {
+    lines.push("Remaining risks:");
+    for (const risk of cp.remainingRisks) lines.push(`  - ${risk}`);
   }
   if (outcome.warnings.length > 0) {
     lines.push("Warnings:");
     for (const warning of outcome.warnings) lines.push(`  - ${warning.path}: ${warning.reason}`);
   }
-  return text(lines.join("\n"), { kind: "delegation", outcome });
+  return lines;
 }
 
+/** Single-owner (no unowned paths) result — the simplest, most common case. */
+function delegationResult(outcome: DelegationOutcome): AgentToolResult<ResolveToolDetails> {
+  const body = [`Orca delegation to '${outcome.owner}' ended.`, ...checkpointBody(outcome)].join("\n");
+  return text(body, { kind: "delegation", outcome });
+}
+
+/** Single-owner pre-spawn build failure (required source missing / oversized). */
 function delegationFailedResult(
   failureKind: DelegationFailureKind,
   diagnostics: string[],
@@ -285,15 +322,122 @@ function delegationFailedResult(
   return text(lines.join("\n"), { kind: "delegation_failed", failureKind, diagnostics });
 }
 
+/** Enforce-mode unowned targets: fail the whole delegation pre-spawn (ADR 0012). */
+function unownedBlockedResult(resolution: Resolution): AgentToolResult<ResolveToolDetails> {
+  const owned = resolution.delegations.map((delegation) => delegation.owner);
+  const lines = [
+    "Orca delegation was blocked before spawning any session (enforce mode): the target set includes " +
+      `path(s) that no domain agent owns: ${resolution.unownedPaths.join(", ")}.`,
+    "Unowned writes fail closed in enforce mode (ADR 0012). Add an ownership scope to .orca/orca.yaml " +
+      "for these paths, or drop them from the delegation, then retry.",
+  ];
+  if (owned.length > 0) {
+    lines.push(
+      `The owned portion (${owned.join(", ")}) was NOT delegated either — the whole call is rejected so ` +
+        "no partial plan runs behind an unresolved ownership gap.",
+    );
+  }
+  return text(lines.join("\n"), {
+    kind: "unowned_blocked",
+    unownedPaths: resolution.unownedPaths,
+    resolution,
+  });
+}
+
+/** Advisory-mode call whose targets are all unowned: nothing to delegate (ADR 0012). */
+function allUnmanagedResult(resolution: Resolution): AgentToolResult<ResolveToolDetails> {
+  const body = [
+    "Orca did not delegate: no target routes to a domain agent, so there is no owned work to run.",
+    `Unmanaged targets (advisory): ${resolution.unownedPaths.join(", ")}.`,
+    "In advisory mode these are your responsibility under existing authority; they were recorded as an " +
+      "advisory policy violation and NOT delegated (ADR 0012). Add ownership scopes to route them.",
+  ].join("\n");
+  return text(body, { kind: "all_unmanaged", unownedPaths: resolution.unownedPaths });
+}
+
 /**
- * `orca_delegate` — Phase 6: run one single-owner delegation end-to-end. It
- * resolves the target paths, and when they route to exactly one owner with no
- * unowned paths it assembles a grant-compiled in-process session (parent model +
- * thinking level, injected instructions/context, operator handoff) and runs it
- * to a terminal checkpoint, returning the status, summary, and observed changed
- * paths. Multi-owner splits and unowned-path handling are Phase 7, so those
- * cases return a Phase-7-pending explanation rather than half-executing. Only the
- * steward has this tool; delegated sessions never do (they get orca_checkpoint).
+ * The aggregate result for a multi-owner sequence (and any owned+unowned advisory
+ * mix). Reports the per-owner status, the completed/not-run split, the early-stop
+ * reason, and — when a step needs scope — the re-delegation recipe. Unowned paths
+ * are called out as unmanaged advisory work at the end.
+ */
+function delegationSequenceResult(
+  sequence: SequenceOutcome,
+  unmanaged: string[],
+  mode: OperatingMode,
+): AgentToolResult<ResolveToolDetails> {
+  const total = sequence.steps.length;
+  const completed = sequence.steps.filter(stepCompleted).length;
+  const notRun = sequence.steps.filter((step) => step.kind === "not_run").length;
+
+  const lines: string[] = [
+    `Orca delegation sequence: ${total} owner(s) resolved, executed sequentially in owner-id order.`,
+  ];
+  if (sequence.allCompleted) {
+    lines.push(`Outcome: all ${total} owner(s) completed.`);
+  } else if (sequence.cancelled) {
+    lines.push(
+      `Outcome: cancelled — ${completed} completed, ${notRun} not run` +
+        (sequence.stoppedAt ? ` (stopped at '${sequence.stoppedAt}').` : "."),
+    );
+  } else {
+    lines.push(
+      `Outcome: stopped at '${sequence.stoppedAt}' — ${completed} completed, ${notRun} not run. ` +
+        "Later owners were not started: the plan stops on the first non-completed status because " +
+        "in-place editing has no transactional rollback (ADR 0009/0077).",
+    );
+  }
+
+  let index = 0;
+  for (const step of sequence.steps) {
+    index += 1;
+    if (step.kind === "delegated") {
+      lines.push("", `${index}. ${step.outcome.owner}:`);
+      for (const line of checkpointBody(step.outcome)) lines.push(`   ${line}`);
+    } else if (step.kind === "build_failed") {
+      lines.push("", `${index}. ${step.owner}: build failed (${step.failureKind}) — not spawned.`);
+      for (const diagnostic of step.diagnostics) lines.push(`   - ${diagnostic}`);
+    } else {
+      const why =
+        step.reason === "cancelled"
+          ? "not run — parent cancellation"
+          : "not run — the sequence stopped before this owner";
+      lines.push("", `${index}. ${step.owner}: ${why} (re-delegate once the earlier outcome is resolved).`);
+    }
+  }
+
+  if (unmanaged.length > 0) {
+    lines.push(
+      "",
+      `Unmanaged targets (advisory): ${unmanaged.join(", ")}.`,
+      "No agent owns these; Orca did not delegate them. In advisory mode they proceed only under your " +
+        "existing authority and were recorded as an advisory policy violation (ADR 0012).",
+    );
+  }
+
+  return text(lines.join("\n"), { kind: "delegation_sequence", sequence, unmanaged, mode });
+}
+
+/**
+ * `orca_delegate` — the full delegation lifecycle (Phase 7). It resolves the
+ * target paths to their structural owners and:
+ *
+ * - splits a multi-owner task into one delegation per owner and runs them
+ *   SEQUENTIALLY in the resolver's owner-id order, each under its own frozen
+ *   grant, stopping the sequence on the first owner that does not `complete`
+ *   (ADR 0006, 0009, 0077 — in-place editing has no rollback);
+ * - handles unowned targets by mode (ADR 0012): enforce fails the whole
+ *   delegation pre-spawn with the unowned paths named; advisory proceeds with the
+ *   owned subset and marks the unowned paths as unmanaged advisory work;
+ * - surfaces each of the four terminal checkpoint statuses distinctly, with the
+ *   scope-expansion recipe for `needs_scope` (re-delegate with the combined paths
+ *   so a FRESH grant is compiled; the paused grant is never widened, ADR 0008);
+ * - propagates parent cancellation to the in-flight session and leaves queued
+ *   owners unrun (ADR 0083).
+ *
+ * Assignment is always structural — the tool takes task + target paths, never an
+ * agent id (ADR 0081). Only the steward has this tool; delegated sessions get
+ * orca_checkpoint instead.
  */
 export function createDelegateTool(
   deps: DelegateDeps,
@@ -302,13 +446,14 @@ export function createDelegateTool(
     name: "orca_delegate",
     label: "Orca delegate",
     description:
-      "Delegate writable work to the structurally determined owner of the given target paths. Pass " +
-      "the task plus concrete repository-relative paths (never an agent id); Orca resolves the owner " +
-      "and runs the work as a scoped in-process session whose read/write/edit tools enforce that " +
+      "Delegate writable work to the structurally determined owner(s) of the given target paths. Pass " +
+      "the task plus concrete repository-relative paths (never an agent id); Orca resolves ownership " +
+      "and runs the work as scoped in-process session(s) whose read/write/edit tools enforce each " +
       "agent's grant, ending in a structured checkpoint with an observed changed-path manifest. " +
-      "This phase executes single-owner delegations; multi-owner and unowned-path handling is Phase 7.",
+      "Multi-owner tasks run as sequential per-owner delegations; unowned targets fail the delegation " +
+      "in enforce mode and are reported as unmanaged work in advisory mode.",
     promptSnippet:
-      "orca_delegate — route writable work to its owner by target paths and run it under that grant.",
+      "orca_delegate — route writable work to its owner(s) by target paths and run under each grant.",
     parameters: delegateParamsSchema,
     async execute(
       _toolCallId: string,
@@ -329,32 +474,57 @@ export function createDelegateTool(
         case "resolution": {
           const { resolution } = outcome;
           deps.onRoute?.(resolution);
+          const active = state as ActiveState;
+          const mode = active.effectiveMode;
 
-          // Phase 6 executes the single-owner happy path only (ADR 0081; multi-owner
-          // split + unowned handling are Phase 7).
-          if (resolution.delegations.length !== 1 || resolution.unownedPaths.length > 0) {
-            return phase7PendingResult(resolution);
+          // Unowned targets (ADR 0012). Enforce fails the whole delegation before
+          // spawning anything; advisory proceeds with the owned subset and marks
+          // the rest unmanaged. Either way the event is recorded.
+          if (resolution.unownedPaths.length > 0 && mode === "enforce") {
+            deps.onUnowned?.(resolution.unownedPaths, mode, "blocked");
+            return unownedBlockedResult(resolution);
+          }
+          const unmanaged = resolution.unownedPaths;
+          if (unmanaged.length > 0) deps.onUnowned?.(unmanaged, mode, "flagged");
+
+          if (resolution.delegations.length === 0) {
+            // Advisory only (enforce already returned): nothing routes to an owner.
+            return allUnmanagedResult(resolution);
           }
 
-          const active = state as ActiveState;
-          const delegation = resolution.delegations[0];
-          const inputs: DelegationInputs = {
+          // One delegation per owner in the resolver's owner-id order, each with
+          // its own compiled (frozen) grant; run them sequentially (ADR 0006, 0077).
+          const parent = { model: ctx.model, thinkingLevel: deps.getThinkingLevel() };
+          const ordered: DelegationInputs[] = resolution.delegations.map((delegation) => ({
             document: active.document,
             owner: delegation.owner,
             targets: delegation.targets,
             grant: delegation.grant,
             task: params.task,
-            effectiveMode: active.effectiveMode,
+            effectiveMode: mode,
             cwd: ctx.cwd,
-            parent: { model: ctx.model, thinkingLevel: deps.getThinkingLevel() },
-          };
+            parent,
+          }));
 
-          const result = await runDelegation(inputs, { createSession: deps.createSession, signal });
-          if (!result.ok) {
-            return delegationFailedResult(result.kind, result.diagnostics, result.warnings);
+          const sequence = await runDelegationSequence(ordered, {
+            createSession: deps.createSession,
+            signal,
+          });
+          for (const step of sequence.steps) {
+            if (step.kind === "delegated") deps.onDelegation?.(step.outcome.appendEntry);
           }
-          deps.onDelegation?.(result.outcome.appendEntry);
-          return delegationResult(result.outcome);
+
+          // A single owner with no unowned paths keeps the direct single-owner
+          // result shape; everything else renders as an aggregate sequence.
+          if (unmanaged.length === 0 && ordered.length === 1) {
+            const step = sequence.steps[0];
+            if (step.kind === "delegated") return delegationResult(step.outcome);
+            if (step.kind === "build_failed") {
+              return delegationFailedResult(step.failureKind, step.diagnostics, step.warnings);
+            }
+            // not_run (cancelled before start) falls through to the aggregate render.
+          }
+          return delegationSequenceResult(sequence, unmanaged, mode);
         }
       }
     },

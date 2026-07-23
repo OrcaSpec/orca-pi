@@ -376,26 +376,27 @@ describe("steward governance handlers", () => {
     expect(registered.tools.has("orca_checkpoint")).toBe(false);
   });
 
-  it("orca_delegate defers a multi-owner task to Phase 7 without spawning or writing", async () => {
+  it("orca_delegate fails an unowned target in enforce mode before spawning (no session, no writes)", async () => {
     const { pi, registered } = makeApi();
     orcaPi(pi as never);
-    writeSpec("multi-owner");
-    // Two owners (web + billing) => not the single-owner happy path; returns the
-    // Phase-7-pending explanation without constructing a session (no network).
+    writeSpec("multi-owner"); // minimum_mode: enforce
+    // An unowned target fails the whole delegation pre-spawn (ADR 0012), so no
+    // session is ever constructed and the real (network-bound) factory is never
+    // reached — a deterministic, offline assertion through the real extension.
     const result = await registered.tools.get("orca_delegate")!.execute(
       "d1",
-      { task: "restyle the button and touch billing", paths: ["apps/web/app.tsx", "services/billing/x.rb"] },
+      { task: "restyle the button and touch a script", paths: ["apps/web/app.tsx", "scripts/deploy.sh"] },
       undefined,
       undefined,
       { cwd: dir },
     );
     const body = result.content.map((c) => c.text).join("\n");
-    expect(body).toContain("Phase 7");
-    expect(body).toContain("owner");
-    expect(result.details?.kind).toBe("phase7_pending");
-    // No side effect: neither planned target was created.
+    expect(body).toContain("scripts/deploy.sh");
+    expect(body).toContain("enforce mode");
+    expect(result.details?.kind).toBe("unowned_blocked");
+    // No side effect: neither the owned nor the unowned target was created.
     expect(existsSync(join(dir, "apps", "web", "app.tsx"))).toBe(false);
-    expect(existsSync(join(dir, "services", "billing", "x.rb"))).toBe(false);
+    expect(existsSync(join(dir, "scripts", "deploy.sh"))).toBe(false);
   });
 
   // --- Reload idempotency --------------------------------------------------
