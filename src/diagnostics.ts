@@ -22,8 +22,9 @@ export type DiagnosticPhase = "yaml" | "structural" | "semantic";
  *   `duplicate_agent_id`, `ownership_conflict`.
  * - `yaml.*` codes are the restricted-YAML profile this loader enforces per
  *   ADR 0025 (aliases, anchors, custom tags, merge keys, duplicate keys, and
- *   multiple documents). OrcaSpec ships no fixtures for YAML-profile violations,
- *   so these codes are orca-pi-local (recorded as a non-blocking spec-gap).
+ *   multiple documents). These are the normative `yaml`-phase codes OrcaSpec
+ *   defines (>= 0.1.1); the `fixtures/invalid/yaml-*.orca.yaml` fixtures assert
+ *   them, and their `pointer` is `""` (document root), matched here.
  */
 export interface Diagnostic {
   phase: DiagnosticPhase;

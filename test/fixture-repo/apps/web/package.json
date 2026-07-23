@@ -1,0 +1,8 @@
+{
+  "name": "@orca-dogfood/web",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "@orca-dogfood/billing": "workspace:*"
+  }
+}

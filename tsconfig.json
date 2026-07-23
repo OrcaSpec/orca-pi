@@ -13,5 +13,7 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["index.ts", "src/**/*.ts", "test/**/*.ts"]
+  "include": ["index.ts", "src/**/*.ts", "test/**/*.ts"],
+  "//": "test/fixture-repo is materialized test data (a mini monorepo of its own), not orca-pi source — it is not part of this project's compilation.",
+  "exclude": ["node_modules", "test/fixture-repo"]
 }

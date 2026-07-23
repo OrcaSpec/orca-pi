@@ -1,0 +1,10 @@
+{
+  "name": "orca-dogfood",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A small real TypeScript monorepo used to dogfood Orca for pi.",
+  "workspaces": [
+    "apps/*",
+    "services/*"
+  ]
+}

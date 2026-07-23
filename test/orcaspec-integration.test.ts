@@ -8,9 +8,10 @@ describe("orcaspec dependency integration", () => {
     expect(orcaspec.SPEC_VERSION).toBe("0.1");
   });
 
-  it("exposes 8 valid and 11 invalid fixtures", () => {
+  it("exposes 8 valid and 17 invalid fixtures", () => {
     expect(orcaspec.listValidFixtures()).toHaveLength(8);
-    expect(orcaspec.listInvalidFixtures()).toHaveLength(11);
+    // 11 structural/semantic + 6 restricted-YAML profile fixtures (orcaspec 0.1.1).
+    expect(orcaspec.listInvalidFixtures()).toHaveLength(17);
   });
 
   it("loads the 0.1 JSON Schema as draft 2020-12", () => {
@@ -38,7 +39,7 @@ describe("orcaspec dependency integration", () => {
       const expected = orcaspec.loadExpected(name);
       expect(expected.valid).toBe(false);
       expect(expected.reason).toBeTruthy();
-      expect(["structural", "semantic"]).toContain(expected.phase);
+      expect(["yaml", "structural", "semantic"]).toContain(expected.phase);
     }
   });
 

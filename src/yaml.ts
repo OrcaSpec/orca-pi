@@ -24,7 +24,11 @@ export type YamlResult =
   | { ok: false; diagnostics: Diagnostic[] };
 
 function yamlDiag(reason: string, message: string): Diagnostic {
-  return { phase: "yaml", reason, message };
+  // A restricted-YAML violation is a property of the whole document, not of a
+  // single parsed node (some, like multiple-documents, have no single node at
+  // all), so it is anchored at the document root (`""`). This matches the
+  // `pointer: ""` OrcaSpec's yaml-phase fixtures carry (orcaspec >= 0.1.1).
+  return { phase: "yaml", reason, message, pointer: "" };
 }
 
 /** Read `anchor`/`tag` off any node without depending on the exact node union. */

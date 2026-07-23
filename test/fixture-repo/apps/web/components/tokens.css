@@ -1,0 +1,6 @@
+/* Design tokens. Owned by `design-system`. */
+.ds-button {
+  border-radius: 6px;
+  padding: 8px 14px;
+  font: inherit;
+}

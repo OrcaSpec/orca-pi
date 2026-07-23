@@ -38,7 +38,8 @@ describe("invalid fixtures are rejected with the annotated diagnostic", () => {
   const invalid = orcaspec.listInvalidFixtures();
 
   it("covers the full invalid fixture set", () => {
-    expect(invalid.length).toBe(11);
+    // 11 structural/semantic + 6 restricted-YAML profile fixtures (orcaspec 0.1.1).
+    expect(invalid.length).toBe(17);
   });
 
   for (const name of invalid) {

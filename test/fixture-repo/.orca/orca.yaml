@@ -1,0 +1,179 @@
+# Orca dogfood repository — a small, real TypeScript monorepo used two ways:
+#   (a) the deterministic fixture repo for orca-pi's no-live-model conformance,
+#       enforcement, lifecycle, and state suite (materialized into a tmp dir per
+#       test), and
+#   (b) the standalone dogfooding ground at ~/Documents/orca-dogfood.
+#
+# This spec is HAND-WRITTEN (not generated) and deliberately exercises, at once:
+#   - multiple domain agents (7);
+#   - NESTED ownership: design-system owns apps/web/components/** INSIDE web's
+#     apps/web/** — a target in the nested scope routes to the most-specific owner;
+#   - OVERLAPPING-ADJACENT ownership: web (apps/web/**) vs web-admin
+#     (apps/web-admin/**) share the textual prefix "apps/web" yet are disjoint;
+#     billing (services/billing/**) vs api (services/api/**) are sibling-adjacent;
+#   - an AGENT write-deny (billing denies its own generated/ tree);
+#   - PROTECTED denies (secrets/** read, infra/production/** write) — non-
+#     overridable in both advisory and enforce mode;
+#   - EDIT shorthand (every agent authors via edit.allow, which expands to
+#     read+write);
+#   - a steward DISCOVERY scope narrower than ** (apps/services/docs + two root
+#     files; infra/** and secrets/** are outside it).
+#
+# minimum_mode is advisory so the dogfood can run in advisory and be flipped to
+# enforce with `/orca mode enforce`; the effective mode is the stricter of this
+# and the requested mode.
+spec_version: "0.1"
+
+repository:
+  id: "018f4f72-0000-7000-8000-00000000d0f0"
+  minimum_mode: advisory
+
+administration:
+  approvers:
+    - provider: orca-local
+      principal: "user-key:dogfood"
+
+steward:
+  instructions:
+    required: []
+    optional:
+      - docs/steward.md
+  context:
+    required: []
+    optional: []
+  discovery:
+    read:
+      # Narrower than "**": the steward discovers the application, service, and
+      # docs trees plus two root files. infra/** and secrets/** are NOT here —
+      # infra is delegated-only, secrets is additionally a protected read deny.
+      allow:
+        - apps/**
+        - services/**
+        - docs/**
+        - package.json
+        - README.md
+      deny: []
+
+protected_denies:
+  read:
+    - secrets/**
+  write:
+    - infra/production/**
+
+agents:
+  # ---- apps/ ----------------------------------------------------------------
+  - id: web
+    name: Web App
+    description: Owns the web application shell outside its nested design system.
+    specialties:
+      - id: framework:react
+        priority: 100
+    ownership:
+      - apps/web/**
+    permissions:
+      read:
+        allow:
+          - docs/shared/**
+        deny: []
+      edit:
+        allow:
+          - apps/web/**
+        deny: []
+    instructions:
+      required: []
+      optional:
+        - docs/agents/web.md
+
+  - id: design-system
+    name: Design System
+    description: Owns the reusable component library nested inside the web app.
+    specialties:
+      - id: domain:design-system
+        priority: 100
+    ownership:
+      - apps/web/components/**
+    permissions:
+      read:
+        allow:
+          - docs/shared/**
+        deny: []
+      edit:
+        allow:
+          - apps/web/components/**
+        deny: []
+
+  - id: web-admin
+    name: Web Admin
+    description: Owns the admin console, adjacent to (not nested in) the web app.
+    ownership:
+      - apps/web-admin/**
+    permissions:
+      edit:
+        allow:
+          - apps/web-admin/**
+        deny: []
+
+  # ---- services/ ------------------------------------------------------------
+  - id: billing
+    name: Billing Service
+    description: Owns the billing service; its generated tree is a write-deny.
+    specialties:
+      - id: domain:billing
+        priority: 100
+    ownership:
+      - services/billing/**
+    permissions:
+      read:
+        allow:
+          - docs/shared/**
+        deny: []
+      write:
+        allow: []
+        deny:
+          - services/billing/generated/**
+      edit:
+        allow:
+          - services/billing/**
+        deny: []
+    context:
+      required: []
+      optional:
+        - docs/shared/billing-glossary.md
+
+  - id: api
+    name: API Service
+    description: Owns the public API service, sibling-adjacent to billing.
+    ownership:
+      - services/api/**
+    permissions:
+      edit:
+        allow:
+          - services/api/**
+        deny: []
+
+  # ---- infra/ (delegated-only; production is a protected write deny) --------
+  - id: infra
+    name: Infrastructure
+    description: Owns infrastructure; production paths are a protected write deny.
+    specialties:
+      - id: domain:infra
+        priority: 100
+    ownership:
+      - infra/**
+    permissions:
+      edit:
+        allow:
+          - infra/**
+        deny: []
+
+  # ---- docs/ ----------------------------------------------------------------
+  - id: docs
+    name: Documentation
+    description: Owns the docs tree, including the shared cross-domain references.
+    ownership:
+      - docs/**
+    permissions:
+      edit:
+        allow:
+          - docs/**
+        deny: []
