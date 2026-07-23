@@ -7,19 +7,34 @@ import orcaPi from "../index";
 
 // A minimal ExtensionAPI double that captures registrations. The extension's
 // pi-framework imports are type-only, so index.ts pulls in no pi runtime here.
+interface RegisteredTool {
+  name: string;
+  execute: (
+    toolCallId: string,
+    params: unknown,
+    signal: unknown,
+    onUpdate: unknown,
+    ctx: unknown,
+  ) => Promise<{ content: { type: string; text?: string }[] }>;
+}
+
 interface Registered {
   events: Map<string, (event: unknown, ctx: unknown) => unknown>;
   commands: Map<string, { description?: string; handler: (args: string, ctx: unknown) => Promise<void> }>;
+  tools: Map<string, RegisteredTool>;
 }
 
 function makeApi(): { pi: unknown; registered: Registered } {
-  const registered: Registered = { events: new Map(), commands: new Map() };
+  const registered: Registered = { events: new Map(), commands: new Map(), tools: new Map() };
   const pi = {
     on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
       registered.events.set(event, handler);
     },
     registerCommand(name: string, options: { description?: string; handler: (args: string, ctx: unknown) => Promise<void> }) {
       registered.commands.set(name, options);
+    },
+    registerTool(tool: RegisteredTool) {
+      registered.tools.set(tool.name, tool);
     },
   };
   return { pi, registered };
@@ -53,6 +68,33 @@ describe("orca-pi extension entry", () => {
     orcaPi(pi as never);
     expect(registered.commands.has("orca")).toBe(true);
     expect(registered.events.has("session_start")).toBe(true);
+  });
+
+  it("registers the orca_resolve and orca_explain tools", () => {
+    const { pi, registered } = makeApi();
+    orcaPi(pi as never);
+    expect(registered.tools.has("orca_resolve")).toBe(true);
+    expect(registered.tools.has("orca_explain")).toBe(true);
+  });
+
+  it("/orca appends the last route decisions after a resolve call", async () => {
+    const { pi, registered } = makeApi();
+    orcaPi(pi as never);
+    writeSpec("multi-owner");
+
+    await registered.tools.get("orca_resolve")!.execute(
+      "call-1",
+      { paths: ["apps/web/app.tsx"] },
+      undefined,
+      undefined,
+      { cwd: dir },
+    );
+
+    const ctx = makeCtx(dir, true);
+    await registered.commands.get("orca")!.handler("", ctx);
+    const widgetLines = ctx.ui.setWidget.mock.calls[0]?.[1] as string[];
+    expect(widgetLines.join("\n")).toContain("Last route decisions");
+    expect(widgetLines.join("\n")).toContain("apps/web/app.tsx");
   });
 
   it("/orca reports unmanaged and notifies in an unmanaged repo with UI", async () => {

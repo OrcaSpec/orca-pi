@@ -11,6 +11,8 @@ import {
   type RepositoryState,
 } from "./src/state";
 import { DEFAULT_MODE, isOperatingMode, type OperatingMode } from "./src/mode";
+import { createExplainTool, createResolveTool, summarizeResolution } from "./src/tools";
+import { RouteLog } from "./src/routelog";
 
 /**
  * Orca for pi — Phase 3: spec loading, validation, and repository states.
@@ -32,19 +34,31 @@ import { DEFAULT_MODE, isOperatingMode, type OperatingMode } from "./src/mode";
  * advisory. Session-entry persistence (appendEntry) is deferred to the delegation
  * work in later phases; the smallest reasonable Phase 3 surface is in-memory.
  *
- * No governance, routing, or tool interception is registered yet — those arrive
- * with the resolver (Phase 4) and steward governance (Phase 5).
+ * Phase 4 adds the two routing-preview tools, `orca_resolve` and `orca_explain`.
+ * They are registered globally, run the pure resolver against the current
+ * repository state, and have no side effects (no delegation, no writes); when
+ * governance is not active they explain the state instead of throwing. Steward
+ * governance and tool interception still arrive in Phase 5.
  */
 export default function orcaPi(pi: ExtensionAPI): void {
   // In-memory, session-scoped requested operating mode (see the note above).
   let requestedMode: OperatingMode = DEFAULT_MODE;
 
+  // Session-scoped memory of the last few route decisions, shown under /orca.
+  const routeLog = new RouteLog();
+
   const currentState = (ctx: ExtensionContext | ExtensionCommandContext): RepositoryState =>
     detectRepositoryState(ctx.cwd, requestedMode);
 
+  const toolDeps = {
+    getState: (cwd: string): RepositoryState => detectRepositoryState(cwd, requestedMode),
+    onRoute: (resolution: Parameters<typeof summarizeResolution>[0]): void =>
+      routeLog.record(summarizeResolution(resolution)),
+  };
+
   /** Surface a state through the UI when present, else as headless plain text. */
   const present = (state: RepositoryState, ctx: ExtensionContext): void => {
-    const lines = formatStatusLines(state);
+    const lines = [...formatStatusLines(state), ...routeLog.statusLines()];
     if (ctx.hasUI) {
       ctx.ui.setStatus("orca", shortStatus(state));
       ctx.ui.setWidget("orca", lines);
@@ -93,4 +107,10 @@ export default function orcaPi(pi: ExtensionAPI): void {
       present(currentState(ctx), ctx);
     },
   });
+
+  // Routing-preview tools. Registered unconditionally; each checks the current
+  // repository state at call time and explains a non-active state rather than
+  // acting. These are steward tools — Phase 5 formalizes the steward surface.
+  pi.registerTool(createResolveTool(toolDeps));
+  pi.registerTool(createExplainTool(toolDeps));
 }
