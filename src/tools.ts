@@ -7,7 +7,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { normalizeTarget } from "./paths";
 import { resolve, type Resolution } from "./resolver";
-import { renderExplain, renderResolvePreview, summarizeResolution } from "./render";
+import { renderDelegatePlan, renderExplain, renderResolvePreview, summarizeResolution } from "./render";
 import { formatStatusLines, type RepositoryState } from "./state";
 
 /**
@@ -170,6 +170,74 @@ export function createExplainTool(deps: ToolDeps): ToolDefinition<typeof paramsS
           return invalidResult(outcome.rejections);
         case "resolution":
           return text(renderExplain(outcome.resolution), {
+            kind: "resolution",
+            resolution: outcome.resolution,
+          });
+      }
+    },
+  });
+}
+
+const delegateParamsSchema = Type.Object(
+  {
+    task: Type.String({
+      minLength: 1,
+      description: "What the owning agent should do, in plain language.",
+    }),
+    paths: Type.Array(
+      Type.String({ minLength: 1, description: "A repository-relative target path." }),
+      {
+        minItems: 1,
+        description:
+          "Concrete repository-relative target paths the task will change. Not agent ids.",
+      },
+    ),
+  },
+  { description: "Delegate a task to the resolver-assigned owner(s) of the given target paths." },
+);
+
+/** Exported so `tool_call` handlers and tests can type the delegate input. */
+export type DelegateToolInput = Static<typeof delegateParamsSchema>;
+
+/**
+ * `orca_delegate` — Phase 5 STUB. It resolves the target paths to their owners
+ * and returns the delegation plan it *would* execute, clearly labeled as a
+ * preview. It spawns no session and changes no file; delegation execution lands
+ * in Phase 6. Only the steward has this tool, and the parent session never gets
+ * `orca_checkpoint` (that terminates a delegated session).
+ */
+export function createDelegateTool(
+  deps: ToolDeps,
+): ToolDefinition<typeof delegateParamsSchema, ResolveToolDetails> {
+  return defineTool({
+    name: "orca_delegate",
+    label: "Orca delegate",
+    description:
+      "Delegate writable work to the structurally determined owner(s) of the given target paths. " +
+      "Pass the task plus concrete repository-relative paths (never an agent id); Orca resolves the " +
+      "owner and runs the write under that agent's grant. PHASE 5 STUB: returns the delegation plan " +
+      "without spawning a session or changing files (execution lands in Phase 6).",
+    promptSnippet:
+      "orca_delegate — route writable work to its owner by target paths (Phase 5: previews the plan).",
+    parameters: delegateParamsSchema,
+    async execute(
+      _toolCallId: string,
+      params: DelegateToolInput,
+      _signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      ctx: ExtensionContext,
+    ): Promise<AgentToolResult<ResolveToolDetails>> {
+      const outcome = computeOutcome(deps.getState(ctx.cwd), params.paths, ctx.cwd);
+      switch (outcome.kind) {
+        case "empty":
+          return emptyResult();
+        case "inactive":
+          return inactiveResult(outcome.state);
+        case "invalid":
+          return invalidResult(outcome.rejections);
+        case "resolution":
+          deps.onRoute?.(outcome.resolution);
+          return text(renderDelegatePlan(params.task, outcome.resolution), {
             kind: "resolution",
             resolution: outcome.resolution,
           });

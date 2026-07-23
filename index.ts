@@ -1,7 +1,11 @@
-import type {
-  ExtensionAPI,
-  ExtensionCommandContext,
-  ExtensionContext,
+import { realpathSync } from "node:fs";
+import { isAbsolute, relative, resolve as resolvePath, sep } from "node:path";
+import {
+  isToolCallEventType,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
+  type ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
 import {
   detectRepositoryState,
@@ -11,41 +15,70 @@ import {
   type RepositoryState,
 } from "./src/state";
 import { DEFAULT_MODE, isOperatingMode, type OperatingMode } from "./src/mode";
-import { createExplainTool, createResolveTool, summarizeResolution } from "./src/tools";
+import { normalizeTarget } from "./src/paths";
+import {
+  createDelegateTool,
+  createExplainTool,
+  createResolveTool,
+  summarizeResolution,
+} from "./src/tools";
 import { RouteLog } from "./src/routelog";
+import { ViolationLog } from "./src/violations";
+import {
+  classifyDiscovery,
+  classifyWrite,
+  type DiscoveryTarget,
+  type GovernanceDecision,
+  type GovernedReadTool,
+  type GovernedTool,
+  type GovernedWriteTool,
+} from "./src/governance";
+import { composeStewardPrompt } from "./src/steward";
 
 /**
- * Orca for pi — Phase 3: spec loading, validation, and repository states.
+ * Orca for pi — Phase 5: steward governance of the parent session (ADR 0080).
  *
- * On session start (all reasons, including `/reload`) and on demand via `/orca`,
- * the extension inspects `ctx.cwd` and lands in exactly one repository state:
- * `unmanaged` (no `.orca/orca.yaml`; pi behaves as unmanaged pi, no tool
- * interception), `active` (valid spec; governance state computed with an
- * effective mode), or the blocked states `invalid_spec` /
- * `unsupported_spec_version` (present but unusable spec; actionable diagnostics,
- * identical in both modes — ADR 0028).
+ * Phases 2–4 established the four repository states and the pure resolver behind
+ * `orca_resolve` / `orca_explain`. This phase governs the parent session as the
+ * repository steward while — and only while — the repository is `active`:
  *
- * User-requested mode surface: `/orca mode advisory|enforce` records a
- * requested operating mode that persists for the life of this extension
- * instance (in-memory session state). The effective mode is recomputed
- * immediately as the stricter of the repository minimum and the requested mode
- * (ADR 0063). This state is deliberately NOT persisted across `/reload`: a
- * reload constructs a fresh extension instance and the requested mode resets to
- * advisory. Session-entry persistence (appendEntry) is deferred to the delegation
- * work in later phases; the smallest reasonable Phase 3 surface is in-memory.
+ * - **Write governance** (`tool_call` on `write`/`edit`): the steward has no
+ *   implicit write authority, so a write into an owned scope is blocked (enforce)
+ *   or flagged (advisory) with an explanation naming the owner and directing
+ *   `orca_delegate`; unowned writes fail closed in enforce and are advisory
+ *   policy violations otherwise (ADR 0012); writes outside the repository cross
+ *   the stewardship boundary (ADR 0015). See `governance.ts`.
+ * - **Discovery governance** (`tool_call` on `read`/`grep`/`find`/`ls`): reads are
+ *   scoped to `steward.discovery.read` minus protected denies; the real
+ *   (symlink-resolved) target is scope-checked, and symlink traversal is
+ *   rejected per ADR 0032.
+ * - **Advisory flagging**: a flagged call proceeds; the explanation reaches the
+ *   human via `notify` + a violation record, and the model via a `tool_result`
+ *   note keyed by `toolCallId`.
+ * - **Steward identity**: `before_agent_start` appends a root-first trusted
+ *   system-prompt block (`steward.ts`) — role, mode, discovery scope, delegation
+ *   directive, four-state context — appended to pi's own prompt, never replacing it.
+ * - **Tool surface**: the steward gains `orca_delegate` (Phase 5 stub). The parent
+ *   session never receives `orca_checkpoint`.
  *
- * Phase 4 adds the two routing-preview tools, `orca_resolve` and `orca_explain`.
- * They are registered globally, run the pure resolver against the current
- * repository state, and have no side effects (no delegation, no writes); when
- * governance is not active they explain the state instead of throwing. Steward
- * governance and tool interception still arrive in Phase 5.
+ * Governance activates ONLY in the `active` state; unmanaged and blocked
+ * repositories see zero interception (every handler returns early), preserving
+ * normal pi behavior. Handlers are registered once in the factory body, so the
+ * `/reload` flow (which rebuilds a fresh extension instance) cannot accumulate
+ * duplicate handlers or double-govern a call.
  */
 export default function orcaPi(pi: ExtensionAPI): void {
-  // In-memory, session-scoped requested operating mode (see the note above).
+  // In-memory, session-scoped requested operating mode (reset on /reload).
   let requestedMode: OperatingMode = DEFAULT_MODE;
 
-  // Session-scoped memory of the last few route decisions, shown under /orca.
+  // Session-scoped memory surfaced under /orca; both reset on /reload.
   const routeLog = new RouteLog();
+  const violations = new ViolationLog();
+
+  // Advisory flags awaiting their tool_result, keyed by toolCallId. A flagged
+  // (not blocked) call proceeds; when its result arrives we append the
+  // explanation so the model sees the same note the human was notified of.
+  const pendingFlags = new Map<string, string>();
 
   const currentState = (ctx: ExtensionContext | ExtensionCommandContext): RepositoryState =>
     detectRepositoryState(ctx.cwd, requestedMode);
@@ -58,7 +91,11 @@ export default function orcaPi(pi: ExtensionAPI): void {
 
   /** Surface a state through the UI when present, else as headless plain text. */
   const present = (state: RepositoryState, ctx: ExtensionContext): void => {
-    const lines = [...formatStatusLines(state), ...routeLog.statusLines()];
+    const lines = [
+      ...formatStatusLines(state),
+      ...routeLog.statusLines(),
+      ...violations.statusLines(),
+    ];
     if (ctx.hasUI) {
       ctx.ui.setStatus("orca", shortStatus(state));
       ctx.ui.setWidget("orca", lines);
@@ -72,12 +109,159 @@ export default function orcaPi(pi: ExtensionAPI): void {
     }
   };
 
+  /** Notify the human of a governance event (warning severity), UI or headless. */
+  const notifyHuman = (ctx: ExtensionContext, message: string): void => {
+    if (ctx.hasUI) {
+      ctx.ui.notify(message, "warning");
+      return;
+    }
+    if (ctx.mode !== "json" && ctx.mode !== "rpc") console.log(message);
+  };
+
+  /** A raw discovery/write target for display: the path, or `(cwd)` when absent. */
+  const displayOf = (raw: string | undefined): string =>
+    raw === undefined || raw.trim() === "" ? "(cwd)" : raw;
+
+  /**
+   * Reduce a raw discovery path to a scope-checkable {@link DiscoveryTarget}:
+   * resolve the real (symlink-followed) target against the canonical repository
+   * root and report whether a symlink was traversed. A missing path denotes the
+   * repository root; a resolved target outside the root becomes `path: null`
+   * (out of the read surface). The real path — not the logical one — is what the
+   * scope check sees, so a symlink whose target escapes scope cannot slip through
+   * (ADR 0032).
+   */
+  const resolveDiscoveryTarget = (raw: string | undefined, repoRoot: string): DiscoveryTarget => {
+    if (raw === undefined || raw.trim() === "") return { path: "", symlink: false };
+
+    let realRoot: string;
+    try {
+      realRoot = realpathSync(repoRoot);
+    } catch {
+      realRoot = repoRoot;
+    }
+
+    const logical = resolvePath(realRoot, raw);
+    let real = logical;
+    try {
+      real = realpathSync(logical);
+    } catch {
+      // Missing leaf: no symlink resolution possible; scope-check the logical path.
+    }
+    const symlink = real !== logical;
+
+    const rel = relative(realRoot, real);
+    const escaped = rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel);
+    return { path: escaped ? null : rel.split(sep).join("/"), symlink };
+  };
+
+  /**
+   * Apply a governance decision: allow passes through; block returns the block
+   * result to pi; flag records the violation, notifies the human, and queues the
+   * model-visible note for `tool_result`. Every non-allow verdict is recorded.
+   */
+  const applyDecision = (
+    ctx: ExtensionContext,
+    toolCallId: string,
+    tool: GovernedTool,
+    displayPath: string,
+    mode: OperatingMode,
+    decision: GovernanceDecision,
+  ): ToolCallEventResult | undefined => {
+    if (decision.verdict === "allow") return undefined;
+
+    violations.record({
+      verdict: decision.verdict === "block" ? "blocked" : "flagged",
+      tool,
+      path: displayPath,
+      owner: decision.owner,
+      mode,
+      reason: decision.reason,
+      timestamp: Date.now(),
+    });
+
+    if (decision.verdict === "block") {
+      notifyHuman(ctx, `Orca blocked ${tool} on ${displayPath}\n${decision.reason}`);
+      return { block: true, reason: decision.reason };
+    }
+
+    notifyHuman(
+      ctx,
+      `Orca flagged ${tool} on ${displayPath} (advisory — proceeding)\n${decision.reason}`,
+    );
+    pendingFlags.set(toolCallId, decision.reason);
+    return undefined;
+  };
+
   pi.on("session_start", async (_event, ctx) => {
-    // Passive detection for every start reason (startup, reload, new, resume,
-    // fork). No tool_call handler is registered, so no interception can occur
-    // regardless of the detected state. Publish only the compact status here.
+    // Passive detection for every start reason. Publish only the compact status;
+    // the governance handlers below activate independently and only when active.
     const state = currentState(ctx);
     if (ctx.hasUI) ctx.ui.setStatus("orca", shortStatus(state));
+  });
+
+  // Steward governance. Runs on every parent tool call but returns immediately
+  // unless the repository is under active governance — unmanaged and blocked
+  // states get zero interception, preserving normal pi behavior.
+  pi.on("tool_call", async (event, ctx): Promise<ToolCallEventResult | undefined> => {
+    const state = detectRepositoryState(ctx.cwd, requestedMode);
+    if (state.kind !== "active") return undefined;
+    const { document, effectiveMode } = state;
+
+    let write: { tool: GovernedWriteTool; raw: string } | undefined;
+    if (isToolCallEventType("write", event)) write = { tool: "write", raw: event.input.path };
+    else if (isToolCallEventType("edit", event)) write = { tool: "edit", raw: event.input.path };
+    if (write) {
+      const norm = normalizeTarget(write.raw, ctx.cwd);
+      const decision = classifyWrite(document, effectiveMode, norm.ok ? norm.path : null);
+      return applyDecision(
+        ctx,
+        event.toolCallId,
+        write.tool,
+        displayOf(write.raw),
+        effectiveMode,
+        decision,
+      );
+    }
+
+    let read: { tool: GovernedReadTool; raw: string | undefined } | undefined;
+    if (isToolCallEventType("read", event)) read = { tool: "read", raw: event.input.path };
+    else if (isToolCallEventType("grep", event)) read = { tool: "grep", raw: event.input.path };
+    else if (isToolCallEventType("find", event)) read = { tool: "find", raw: event.input.path };
+    else if (isToolCallEventType("ls", event)) read = { tool: "ls", raw: event.input.path };
+    if (read) {
+      const target = resolveDiscoveryTarget(read.raw, ctx.cwd);
+      const decision = classifyDiscovery(document, effectiveMode, target);
+      return applyDecision(
+        ctx,
+        event.toolCallId,
+        read.tool,
+        displayOf(read.raw),
+        effectiveMode,
+        decision,
+      );
+    }
+
+    return undefined;
+  });
+
+  // Advisory flagging, model side: append the queued explanation to the result
+  // of a call we let proceed. Keyed by toolCallId, consumed once.
+  pi.on("tool_result", async (event, _ctx) => {
+    const note = pendingFlags.get(event.toolCallId);
+    if (note === undefined) return undefined;
+    pendingFlags.delete(event.toolCallId);
+    return {
+      content: [...event.content, { type: "text" as const, text: `\n[orca advisory] ${note}` }],
+    };
+  });
+
+  // Steward identity: append the root-first trusted governance block to pi's
+  // system prompt, only while active. Absent in unmanaged and blocked states.
+  pi.on("before_agent_start", async (event, ctx) => {
+    const state = detectRepositoryState(ctx.cwd, requestedMode);
+    if (state.kind !== "active") return undefined;
+    return { systemPrompt: `${event.systemPrompt}\n\n${composeStewardPrompt(state)}` };
   });
 
   pi.registerCommand("orca", {
@@ -108,9 +292,11 @@ export default function orcaPi(pi: ExtensionAPI): void {
     },
   });
 
-  // Routing-preview tools. Registered unconditionally; each checks the current
-  // repository state at call time and explains a non-active state rather than
-  // acting. These are steward tools — Phase 5 formalizes the steward surface.
+  // Steward tool surface: routing preview + explanation (Phase 4) plus the
+  // Phase 5 orca_delegate stub. Registered unconditionally; each checks the
+  // current state at call time. orca_checkpoint is NOT registered in the parent
+  // session — it terminates a delegated session, not the steward (ADR 0083).
   pi.registerTool(createResolveTool(toolDeps));
   pi.registerTool(createExplainTool(toolDeps));
+  pi.registerTool(createDelegateTool(toolDeps));
 }
