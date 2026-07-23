@@ -36,8 +36,27 @@ import {
   type GovernedWriteTool,
 } from "./src/governance";
 import { composeStewardPrompt } from "./src/steward";
-import type { DelegationSession, DelegationSessionConfig } from "./src/delegation";
+import type {
+  DelegationProgress,
+  DelegationSession,
+  DelegationSessionConfig,
+} from "./src/delegation";
 import { createRealSessionFactory } from "./src/session-runner";
+import { formatEnforcementSummary } from "./src/enforcement";
+import {
+  DELEGATION_ENTRY_TYPE,
+  DelegationHistory,
+  renderRecordLines,
+  type PersistedDelegationRecord,
+} from "./src/delegation-entry";
+import {
+  inflightFromProgress,
+  progressLine,
+  statusWidgetLines,
+  Surface,
+  type InflightDelegation,
+} from "./src/surface";
+import { linesComponent } from "./src/tui";
 
 /**
  * Orca for pi — steward governance of the parent session (ADR 0080), plus the
@@ -73,13 +92,44 @@ import { createRealSessionFactory } from "./src/session-runner";
  * `/reload` flow (which rebuilds a fresh extension instance) cannot accumulate
  * duplicate handlers or double-govern a call.
  */
+/**
+ * Test/embedding seam. Production wires the real in-process session factory
+ * (which needs a live model); the offline suite injects a scripted
+ * `createSession` so the full extension — governance, delegation, persistence,
+ * and the live surfaces — can be exercised end-to-end without a model.
+ */
+export interface OrcaOverrides {
+  createSession?: (config: DelegationSessionConfig) => Promise<DelegationSession>;
+}
+
 export default function orcaPi(pi: ExtensionAPI): void {
+  installOrca(pi);
+}
+
+export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): void {
   // In-memory, session-scoped requested operating mode (reset on /reload).
+  //
+  // Phase 8 decision — requested mode is NOT persisted as a session entry. The
+  // durable floor on the effective mode is `repository.minimum_mode`, which lives
+  // in the spec file and is re-read on every session_start, so a resumed/forked
+  // session is never weaker than the repository demands. A voluntary elevation
+  // above that floor is a per-session choice; persisting it would silently keep
+  // `enforce` active in a new session the user did not ask to elevate. Keeping it
+  // ephemeral is the smaller, safer default (only the spec-derived minimum, which
+  // is already durable, survives). Delegation records DO persist (see below).
   let requestedMode: OperatingMode = DEFAULT_MODE;
 
   // Session-scoped memory surfaced under /orca; both reset on /reload.
   const routeLog = new RouteLog();
   const violations = new ViolationLog();
+
+  // Durable delegation history (PRD "User Surface"): rebuilt on every
+  // session_start from session entries ALONE, appended to live as delegations
+  // complete. A resumed/forked session recovers its history from entries only.
+  const history = new DelegationHistory();
+
+  // The in-flight delegation for the live status widget; undefined when idle.
+  let inflight: InflightDelegation | undefined;
 
   // Advisory flags awaiting their tool_result, keyed by toolCallId. A flagged
   // (not blocked) call proceeds; when its result arrives we append the
@@ -96,6 +146,7 @@ export default function orcaPi(pi: ExtensionAPI): void {
   // the life of the extension instance (rebuilt fresh on /reload).
   let sessionFactory: ((config: DelegationSessionConfig) => Promise<DelegationSession>) | undefined;
   const createSession = async (config: DelegationSessionConfig): Promise<DelegationSession> => {
+    if (overrides.createSession) return overrides.createSession(config);
     if (!sessionFactory) {
       sessionFactory = createRealSessionFactory(await ModelRuntime.create());
     }
@@ -111,33 +162,39 @@ export default function orcaPi(pi: ExtensionAPI): void {
       routeLog.record(summarizeResolution(resolution)),
   };
 
-  /** Surface a state through the UI when present, else as headless plain text. */
-  const present = (state: RepositoryState, ctx: ExtensionContext): void => {
-    const lines = [
-      ...formatStatusLines(state),
-      ...routeLog.statusLines(),
-      ...violations.statusLines(),
+  /**
+   * The full `/orca` status surface (PRD "Commands and status"): state,
+   * effective mode + inputs, digest, agents, then — only under active governance
+   * — the dimensioned enforcement summary with the bash disclosure. Last route
+   * decisions, governance events, and the durable delegation history follow.
+   * Blocked and unmanaged states show their diagnostics WITHOUT an enforcement
+   * claim, since no constructive enforcement is active to describe.
+   */
+  const composeStatusLines = (state: RepositoryState): string[] => {
+    const lines = [...formatStatusLines(state)];
+    if (state.kind === "active") lines.push("", ...formatEnforcementSummary());
+    const sections = [
+      routeLog.statusLines(),
+      violations.statusLines(),
+      history.statusLines(),
+      history.lastDetailLines(),
     ];
-    if (ctx.hasUI) {
-      ctx.ui.setStatus("orca", shortStatus(state));
-      ctx.ui.setWidget("orca", lines);
-      ctx.ui.notify(lines.join("\n"), statusLevel(state));
-      return;
-    }
-    // Headless: emit plain text on stdout, except in structured protocol modes
-    // (json/rpc) where stdout carries the protocol and must not be polluted.
-    if (ctx.mode !== "json" && ctx.mode !== "rpc") {
-      console.log(lines.join("\n"));
-    }
+    for (const section of sections) if (section.length > 0) lines.push("", ...section);
+    return lines;
   };
 
-  /** Notify the human of a governance event (warning severity), UI or headless. */
+  /** Surface the full `/orca` status through the one UI seam (no-op headless UI). */
+  const present = (state: RepositoryState, ctx: ExtensionContext): void => {
+    const lines = composeStatusLines(state);
+    const surface = new Surface(ctx);
+    surface.status(shortStatus(state));
+    surface.widget(lines);
+    surface.notify(lines.join("\n"), statusLevel(state));
+  };
+
+  /** Notify the human of a governance event (warning severity) via the seam. */
   const notifyHuman = (ctx: ExtensionContext, message: string): void => {
-    if (ctx.hasUI) {
-      ctx.ui.notify(message, "warning");
-      return;
-    }
-    if (ctx.mode !== "json" && ctx.mode !== "rpc") console.log(message);
+    new Surface(ctx).notify(message, "warning");
   };
 
   /** A raw discovery/write target for display: the path, or `(cwd)` when absent. */
@@ -221,10 +278,37 @@ export default function orcaPi(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    // Passive detection for every start reason. Publish only the compact status;
-    // the governance handlers below activate independently and only when active.
+    // Rebuild the durable delegation history from session entries ALONE, for
+    // EVERY start reason (startup / reload / new / resume / fork). A resumed or
+    // forked session therefore recovers its prior delegation history with no
+    // other store (PRD "User Surface"). The in-flight marker resets with the
+    // fresh runtime.
+    const branch = ctx.sessionManager?.getBranch?.() ?? [];
+    history.rebuildFrom(branch);
+    inflight = undefined;
+
+    // Passive detection for every start reason; the governance handlers below
+    // activate independently and only when active.
     const state = currentState(ctx);
-    if (ctx.hasUI) ctx.ui.setStatus("orca", shortStatus(state));
+    const surface = new Surface(ctx);
+    surface.status(shortStatus(state));
+    surface.widget(
+      statusWidgetLines({
+        state,
+        violationCount: violations.recent().length,
+        historyCount: history.count(),
+        inflight,
+      }),
+    );
+    // Announce activation / blocked state (not routine unmanaged startups) so a
+    // mode or governance change on session_start & /reload is visible.
+    if (state.kind !== "unmanaged") {
+      const message =
+        state.kind === "active"
+          ? `Orca governance active — effective mode ${state.effectiveMode}.`
+          : `Orca ${state.kind}: governance blocked; see /orca for diagnostics.`;
+      surface.notify(message, statusLevel(state));
+    }
   });
 
   // Steward governance. Runs on every parent tool call but returns immediately
@@ -323,6 +407,14 @@ export default function orcaPi(pi: ExtensionAPI): void {
   // Phase 5 orca_delegate stub. Registered unconditionally; each checks the
   // current state at call time. orca_checkpoint is NOT registered in the parent
   // session — it terminates a delegated session, not the steward (ADR 0083).
+  // Render persisted delegation entries readably in the transcript. Entries are
+  // TUI-only (they do NOT enter LLM context); on a resumed session these are the
+  // sole record of prior delegations. The renderer is pure over `entry.data`.
+  pi.registerEntryRenderer<PersistedDelegationRecord>(DELEGATION_ENTRY_TYPE, (entry) => {
+    const record = entry.data;
+    return record ? linesComponent(renderRecordLines(record)) : undefined;
+  });
+
   pi.registerTool(createResolveTool(toolDeps));
   pi.registerTool(createExplainTool(toolDeps));
   pi.registerTool(
@@ -334,6 +426,34 @@ export default function orcaPi(pi: ExtensionAPI): void {
         routeLog.record(
           `delegated ${entry.owner}: ${entry.status}, ${entry.changedPaths.length} changed path(s)`,
         ),
+      // Persist each completed sequence as a session entry and add it to the
+      // durable history (one entry per sequence). appendEntry does NOT enter LLM
+      // context; the history rebuild on session_start reads exactly these back.
+      onDelegationRecord: (record) => {
+        pi.appendEntry(DELEGATION_ENTRY_TYPE, record);
+        history.add(record);
+      },
+      // Live progress → status widget (owner + step k/N + status) and human
+      // notifications on sequence start, per-owner checkpoint outcomes, and end.
+      onProgress: (progress: DelegationProgress, progressCtx: ExtensionContext) => {
+        inflight = inflightFromProgress(inflight, progress);
+        const surface = new Surface(progressCtx);
+        surface.widget(
+          statusWidgetLines({
+            state: currentState(progressCtx),
+            violationCount: violations.recent().length,
+            historyCount: history.count(),
+            inflight,
+          }),
+        );
+        if (
+          progress.kind === "sequence_start" ||
+          progress.kind === "step_end" ||
+          progress.kind === "sequence_end"
+        ) {
+          surface.notify(progressLine(progress), "info");
+        }
+      },
       // Unowned-target delegation events (ADR 0012): blocked in enforce, flagged
       // in advisory. Recorded so /orca shows the lifecycle event (Phase 8 polishes UX).
       onUnowned: (paths, mode, verdict) => {

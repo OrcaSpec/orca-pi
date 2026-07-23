@@ -7,10 +7,12 @@ import type { CompiledGrant, ResolvedDelegation } from "./resolver";
 import {
   createDelegationRecord,
   synthesizeFailed,
+  type BashActivity,
   type CheckpointResult,
   type CheckpointStatus,
   type DelegationRecord,
 } from "./checkpoint";
+import { capabilitySummaryFor, type CapabilitySummary } from "./enforcement";
 import { createDelegationTools } from "./delegation-tools";
 import {
   CONTEXT_BUDGET_BYTES,
@@ -278,20 +280,90 @@ export function buildDelegationSession(inputs: DelegationInputs): BuildResult {
   };
 }
 
-/** A spawned delegated session, reduced to what the run loop needs (mockable seam). */
+/**
+ * Per-delegation usage totalled from the delegated session's own events (ADR
+ * 0076 — the delegation runs on the parent model, so its usage is real spend).
+ * pi surfaces usage on assistant message events (`message.usage`, a pi-ai
+ * `Usage` with token counts and a cost breakdown); the real session factory
+ * accumulates those into this shape. {@link available} is false when the
+ * session exposed no usage at all, so a resumed/failed delegation reports
+ * "unknown" honestly rather than a fabricated zero-cost.
+ */
+export interface DelegationUsage {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  costUsd: number;
+  available: boolean;
+}
+
+/** A zeroed, explicitly-unavailable usage total (no usage was reported). */
+export function emptyUsage(): DelegationUsage {
+  return { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0, available: false };
+}
+
+/** Sum a set of per-delegation usage totals for a sequence-level report. */
+export function sumUsage(usages: readonly DelegationUsage[]): DelegationUsage {
+  const total = usages.reduce(
+    (acc, usage) => ({
+      inputTokens: acc.inputTokens + usage.inputTokens,
+      outputTokens: acc.outputTokens + usage.outputTokens,
+      totalTokens: acc.totalTokens + usage.totalTokens,
+      costUsd: acc.costUsd + usage.costUsd,
+      available: acc.available || usage.available,
+    }),
+    emptyUsage(),
+  );
+  return total;
+}
+
+/**
+ * A spawned delegated session, reduced to what the run loop needs (mockable
+ * seam). {@link prompt} and {@link abort} are required; {@link onActivity} and
+ * {@link usage} are optional visibility hooks the real factory wires to pi's
+ * session events and a scripted fake can supply directly (both are offline).
+ */
 export interface DelegationSession {
   prompt(text: string): Promise<void>;
   abort(): Promise<void> | void;
+  /** Subscribe to lightweight activity notes for live TUI progress streaming. */
+  onActivity?(listener: (note: string) => void): void;
+  /** The usage accumulated over the session; absent when none is exposed. */
+  usage?(): DelegationUsage;
 }
+
+/**
+ * A live progress event for one delegation or sequence, streamed into the
+ * delegate tool's `onUpdate` and the status widget so the TUI shows in-flight
+ * progress (owner, step k/N, status). Offline-deterministic: the sequence loop
+ * emits the ordering; `step_activity` carries whatever the session reports.
+ */
+export type DelegationProgress =
+  | { kind: "sequence_start"; owners: string[]; total: number }
+  | { kind: "step_start"; owner: string; index: number; total: number }
+  | { kind: "step_activity"; owner: string; index: number; total: number; note: string }
+  | {
+      kind: "step_end";
+      owner: string;
+      index: number;
+      total: number;
+      status: CheckpointStatus | "build_failed";
+      changedPaths: number;
+    }
+  | { kind: "sequence_end"; total: number; completed: number; allCompleted: boolean };
 
 /** Dependencies for running a delegation: the session factory and optional cancellation. */
 export interface RunDeps {
   createSession: (config: DelegationSessionConfig) => Promise<DelegationSession>;
   /** Parent abort signal; when it fires, the delegated session is aborted (ADR 0078). */
   signal?: AbortSignal;
+  /** Sink for live activity notes from the in-flight session (visibility only). */
+  onActivity?: (note: string) => void;
+  /** Sink for structured progress events; the sequence loop drives the ordering. */
+  onProgress?: (progress: DelegationProgress) => void;
 }
 
-/** A minimal session-entry record for the steward (Phase 8 renders/persists it). */
+/** A session-entry record for one delegation (Phase 8 renders/persists it). */
 export interface DelegationEntry {
   kind: "orca_delegation";
   owner: string;
@@ -305,6 +377,14 @@ export interface DelegationEntry {
   instructionDigests: SourceDigest[];
   contextDigests: SourceDigest[];
   warnings: InjectionWarning[];
+  /** The grant-compiled tool names for this delegation (drives the honesty claim). */
+  toolNames: string[];
+  /** The ADR 0023 capability summary derived from {@link toolNames} (never a mode). */
+  capabilitySummary: CapabilitySummary;
+  /** Observed bash commands — visibility only, never enforcement (ADR 0079). */
+  bashActivity: BashActivity[];
+  /** Per-delegation usage totalled from the session's events. */
+  usage: DelegationUsage;
 }
 
 /** The steward-facing result of one delegation. */
@@ -313,6 +393,7 @@ export interface DelegationOutcome {
   targets: string[];
   checkpoint: CheckpointResult;
   warnings: InjectionWarning[];
+  usage: DelegationUsage;
   appendEntry: DelegationEntry;
 }
 
@@ -329,6 +410,7 @@ export type RunResult =
 function toEntry(
   config: DelegationSessionConfig,
   checkpoint: CheckpointResult,
+  usage: DelegationUsage,
 ): DelegationEntry {
   return {
     kind: "orca_delegation",
@@ -343,6 +425,10 @@ function toEntry(
     instructionDigests: config.instructionDigests,
     contextDigests: config.contextDigests,
     warnings: config.warnings,
+    toolNames: config.toolNames,
+    capabilitySummary: capabilitySummaryFor(config.toolNames),
+    bashActivity: [...config.record.bashActivity],
+    usage,
   };
 }
 
@@ -363,6 +449,7 @@ export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Pr
   const { config } = built;
 
   const session = await deps.createSession(config);
+  if (deps.onActivity && session.onActivity) session.onActivity(deps.onActivity);
 
   const onAbort = (): void => void session.abort();
   if (deps.signal) {
@@ -390,6 +477,8 @@ export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Pr
     config.record.checkpoint ??
     synthesizeFailed([...config.record.changedPaths].sort(), "No checkpoint was recorded.");
 
+  const usage = session.usage ? session.usage() : emptyUsage();
+
   return {
     ok: true,
     outcome: {
@@ -397,7 +486,8 @@ export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Pr
       targets: config.targets,
       checkpoint,
       warnings: config.warnings,
-      appendEntry: toEntry(config, checkpoint),
+      usage,
+      appendEntry: toEntry(config, checkpoint, usage),
     },
   };
 }
@@ -474,13 +564,18 @@ export async function runDelegationSequence(
   let stopped = false;
   let stoppedAt: string | undefined;
   let cancelled = false;
+  const total = ordered.length;
 
   const markStopped = (owner: string): void => {
     stopped = true;
     if (stoppedAt === undefined) stoppedAt = owner;
   };
 
+  deps.onProgress?.({ kind: "sequence_start", owners: ordered.map((o) => o.owner), total });
+
+  let index = 0;
   for (const inputs of ordered) {
+    index += 1;
     if (stopped) {
       steps.push({
         kind: "not_run",
@@ -498,7 +593,15 @@ export async function runDelegationSequence(
       continue;
     }
 
-    const result = await runDelegation(inputs, deps);
+    deps.onProgress?.({ kind: "step_start", owner: inputs.owner, index, total });
+    // Scope this owner's activity notes with its position so the widget/onUpdate
+    // stream can attribute streaming activity to the right in-flight delegation.
+    const stepDeps: RunDeps = {
+      ...deps,
+      onActivity: (note) =>
+        deps.onProgress?.({ kind: "step_activity", owner: inputs.owner, index, total, note }),
+    };
+    const result = await runDelegation(inputs, stepDeps);
     // A cancellation observed during this delegation (its session was aborted and
     // it ended with a synthesized failure) marks the whole sequence cancelled.
     if (deps.signal?.aborted) cancelled = true;
@@ -512,18 +615,37 @@ export async function runDelegationSequence(
         diagnostics: result.diagnostics,
         warnings: result.warnings,
       });
+      deps.onProgress?.({
+        kind: "step_end",
+        owner: inputs.owner,
+        index,
+        total,
+        status: "build_failed",
+        changedPaths: 0,
+      });
       markStopped(inputs.owner);
       continue;
     }
 
     steps.push({ kind: "delegated", outcome: result.outcome });
+    deps.onProgress?.({
+      kind: "step_end",
+      owner: inputs.owner,
+      index,
+      total,
+      status: result.outcome.checkpoint.status,
+      changedPaths: result.outcome.checkpoint.changedPaths.length,
+    });
     if (result.outcome.checkpoint.status !== "completed") markStopped(inputs.owner);
   }
 
-  return {
-    steps,
-    allCompleted: steps.length > 0 && steps.every(stepCompleted),
-    stoppedAt,
-    cancelled,
-  };
+  const allCompleted = steps.length > 0 && steps.every(stepCompleted);
+  deps.onProgress?.({
+    kind: "sequence_end",
+    total,
+    completed: steps.filter(stepCompleted).length,
+    allCompleted,
+  });
+
+  return { steps, allCompleted, stoppedAt, cancelled };
 }

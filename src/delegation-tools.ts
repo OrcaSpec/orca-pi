@@ -8,6 +8,8 @@ import {
   createWriteToolDefinition,
   defineTool,
   type AgentToolResult,
+  type BashSpawnContext,
+  type BashSpawnHook,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { CompiledGrant } from "./resolver";
@@ -245,14 +247,34 @@ export function createGrantedEditTool(
 }
 
 /**
- * The unmodified `bash` tool (ADR 0079). Included by default so domain agents
- * keep shells for tests, builds, and codegen. Orca applies no heuristic command
- * inspection; the delegation prompt states the write boundary so the model
- * self-polices, and the enforcement summary discloses that bash filesystem
- * effects are advisory, never counted in the observed manifest.
+ * A `spawnHook` that RECORDS each bash invocation's command and cwd into the
+ * delegation record and returns the spawn context UNCHANGED (ADR 0079).
+ *
+ * This is visibility, never enforcement. The hook is a pure pass-through for
+ * execution — it returns exactly the `{ command, cwd, env }` it received, so it
+ * cannot alter, rewrite, sandbox, or block a command — and nothing anywhere
+ * reads `record.bashActivity` to make an allow/deny decision. The log exists only
+ * so the human can SEE, after the fact, what shell commands a delegation ran; the
+ * subprocess filesystem dimension stays advisory (see `enforcement.ts`).
  */
-export function createDelegationBashTool(cwd: string): ToolDefinition {
-  return createBashToolDefinition(cwd) as ToolDefinition;
+export function recordingSpawnHook(record: DelegationRecord): BashSpawnHook {
+  return (context: BashSpawnContext): BashSpawnContext => {
+    record.bashActivity.push({ command: context.command, cwd: context.cwd });
+    return context;
+  };
+}
+
+/**
+ * The `bash` tool (ADR 0079), included by default so domain agents keep shells
+ * for tests, builds, and codegen. Orca applies no heuristic command inspection;
+ * the delegation prompt states the write boundary so the model self-polices, and
+ * the enforcement summary discloses that bash filesystem effects are advisory,
+ * never counted in the observed manifest. The only Orca addition is the
+ * {@link recordingSpawnHook}, which logs commands for visibility and never
+ * changes what runs.
+ */
+export function createDelegationBashTool(cwd: string, record: DelegationRecord): ToolDefinition {
+  return createBashToolDefinition(cwd, { spawnHook: recordingSpawnHook(record) }) as ToolDefinition;
 }
 
 function renderCheckpointText(result: CheckpointResult): string {
@@ -323,7 +345,7 @@ export function createDelegationTools(
     createGrantedReadTool(cwd, grant),
     createGrantedWriteTool(cwd, grant, record),
     createGrantedEditTool(cwd, grant, record),
-    createDelegationBashTool(cwd),
+    createDelegationBashTool(cwd, record),
     createCheckpointTool(record) as ToolDefinition,
   ];
 }

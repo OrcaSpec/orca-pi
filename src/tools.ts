@@ -3,6 +3,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
   defineTool,
   type AgentToolResult,
+  type AgentToolUpdateCallback,
   type ExtensionContext,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -18,10 +19,19 @@ import {
   type DelegationEntry,
   type DelegationInputs,
   type DelegationOutcome,
+  type DelegationProgress,
   type DelegationSession,
   type DelegationSessionConfig,
   type SequenceOutcome,
 } from "./delegation";
+import {
+  buildDelegationRecord,
+  digestGrants,
+  renderRecordLines,
+  type PersistedDelegationRecord,
+} from "./delegation-entry";
+import { progressLine } from "./surface";
+import { linesComponent } from "./tui";
 
 /**
  * The two routing-preview tools, `orca_resolve` (model facing) and
@@ -59,11 +69,18 @@ export type ResolveToolDetails =
   | { kind: "inactive"; state: RepositoryState["kind"] }
   | { kind: "invalid"; rejections: { input: string; reason: string }[] }
   | { kind: "empty" }
-  | { kind: "delegation"; outcome: DelegationOutcome }
+  | { kind: "delegation"; outcome: DelegationOutcome; record: PersistedDelegationRecord }
   | { kind: "delegation_failed"; failureKind: DelegationFailureKind; diagnostics: string[] }
-  | { kind: "delegation_sequence"; sequence: SequenceOutcome; unmanaged: string[]; mode: OperatingMode }
+  | {
+      kind: "delegation_sequence";
+      sequence: SequenceOutcome;
+      unmanaged: string[];
+      mode: OperatingMode;
+      record: PersistedDelegationRecord;
+    }
   | { kind: "unowned_blocked"; unownedPaths: string[]; resolution: Resolution }
-  | { kind: "all_unmanaged"; unownedPaths: string[] };
+  | { kind: "all_unmanaged"; unownedPaths: string[] }
+  | { kind: "progress"; progress: DelegationProgress };
 
 type ToolOutcome =
   | { kind: "resolution"; resolution: Resolution }
@@ -226,7 +243,7 @@ export interface DelegateDeps extends ToolDeps {
   getThinkingLevel: () => ThinkingLevel;
   /** Spawn a delegated session from an assembled config (the run-loop seam). */
   createSession: (config: DelegationSessionConfig) => Promise<DelegationSession>;
-  /** Record a delegation entry as it terminates (Phase 8 renders/persists it). */
+  /** Record a per-owner delegation entry as it terminates (route-log breadcrumb). */
   onDelegation?: (entry: DelegationEntry) => void;
   /**
    * Record an unowned-target delegation event (ADR 0012): `blocked` when enforce
@@ -234,6 +251,17 @@ export interface DelegateDeps extends ToolDeps {
    * with the owned subset and leaves the unowned paths as unmanaged work.
    */
   onUnowned?: (paths: string[], mode: OperatingMode, verdict: "blocked" | "flagged") => void;
+  /**
+   * Persist a completed delegation SEQUENCE as a session entry and add it to the
+   * durable history (PRD "User Surface"). Called once per sequence, after it ends.
+   */
+  onDelegationRecord?: (record: PersistedDelegationRecord) => void;
+  /**
+   * Live progress sink, invoked with the tool's own ctx so the extension can
+   * update the status widget and notify the human as a delegation runs. Progress
+   * is ALSO streamed into the tool's `onUpdate` for the TUI regardless of this.
+   */
+  onProgress?: (progress: DelegationProgress, ctx: ExtensionContext) => void;
 }
 
 /** The observed-manifest line shared by every checkpoint rendering. */
@@ -300,9 +328,12 @@ function checkpointBody(outcome: DelegationOutcome): string[] {
 }
 
 /** Single-owner (no unowned paths) result — the simplest, most common case. */
-function delegationResult(outcome: DelegationOutcome): AgentToolResult<ResolveToolDetails> {
+function delegationResult(
+  outcome: DelegationOutcome,
+  record: PersistedDelegationRecord,
+): AgentToolResult<ResolveToolDetails> {
   const body = [`Orca delegation to '${outcome.owner}' ended.`, ...checkpointBody(outcome)].join("\n");
-  return text(body, { kind: "delegation", outcome });
+  return text(body, { kind: "delegation", outcome, record });
 }
 
 /** Single-owner pre-spawn build failure (required source missing / oversized). */
@@ -365,6 +396,7 @@ function delegationSequenceResult(
   sequence: SequenceOutcome,
   unmanaged: string[],
   mode: OperatingMode,
+  record: PersistedDelegationRecord,
 ): AgentToolResult<ResolveToolDetails> {
   const total = sequence.steps.length;
   const completed = sequence.steps.filter(stepCompleted).length;
@@ -415,7 +447,23 @@ function delegationSequenceResult(
     );
   }
 
-  return text(lines.join("\n"), { kind: "delegation_sequence", sequence, unmanaged, mode });
+  return text(lines.join("\n"), { kind: "delegation_sequence", sequence, unmanaged, mode, record });
+}
+
+/**
+ * The human-facing TUI lines for a delegate result (`renderResult`). For a
+ * completed sequence it renders the persisted record (owner statuses, observed
+ * manifests, per-owner capability summary, bash-activity, and usage) so the human
+ * sees the honesty surface the LLM-facing text omits; for every other result it
+ * falls back to the tool's own text content. Pure — the TUI wrapping happens in
+ * `tui.ts`.
+ */
+export function delegateResultLines(result: AgentToolResult<ResolveToolDetails>): string[] {
+  const details = result.details;
+  if (details && (details.kind === "delegation" || details.kind === "delegation_sequence")) {
+    return renderRecordLines(details.record);
+  }
+  return result.content.flatMap((block) => (block.type === "text" ? block.text.split("\n") : []));
 }
 
 /**
@@ -455,11 +503,12 @@ export function createDelegateTool(
     promptSnippet:
       "orca_delegate — route writable work to its owner(s) by target paths and run under each grant.",
     parameters: delegateParamsSchema,
+    renderResult: (result) => linesComponent(delegateResultLines(result)),
     async execute(
       _toolCallId: string,
       params: DelegateToolInput,
       signal: AbortSignal | undefined,
-      _onUpdate: unknown,
+      onUpdate: AgentToolUpdateCallback<ResolveToolDetails> | undefined,
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<ResolveToolDetails>> {
       const state = deps.getState(ctx.cwd);
@@ -506,25 +555,51 @@ export function createDelegateTool(
             parent,
           }));
 
+          // Stream live progress into the tool's onUpdate (TUI) and hand each
+          // event to the extension (widget + notify) with the tool's own ctx.
+          const onProgress = (progress: DelegationProgress): void => {
+            onUpdate?.({
+              content: [{ type: "text", text: progressLine(progress) }],
+              details: { kind: "progress", progress },
+            });
+            deps.onProgress?.(progress, ctx);
+          };
+
+          const startedAt = Date.now();
           const sequence = await runDelegationSequence(ordered, {
             createSession: deps.createSession,
             signal,
+            onProgress,
           });
+          const endedAt = Date.now();
           for (const step of sequence.steps) {
             if (step.kind === "delegated") deps.onDelegation?.(step.outcome.appendEntry);
           }
+
+          // Persist the whole sequence as one durable session entry (PRD "User
+          // Surface"): owners, task, targets, grant digest, per-step statuses,
+          // observed manifests, usage, and timestamps.
+          const record = buildDelegationRecord({
+            task: params.task,
+            targets: resolution.perTarget.map((target) => target.path),
+            grantDigest: digestGrants(resolution.delegations.map((delegation) => delegation.grant)),
+            sequence,
+            startedAt,
+            endedAt,
+          });
+          deps.onDelegationRecord?.(record);
 
           // A single owner with no unowned paths keeps the direct single-owner
           // result shape; everything else renders as an aggregate sequence.
           if (unmanaged.length === 0 && ordered.length === 1) {
             const step = sequence.steps[0];
-            if (step.kind === "delegated") return delegationResult(step.outcome);
+            if (step.kind === "delegated") return delegationResult(step.outcome, record);
             if (step.kind === "build_failed") {
               return delegationFailedResult(step.failureKind, step.diagnostics, step.warnings);
             }
             // not_run (cancelled before start) falls through to the aggregate render.
           }
-          return delegationSequenceResult(sequence, unmanaged, mode);
+          return delegationSequenceResult(sequence, unmanaged, mode, record);
         }
       }
     },

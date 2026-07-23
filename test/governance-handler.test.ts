@@ -51,6 +51,8 @@ function makeApi(): { pi: unknown; registered: Registered } {
     registerTool(tool: Tool) {
       registered.tools.set(tool.name, tool);
     },
+    registerEntryRenderer(_customType: string, _renderer: unknown) {},
+    appendEntry(_customType: string, _data?: unknown) {},
   };
   return { pi, registered };
 }

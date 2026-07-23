@@ -101,23 +101,39 @@ export interface CheckpointResult {
 }
 
 /**
+ * One `bash` invocation observed by the spawn hook: the command and cwd only.
+ * This is VISIBILITY, never enforcement (ADR 0079) — see `delegation-tools.ts`.
+ */
+export interface BashActivity {
+  command: string;
+  cwd: string;
+}
+
+/**
  * The per-delegation observed record (ADR 0083). The grant-wrapped write/edit
  * tools add each successful mutation's repository-relative path to
  * {@link changedPaths}; the checkpoint tool sets {@link checkpoint} when the
  * agent ends the session. This mutable object is the seam between the tool layer
  * (which observes) and the orchestration layer (which reports): the manifest is
  * whatever the tools recorded, nothing the agent asserts.
+ *
+ * {@link bashActivity} is a parallel, purely-informational log of the shell
+ * commands the delegation ran, captured by the bash `spawnHook` for visibility
+ * (ADR 0079). It is NEVER consulted in any allow/deny decision and its contents
+ * are outside {@link changedPaths}: bash filesystem effects remain advisory.
  */
 export interface DelegationRecord {
   /** Repository-relative paths of successful file-tool mutations, observed. */
   changedPaths: Set<string>;
+  /** Observed bash commands (visibility only, never enforcement — ADR 0079). */
+  bashActivity: BashActivity[];
   /** The checkpoint once the session ends (agent-called or synthesized). */
   checkpoint?: CheckpointResult;
 }
 
 /** A fresh, empty observed record for one delegation. */
 export function createDelegationRecord(): DelegationRecord {
-  return { changedPaths: new Set() };
+  return { changedPaths: new Set(), bashActivity: [] };
 }
 
 /** Normalize a validated checkpoint input into the agent-supplied part of a result. */

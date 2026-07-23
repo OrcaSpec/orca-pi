@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as orcaspec from "orcaspec";
-import orcaPi from "../index";
+import orcaPi, { installOrca } from "../index";
+import { DELEGATION_ENTRY_TYPE } from "../src/delegation-entry";
+import type { DelegationSession, DelegationSessionConfig } from "../src/delegation";
 
 // A minimal ExtensionAPI double that captures registrations. The extension's
 // pi-framework imports are type-only, so index.ts pulls in no pi runtime here.
@@ -22,10 +24,18 @@ interface Registered {
   events: Map<string, (event: unknown, ctx: unknown) => unknown>;
   commands: Map<string, { description?: string; handler: (args: string, ctx: unknown) => Promise<void> }>;
   tools: Map<string, RegisteredTool>;
+  entryRenderers: Map<string, (entry: unknown, options: unknown, theme: unknown) => unknown>;
+  appended: { customType: string; data: unknown }[];
 }
 
 function makeApi(): { pi: unknown; registered: Registered } {
-  const registered: Registered = { events: new Map(), commands: new Map(), tools: new Map() };
+  const registered: Registered = {
+    events: new Map(),
+    commands: new Map(),
+    tools: new Map(),
+    entryRenderers: new Map(),
+    appended: [],
+  };
   const pi = {
     on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
       registered.events.set(event, handler);
@@ -36,20 +46,56 @@ function makeApi(): { pi: unknown; registered: Registered } {
     registerTool(tool: RegisteredTool) {
       registered.tools.set(tool.name, tool);
     },
+    registerEntryRenderer(customType: string, renderer: (entry: unknown, options: unknown, theme: unknown) => unknown) {
+      registered.entryRenderers.set(customType, renderer);
+    },
+    appendEntry(customType: string, data?: unknown) {
+      registered.appended.push({ customType, data });
+    },
   };
   return { pi, registered };
 }
 
-function makeCtx(cwd: string, hasUI: boolean) {
+/** A branch-carrying session manager double for session_start rebuild tests. */
+function makeCtx(cwd: string, hasUI: boolean, branch: unknown[] = []) {
   return {
     cwd,
     hasUI,
+    mode: "tui",
+    model: { id: "fake", provider: "fake" },
+    sessionManager: { getBranch: () => branch },
     ui: {
       notify: vi.fn(),
       setStatus: vi.fn(),
       setWidget: vi.fn(),
     },
   };
+}
+
+/** A scripted, owner-aware createSession that completes with a recorded change. */
+const OWNED: Record<string, string> = {
+  billing: "services/billing/x.rb",
+  web: "apps/web/app.tsx",
+  "design-system": "apps/web/components/button.tsx",
+  infra: "infra/main.tf",
+};
+function scriptedCreateSession() {
+  return async (config: DelegationSessionConfig): Promise<DelegationSession> => ({
+    prompt: async () => {
+      config.record.bashActivity.push({ command: `build ${config.owner}`, cwd: config.cwd });
+      config.record.changedPaths.add(OWNED[config.owner]);
+      const checkpoint = config.tools.find((t) => t.name === "orca_checkpoint")!;
+      await checkpoint.execute(
+        "t",
+        { status: "completed", summary: `${config.owner} done` } as never,
+        undefined,
+        undefined,
+        { cwd: config.cwd } as never,
+      );
+    },
+    abort: () => {},
+    usage: () => ({ inputTokens: 10, outputTokens: 5, totalTokens: 15, costUsd: 0.001, available: true }),
+  });
 }
 
 describe("orca-pi extension entry", () => {
@@ -168,5 +214,169 @@ describe("orca-pi extension entry", () => {
     const notified = ctx.ui.notify.mock.calls[0]?.[0] as string;
     expect(notified).toContain("semantic.duplicate_agent_id");
     expect(ctx.ui.notify.mock.calls[0]?.[1]).toBe("error");
+  });
+
+  // --- Phase 8: enforcement summary in /orca across all four states --------
+
+  const orcaText = (ctx: ReturnType<typeof makeCtx>): string =>
+    (ctx.ui.notify.mock.calls[0]?.[0] as string) ?? "";
+
+  it("/orca shows the enforcement summary + bash disclosure ONLY under active governance", async () => {
+    const { pi, registered } = makeApi();
+    orcaPi(pi as never);
+    writeSpec("single-agent");
+    const ctx = makeCtx(dir, true);
+    await registered.commands.get("orca")!.handler("", ctx);
+    const text = orcaText(ctx);
+    expect(text).toContain("Enforcement profile (dimensioned");
+    expect(text).toContain("Subprocess filesystem effects (bash): Advisory, disclosed");
+    expect(text).toContain("partially_enforced");
+  });
+
+  it("/orca in unmanaged, invalid_spec, and unsupported_spec_version shows diagnostics, NOT an enforcement claim", async () => {
+    const command = () => {
+      const { pi, registered } = makeApi();
+      orcaPi(pi as never);
+      return registered.commands.get("orca")!;
+    };
+
+    // unmanaged (no spec)
+    const unmanagedCtx = makeCtx(dir, true);
+    await command().handler("", unmanagedCtx);
+    expect(orcaText(unmanagedCtx)).toContain("unmanaged");
+    expect(orcaText(unmanagedCtx)).not.toContain("Enforcement profile");
+
+    // invalid_spec
+    writeSpec("duplicate-agent-id");
+    const invalidCtx = makeCtx(dir, true);
+    await command().handler("", invalidCtx);
+    expect(orcaText(invalidCtx)).toContain("invalid_spec");
+    expect(orcaText(invalidCtx)).toContain("Diagnostics");
+    expect(orcaText(invalidCtx)).not.toContain("Enforcement profile");
+
+    // unsupported_spec_version
+    writeSpec("unsupported-spec-version");
+    const unsupportedCtx = makeCtx(dir, true);
+    await command().handler("", unsupportedCtx);
+    expect(orcaText(unsupportedCtx)).toContain("unsupported_spec_version");
+    expect(orcaText(unsupportedCtx)).not.toContain("Enforcement profile");
+  });
+
+  // --- Phase 8: delegation persistence, entry renderer, live surfaces ------
+
+  it("registers a renderer for orca-delegation entries", () => {
+    const { pi, registered } = makeApi();
+    orcaPi(pi as never);
+    expect(registered.entryRenderers.has(DELEGATION_ENTRY_TYPE)).toBe(true);
+  });
+
+  it("persists a completed delegation as a session entry and shows it under /orca", async () => {
+    const { pi, registered } = makeApi();
+    installOrca(pi as never, { createSession: scriptedCreateSession() });
+    writeSpec("multi-owner");
+
+    const runCtx = makeCtx(dir, true);
+    await registered.tools.get("orca_delegate")!.execute(
+      "d1",
+      { task: "restyle the button", paths: ["apps/web/app.tsx"] },
+      undefined,
+      undefined,
+      runCtx,
+    );
+
+    // One orca-delegation entry was appended (no separate audit store).
+    const appended = registered.appended.filter((e) => e.customType === DELEGATION_ENTRY_TYPE);
+    expect(appended).toHaveLength(1);
+    expect((appended[0].data as { owners: string[] }).owners).toEqual(["web"]);
+
+    // Live surfaces fired during the delegation: widget updated + progress notified.
+    expect(runCtx.ui.setWidget).toHaveBeenCalled();
+    const notifications = runCtx.ui.notify.mock.calls.map((c) => c[0] as string);
+    expect(notifications.some((n) => n.includes("delegating to"))).toBe(true);
+    expect(notifications.some((n) => n.includes("delegation complete"))).toBe(true);
+
+    // The durable history is visible in /orca on the SAME session instance.
+    const statusCtx = makeCtx(dir, true);
+    await registered.commands.get("orca")!.handler("", statusCtx);
+    const status = orcaText(statusCtx);
+    expect(status).toContain("Delegation history (1):");
+    expect(status).toContain("restyle the button");
+    // Last-delegation detail carries the capability summary and the bash activity,
+    // labelled visibility-only (ADR 0079).
+    expect(status).toContain("Capability summary (not a mode): partially_enforced");
+    expect(status).toContain("Bash activity — VISIBILITY ONLY, not enforcement (ADR 0079)");
+  });
+
+  it("a resumed session rebuilds delegation history from session entries ALONE", async () => {
+    // First instance runs a delegation and captures the persisted entry.
+    const first = makeApi();
+    installOrca(first.pi as never, { createSession: scriptedCreateSession() });
+    writeSpec("multi-owner");
+    await first.registered.tools.get("orca_delegate")!.execute(
+      "d1",
+      { task: "the earlier task", paths: ["apps/web/app.tsx", "services/billing/x.rb"] },
+      undefined,
+      undefined,
+      makeCtx(dir, true),
+    );
+    const entry = {
+      type: "custom",
+      customType: DELEGATION_ENTRY_TYPE,
+      data: first.registered.appended.find((e) => e.customType === DELEGATION_ENTRY_TYPE)!.data,
+    };
+
+    // A FRESH instance (fresh in-memory state) resumes: session_start rebuilds
+    // history purely from the branch entries, with an unrelated entry interleaved.
+    const resumed = makeApi();
+    orcaPi(resumed.pi as never);
+    const branch = [{ type: "message", message: { role: "user" } }, entry];
+    const resumeCtx = makeCtx(dir, true, branch);
+    await resumed.registered.events.get("session_start")!({ reason: "resume" }, resumeCtx);
+
+    const statusCtx = makeCtx(dir, true, branch);
+    await resumed.registered.commands.get("orca")!.handler("", statusCtx);
+    expect(orcaText(statusCtx)).toContain("Delegation history (1):");
+    expect(orcaText(statusCtx)).toContain("the earlier task");
+  });
+
+  it("session_start announces activation for a managed repo and stays quiet when unmanaged", async () => {
+    const active = makeApi();
+    orcaPi(active.pi as never);
+    writeSpec("single-agent");
+    const activeCtx = makeCtx(dir, true);
+    await active.registered.events.get("session_start")!({ reason: "startup" }, activeCtx);
+    expect(activeCtx.ui.setStatus).toHaveBeenCalledWith("orca", "orca: advisory");
+    expect((activeCtx.ui.notify.mock.calls[0]?.[0] as string)).toContain("governance active");
+
+    const bare = mkdtempSync(join(tmpdir(), "orca-pi-bare-"));
+    try {
+      const unmanaged = makeApi();
+      orcaPi(unmanaged.pi as never);
+      const bareCtx = makeCtx(bare, true);
+      await unmanaged.registered.events.get("session_start")!({ reason: "startup" }, bareCtx);
+      expect(bareCtx.ui.setStatus).toHaveBeenCalledWith("orca", "orca: unmanaged");
+      expect(bareCtx.ui.notify).not.toHaveBeenCalled();
+    } finally {
+      rmSync(bare, { recursive: true, force: true });
+    }
+  });
+
+  it("drives a full delegation headless without any UI calls", async () => {
+    const { pi, registered } = makeApi();
+    installOrca(pi as never, { createSession: scriptedCreateSession() });
+    writeSpec("multi-owner");
+    const ctx = makeCtx(dir, false);
+    await registered.tools.get("orca_delegate")!.execute(
+      "d1",
+      { task: "headless task", paths: ["apps/web/app.tsx"] },
+      undefined,
+      undefined,
+      ctx,
+    );
+    // The delegation still ran and persisted; the surfaces were simply no-ops.
+    expect(registered.appended.filter((e) => e.customType === DELEGATION_ENTRY_TYPE)).toHaveLength(1);
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+    expect(ctx.ui.setStatus).not.toHaveBeenCalled();
+    expect(ctx.ui.setWidget).not.toHaveBeenCalled();
   });
 });
