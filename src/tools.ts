@@ -1,4 +1,5 @@
 import { Type, type Static } from "typebox";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
   defineTool,
   type AgentToolResult,
@@ -7,8 +8,16 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { normalizeTarget } from "./paths";
 import { resolve, type Resolution } from "./resolver";
-import { renderDelegatePlan, renderExplain, renderResolvePreview, summarizeResolution } from "./render";
-import { formatStatusLines, type RepositoryState } from "./state";
+import { renderExplain, renderResolvePreview, summarizeResolution } from "./render";
+import { formatStatusLines, type ActiveState, type RepositoryState } from "./state";
+import {
+  runDelegation,
+  type DelegationEntry,
+  type DelegationInputs,
+  type DelegationOutcome,
+  type DelegationSession,
+  type DelegationSessionConfig,
+} from "./delegation";
 
 /**
  * The two routing-preview tools, `orca_resolve` (model facing) and
@@ -37,12 +46,18 @@ const paramsSchema = Type.Object(
 
 type ToolParams = Static<typeof paramsSchema>;
 
+/** Pre-spawn delegation failure kinds surfaced to the steward. */
+export type DelegationFailureKind = "unknown_owner" | "required_missing" | "oversized";
+
 /** Structured details attached to a tool result for logs / UI. */
 export type ResolveToolDetails =
   | { kind: "resolution"; resolution: Resolution }
   | { kind: "inactive"; state: RepositoryState["kind"] }
   | { kind: "invalid"; rejections: { input: string; reason: string }[] }
-  | { kind: "empty" };
+  | { kind: "empty" }
+  | { kind: "phase7_pending"; resolution: Resolution }
+  | { kind: "delegation"; outcome: DelegationOutcome }
+  | { kind: "delegation_failed"; failureKind: DelegationFailureKind; diagnostics: string[] };
 
 type ToolOutcome =
   | { kind: "resolution"; resolution: Resolution }
@@ -199,35 +214,111 @@ const delegateParamsSchema = Type.Object(
 /** Exported so `tool_call` handlers and tests can type the delegate input. */
 export type DelegateToolInput = Static<typeof delegateParamsSchema>;
 
+/** Dependencies the delegate tool needs beyond routing: model, session factory, sink. */
+export interface DelegateDeps extends ToolDeps {
+  /** The parent session's current thinking level (ADR 0076); model comes from ctx. */
+  getThinkingLevel: () => ThinkingLevel;
+  /** Spawn a delegated session from an assembled config (the run-loop seam). */
+  createSession: (config: DelegationSessionConfig) => Promise<DelegationSession>;
+  /** Record a completed delegation entry (Phase 8 renders/persists it). */
+  onDelegation?: (entry: DelegationEntry) => void;
+}
+
+/** The Phase-7-pending explanation: single-owner-only executes this phase. */
+function phase7PendingResult(resolution: Resolution): AgentToolResult<ResolveToolDetails> {
+  const reasons: string[] = [];
+  if (resolution.delegations.length !== 1) {
+    reasons.push(
+      `it resolves to ${resolution.delegations.length} owner(s), and Phase 6 executes only a single-owner ` +
+        "delegation (multi-owner tasks split into sequential per-owner delegations in Phase 7)",
+    );
+  }
+  if (resolution.unownedPaths.length > 0) {
+    reasons.push(
+      `it includes unowned target(s) (${resolution.unownedPaths.join(", ")}), whose enforce/advisory ` +
+        "handling lands in Phase 7",
+    );
+  }
+  const body = [
+    "Orca delegate did not execute: " + reasons.join("; ") + ".",
+    "The resolved routing is shown below for preview; no session was spawned and no file was changed.",
+    "",
+    renderResolvePreview(resolution),
+  ].join("\n");
+  return text(body, { kind: "phase7_pending", resolution });
+}
+
+function delegationResult(outcome: DelegationOutcome): AgentToolResult<ResolveToolDetails> {
+  const cp = outcome.checkpoint;
+  const lines = [
+    `Orca delegation to '${outcome.owner}' ended: ${cp.status}` +
+      (cp.synthesized ? " (synthesized — the session ended without calling orca_checkpoint)" : "") +
+      ".",
+    `Summary: ${cp.summary}`,
+    cp.changedPaths.length > 0
+      ? `Observed changed paths (${cp.changedPaths.length}): ${cp.changedPaths.join(", ")}`
+      : "Observed changed paths: (none).",
+  ];
+  if (cp.scopeRequest && cp.scopeRequest.length > 0) {
+    lines.push(`Scope requested: ${cp.scopeRequest.join(", ")}`);
+  }
+  if (outcome.warnings.length > 0) {
+    lines.push("Warnings:");
+    for (const warning of outcome.warnings) lines.push(`  - ${warning.path}: ${warning.reason}`);
+  }
+  return text(lines.join("\n"), { kind: "delegation", outcome });
+}
+
+function delegationFailedResult(
+  failureKind: DelegationFailureKind,
+  diagnostics: string[],
+  warnings: { path: string; reason: string }[],
+): AgentToolResult<ResolveToolDetails> {
+  const lines = [
+    `Orca delegation was blocked before spawning a session (${failureKind}):`,
+    ...diagnostics.map((diagnostic) => `  - ${diagnostic}`),
+  ];
+  if (warnings.length > 0) {
+    lines.push("Warnings:");
+    for (const warning of warnings) lines.push(`  - ${warning.path}: ${warning.reason}`);
+  }
+  return text(lines.join("\n"), { kind: "delegation_failed", failureKind, diagnostics });
+}
+
 /**
- * `orca_delegate` — Phase 5 STUB. It resolves the target paths to their owners
- * and returns the delegation plan it *would* execute, clearly labeled as a
- * preview. It spawns no session and changes no file; delegation execution lands
- * in Phase 6. Only the steward has this tool, and the parent session never gets
- * `orca_checkpoint` (that terminates a delegated session).
+ * `orca_delegate` — Phase 6: run one single-owner delegation end-to-end. It
+ * resolves the target paths, and when they route to exactly one owner with no
+ * unowned paths it assembles a grant-compiled in-process session (parent model +
+ * thinking level, injected instructions/context, operator handoff) and runs it
+ * to a terminal checkpoint, returning the status, summary, and observed changed
+ * paths. Multi-owner splits and unowned-path handling are Phase 7, so those
+ * cases return a Phase-7-pending explanation rather than half-executing. Only the
+ * steward has this tool; delegated sessions never do (they get orca_checkpoint).
  */
 export function createDelegateTool(
-  deps: ToolDeps,
+  deps: DelegateDeps,
 ): ToolDefinition<typeof delegateParamsSchema, ResolveToolDetails> {
   return defineTool({
     name: "orca_delegate",
     label: "Orca delegate",
     description:
-      "Delegate writable work to the structurally determined owner(s) of the given target paths. " +
-      "Pass the task plus concrete repository-relative paths (never an agent id); Orca resolves the " +
-      "owner and runs the write under that agent's grant. PHASE 5 STUB: returns the delegation plan " +
-      "without spawning a session or changing files (execution lands in Phase 6).",
+      "Delegate writable work to the structurally determined owner of the given target paths. Pass " +
+      "the task plus concrete repository-relative paths (never an agent id); Orca resolves the owner " +
+      "and runs the work as a scoped in-process session whose read/write/edit tools enforce that " +
+      "agent's grant, ending in a structured checkpoint with an observed changed-path manifest. " +
+      "This phase executes single-owner delegations; multi-owner and unowned-path handling is Phase 7.",
     promptSnippet:
-      "orca_delegate — route writable work to its owner by target paths (Phase 5: previews the plan).",
+      "orca_delegate — route writable work to its owner by target paths and run it under that grant.",
     parameters: delegateParamsSchema,
     async execute(
       _toolCallId: string,
       params: DelegateToolInput,
-      _signal: AbortSignal | undefined,
+      signal: AbortSignal | undefined,
       _onUpdate: unknown,
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<ResolveToolDetails>> {
-      const outcome = computeOutcome(deps.getState(ctx.cwd), params.paths, ctx.cwd);
+      const state = deps.getState(ctx.cwd);
+      const outcome = computeOutcome(state, params.paths, ctx.cwd);
       switch (outcome.kind) {
         case "empty":
           return emptyResult();
@@ -235,12 +326,36 @@ export function createDelegateTool(
           return inactiveResult(outcome.state);
         case "invalid":
           return invalidResult(outcome.rejections);
-        case "resolution":
-          deps.onRoute?.(outcome.resolution);
-          return text(renderDelegatePlan(params.task, outcome.resolution), {
-            kind: "resolution",
-            resolution: outcome.resolution,
-          });
+        case "resolution": {
+          const { resolution } = outcome;
+          deps.onRoute?.(resolution);
+
+          // Phase 6 executes the single-owner happy path only (ADR 0081; multi-owner
+          // split + unowned handling are Phase 7).
+          if (resolution.delegations.length !== 1 || resolution.unownedPaths.length > 0) {
+            return phase7PendingResult(resolution);
+          }
+
+          const active = state as ActiveState;
+          const delegation = resolution.delegations[0];
+          const inputs: DelegationInputs = {
+            document: active.document,
+            owner: delegation.owner,
+            targets: delegation.targets,
+            grant: delegation.grant,
+            task: params.task,
+            effectiveMode: active.effectiveMode,
+            cwd: ctx.cwd,
+            parent: { model: ctx.model, thinkingLevel: deps.getThinkingLevel() },
+          };
+
+          const result = await runDelegation(inputs, { createSession: deps.createSession, signal });
+          if (!result.ok) {
+            return delegationFailedResult(result.kind, result.diagnostics, result.warnings);
+          }
+          deps.onDelegation?.(result.outcome.appendEntry);
+          return delegationResult(result.outcome);
+        }
       }
     },
   });

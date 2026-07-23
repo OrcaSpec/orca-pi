@@ -1,7 +1,9 @@
 import { realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve as resolvePath, sep } from "node:path";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
   isToolCallEventType,
+  ModelRuntime,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
@@ -34,6 +36,8 @@ import {
   type GovernedWriteTool,
 } from "./src/governance";
 import { composeStewardPrompt } from "./src/steward";
+import type { DelegationSession, DelegationSessionConfig } from "./src/delegation";
+import { createRealSessionFactory } from "./src/session-runner";
 
 /**
  * Orca for pi — Phase 5: steward governance of the parent session (ADR 0080).
@@ -79,6 +83,22 @@ export default function orcaPi(pi: ExtensionAPI): void {
   // (not blocked) call proceeds; when its result arrives we append the
   // explanation so the model sees the same note the human was notified of.
   const pendingFlags = new Map<string, string>();
+
+  // The parent session's thinking level, tracked so delegations run on the
+  // parent model + thinking level (ADR 0076). The model itself is read from the
+  // tool ctx at delegation time; there is no per-agent model configuration.
+  let parentThinkingLevel: ThinkingLevel = "medium";
+
+  // The delegated-session factory is built lazily on first delegation so a
+  // pass-through (unmanaged) session never constructs a ModelRuntime. Cached for
+  // the life of the extension instance (rebuilt fresh on /reload).
+  let sessionFactory: ((config: DelegationSessionConfig) => Promise<DelegationSession>) | undefined;
+  const createSession = async (config: DelegationSessionConfig): Promise<DelegationSession> => {
+    if (!sessionFactory) {
+      sessionFactory = createRealSessionFactory(await ModelRuntime.create());
+    }
+    return sessionFactory(config);
+  };
 
   const currentState = (ctx: ExtensionContext | ExtensionCommandContext): RepositoryState =>
     detectRepositoryState(ctx.cwd, requestedMode);
@@ -193,6 +213,11 @@ export default function orcaPi(pi: ExtensionAPI): void {
     return undefined;
   };
 
+  // Track the parent session's thinking level so delegations inherit it (ADR 0076).
+  pi.on("thinking_level_select", async (event) => {
+    parentThinkingLevel = event.level;
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     // Passive detection for every start reason. Publish only the compact status;
     // the governance handlers below activate independently and only when active.
@@ -298,5 +323,15 @@ export default function orcaPi(pi: ExtensionAPI): void {
   // session — it terminates a delegated session, not the steward (ADR 0083).
   pi.registerTool(createResolveTool(toolDeps));
   pi.registerTool(createExplainTool(toolDeps));
-  pi.registerTool(createDelegateTool(toolDeps));
+  pi.registerTool(
+    createDelegateTool({
+      ...toolDeps,
+      getThinkingLevel: () => parentThinkingLevel,
+      createSession,
+      onDelegation: (entry) =>
+        routeLog.record(
+          `delegated ${entry.owner}: ${entry.status}, ${entry.changedPaths.length} changed path(s)`,
+        ),
+    }),
+  );
 }

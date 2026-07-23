@@ -78,46 +78,6 @@ export function renderResolvePreview(resolution: Resolution): string {
   return lines.join("\n");
 }
 
-/**
- * The delegation plan `orca_delegate` would execute, rendered as a preview. In
- * Phase 5 the tool is a stub: it runs the pure resolver and shows the per-owner
- * delegations and grants it *would* issue, but spawns no session and touches no
- * file. The Phase 6 label is prominent so neither the model nor the human
- * mistakes the plan for executed work.
- */
-export function renderDelegatePlan(task: string, resolution: Resolution): string {
-  const lines: string[] = [
-    "Orca delegation plan (PREVIEW ONLY — delegation execution lands in Phase 6).",
-    "No session was spawned and no file was changed.",
-    "",
-    `Task: ${task}`,
-    "",
-    `Planned delegations (${resolution.delegations.length}) — one per owner, sequential, by owner id:`,
-  ];
-  if (resolution.delegations.length === 0) {
-    lines.push("  (none — no target routes to an owner)");
-  }
-  for (const delegation of resolution.delegations) {
-    lines.push(`  ${delegationHeader(delegation)}`);
-    lines.push(...formatGrant(delegation));
-  }
-
-  if (resolution.unownedPaths.length > 0) {
-    lines.push("", `Unowned targets (${resolution.unownedPaths.length}) — not delegated:`);
-    for (const path of resolution.unownedPaths) lines.push(`  - ${path}`);
-    lines.push(
-      "Unowned writable targets would block delegation in enforce mode and warn in advisory mode (ADR 0012).",
-    );
-  }
-
-  lines.push(
-    "",
-    "When Phase 6 lands, orca_delegate will run each delegation as a scoped in-process session " +
-      "whose read/write/edit tools enforce the grant above.",
-  );
-  return lines.join("\n");
-}
-
 function explainTarget(reasoning: TargetReasoning): string[] {
   if (reasoning.unowned) {
     return [

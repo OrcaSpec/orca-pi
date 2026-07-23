@@ -376,24 +376,26 @@ describe("steward governance handlers", () => {
     expect(registered.tools.has("orca_checkpoint")).toBe(false);
   });
 
-  it("orca_delegate returns the delegation plan without spawning or writing (Phase 6 label)", async () => {
+  it("orca_delegate defers a multi-owner task to Phase 7 without spawning or writing", async () => {
     const { pi, registered } = makeApi();
     orcaPi(pi as never);
     writeSpec("multi-owner");
+    // Two owners (web + billing) => not the single-owner happy path; returns the
+    // Phase-7-pending explanation without constructing a session (no network).
     const result = await registered.tools.get("orca_delegate")!.execute(
       "d1",
-      { task: "restyle the button", paths: ["apps/web/app.tsx"] },
+      { task: "restyle the button and touch billing", paths: ["apps/web/app.tsx", "services/billing/x.rb"] },
       undefined,
       undefined,
       { cwd: dir },
     );
     const body = result.content.map((c) => c.text).join("\n");
-    expect(body).toContain("PREVIEW");
-    expect(body).toContain("Phase 6");
-    expect(body).toContain("web");
-    expect(result.details?.kind).toBe("resolution");
-    // No side effect: the planned target was never created.
+    expect(body).toContain("Phase 7");
+    expect(body).toContain("owner");
+    expect(result.details?.kind).toBe("phase7_pending");
+    // No side effect: neither planned target was created.
     expect(existsSync(join(dir, "apps", "web", "app.tsx"))).toBe(false);
+    expect(existsSync(join(dir, "services", "billing", "x.rb"))).toBe(false);
   });
 
   // --- Reload idempotency --------------------------------------------------
