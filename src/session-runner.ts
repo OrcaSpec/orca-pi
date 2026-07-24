@@ -3,10 +3,56 @@ import {
   DefaultResourceLoader,
   getAgentDir,
   SessionManager,
+  type InlineExtension,
   type ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "@earendil-works/pi-ai";
 import { emptyUsage, type DelegationSession, type DelegationSessionConfig, type DelegationUsage } from "./delegation";
+
+const CHILD_OBSERVER_BRIDGE_SYMBOL = Symbol.for(
+  "@orca-eval/pi-observer/child-session-bridge",
+);
+
+interface ChildObserverHandle {
+  extension: InlineExtension;
+  start(): void;
+  setOutcome(evidence: {
+    status: "completed" | "error" | "cancelled";
+    checkpointStatus: string;
+    changedPaths: string[];
+  }): void;
+  finish(): void;
+}
+
+interface ChildObserverBridge {
+  prepareDelegation(input: {
+    grantId: string;
+    targetPaths: string[];
+    resolvedOwners: string[];
+  }): ChildObserverHandle;
+}
+
+function childObserverBridge(): ChildObserverBridge | undefined {
+  const scope = globalThis as typeof globalThis & {
+    [CHILD_OBSERVER_BRIDGE_SYMBOL]?: ChildObserverBridge;
+  };
+  return scope[CHILD_OBSERVER_BRIDGE_SYMBOL];
+}
+
+export function prepareChildObserver(
+  config: DelegationSessionConfig,
+): ChildObserverHandle | undefined {
+  const bridge = childObserverBridge();
+  if (!bridge) return undefined;
+  if (!config.grantId) {
+    throw new Error("Observed delegated sessions require a stable grant ID");
+  }
+  return bridge.prepareDelegation({
+    grantId: config.grantId,
+    targetPaths: config.targets,
+    resolvedOwners: [config.owner],
+  });
+}
 
 /**
  * Fold one pi-ai {@link Usage} block into a running delegation total. pi reports
@@ -30,11 +76,10 @@ function addUsage(total: DelegationUsage, usage: Usage): DelegationUsage {
  *
  * Two construction choices are load-bearing:
  *
- * - `extensionsOverride` returns an empty extension set. Without it,
- *   `DefaultResourceLoader` would rediscover the orca-pi extension itself and run
- *   it inside the child — re-registering `orca_delegate` and re-governing the
- *   session as a steward. A delegated session must carry ONLY its grant-compiled
- *   tools, so no extensions are loaded and no parent governance leaks in.
+ * - Normal extension discovery is disabled. When the evaluator-owned passive
+ *   observer exposes its in-process bridge, that one hidden inline extension is
+ *   retained; Orca itself and every unrelated extension remain excluded. This
+ *   preserves grant-only child governance while producing correlated evidence.
  * - `noTools: "builtin"` disables pi's default read/bash/edit/write; the session's
  *   tools are exactly the grant-compiled `customTools` (grant-checked
  *   read/write/edit, unmodified bash, and orca_checkpoint). The system prompt and
@@ -49,15 +94,27 @@ export function createRealSessionFactory(
   modelRuntime: ModelRuntime,
 ): (config: DelegationSessionConfig) => Promise<DelegationSession> {
   return async (config: DelegationSessionConfig): Promise<DelegationSession> => {
+    const childObserver = prepareChildObserver(config);
     const loader = new DefaultResourceLoader({
       cwd: config.cwd,
       agentDir: getAgentDir(),
-      extensionsOverride: (base) => ({ ...base, extensions: [], errors: [] }),
+      noExtensions: true,
+      extensionFactories: childObserver ? [childObserver.extension] : [],
+      extensionsOverride: (base) => ({
+        ...base,
+        extensions: base.extensions.filter(
+          (extension) => extension.path === "<inline:orca-eval-child-observer>",
+        ),
+        errors: base.errors.filter(
+          (error) => error.path === "<inline:orca-eval-child-observer>",
+        ),
+      }),
       systemPromptOverride: () => config.systemPrompt,
       agentsFilesOverride: () => ({ agentsFiles: config.contextFiles }),
     });
     await loader.reload();
 
+    childObserver?.start();
     const { session } = await createAgentSession({
       cwd: config.cwd,
       model: config.model,
@@ -97,6 +154,18 @@ export function createRealSessionFactory(
         activityListeners.push(listener);
       },
       usage: () => usageTotal,
+      finish: async (evidence) => {
+        childObserver?.setOutcome(evidence);
+        try {
+          await session.extensionRunner.emit({
+            type: "session_shutdown",
+            reason: "quit",
+          });
+        } finally {
+          session.dispose();
+        }
+        childObserver?.finish();
+      },
     };
   };
 }

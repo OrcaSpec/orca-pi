@@ -54,6 +54,8 @@ export interface DelegationInputs {
   owner: string;
   targets: string[];
   grant: CompiledGrant;
+  /** Stable digest of the compiled grant, when the caller retains trace evidence. */
+  grantId?: string;
   /** The scoped assignment the steward delegated. */
   task: string;
   /** The original user request, when the steward passes it through; defaults to the task. */
@@ -79,6 +81,7 @@ export interface DelegationSessionConfig {
   cwd: string;
   owner: string;
   targets: string[];
+  grantId?: string;
   systemPrompt: string;
   contextFiles: { path: string; content: string }[];
   tools: ToolDefinition[];
@@ -264,6 +267,7 @@ export function buildDelegationSession(inputs: DelegationInputs): BuildResult {
       cwd: inputs.cwd,
       owner: inputs.owner,
       targets: inputs.targets,
+      grantId: inputs.grantId,
       systemPrompt,
       contextFiles,
       tools,
@@ -330,6 +334,12 @@ export interface DelegationSession {
   onActivity?(listener: (note: string) => void): void;
   /** The usage accumulated over the session; absent when none is exposed. */
   usage?(): DelegationUsage;
+  /** Dispose the child runtime and finalize optional evaluator evidence. */
+  finish?(evidence: {
+    status: "completed" | "error" | "cancelled";
+    checkpointStatus: CheckpointStatus;
+    changedPaths: string[];
+  }): Promise<void>;
 }
 
 /**
@@ -457,9 +467,13 @@ export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Pr
     else deps.signal.addEventListener("abort", onAbort, { once: true });
   }
 
+  let completionStatus: "completed" | "error" | "cancelled" =
+    deps.signal?.aborted ? "cancelled" : "completed";
   try {
     await session.prompt(config.kickoffPrompt);
+    if (deps.signal?.aborted) completionStatus = "cancelled";
   } catch (error) {
+    completionStatus = deps.signal?.aborted ? "cancelled" : "error";
     // A rejected prompt (including an aborted session) does not end statusless:
     // fall through to synthesize a failed checkpoint below unless one was recorded.
     if (!config.record.checkpoint) {
@@ -478,6 +492,11 @@ export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Pr
     synthesizeFailed([...config.record.changedPaths].sort(), "No checkpoint was recorded.");
 
   const usage = session.usage ? session.usage() : emptyUsage();
+  await session.finish?.({
+    status: completionStatus,
+    checkpointStatus: checkpoint.status,
+    changedPaths: [...checkpoint.changedPaths].sort(),
+  });
 
   return {
     ok: true,

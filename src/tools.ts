@@ -549,6 +549,7 @@ export function createDelegateTool(
             owner: delegation.owner,
             targets: delegation.targets,
             grant: delegation.grant,
+            grantId: digestGrants([delegation.grant]),
             task: params.task,
             effectiveMode: mode,
             cwd: ctx.cwd,

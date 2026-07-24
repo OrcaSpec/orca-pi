@@ -246,6 +246,33 @@ describe("runDelegation end-to-end (scripted, offline)", () => {
     expect(result.outcome.appendEntry.changedPaths).toEqual(["apps/web/app.tsx"]);
   });
 
+  it("finalizes child evidence with runtime and checkpoint outcomes", async () => {
+    const finish = vi.fn();
+    const createSession = async (config: DelegationSessionConfig): Promise<DelegationSession> => ({
+      prompt: async () => {
+        await callTool(config, "write", {
+          path: "apps/web/app.tsx",
+          content: "<button>observed</button>",
+        });
+        await callTool(config, "orca_checkpoint", {
+          status: "completed",
+          summary: "observed",
+        });
+      },
+      abort: vi.fn(),
+      finish,
+    });
+
+    const result = await runDelegation(inputsFor(dir, webAgent()), { createSession });
+
+    expect(result.ok).toBe(true);
+    expect(finish).toHaveBeenCalledWith({
+      status: "completed",
+      checkpointStatus: "completed",
+      changedPaths: ["apps/web/app.tsx"],
+    });
+  });
+
   it("synthesizes a failed checkpoint (with observed paths) when the session ends statusless", async () => {
     const { createSession } = scriptedSession(async (config) => {
       await callTool(config, "write", { path: "apps/web/app.tsx", content: "half done" });
@@ -291,14 +318,21 @@ describe("runDelegation end-to-end (scripted, offline)", () => {
   });
 
   it("aborts immediately when the parent signal is already aborted", async () => {
-    const { createSession, abort } = scriptedSession(async () => {
-      /* prompt resolves without doing anything */
+    const abort = vi.fn();
+    const finish = vi.fn();
+    const createSession = async (): Promise<DelegationSession> => ({
+      prompt: async () => {},
+      abort,
+      finish,
     });
     const result = await runDelegation(inputsFor(dir, webAgent()), {
       createSession,
       signal: AbortSignal.abort(),
     });
     expect(abort).toHaveBeenCalled();
+    expect(finish).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "cancelled" }),
+    );
     expect(result.ok).toBe(true);
   });
 
