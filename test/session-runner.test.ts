@@ -47,7 +47,7 @@ describe("real delegated session observer isolation", () => {
     const shutdown = vi.fn();
     const prepareDelegation = vi.fn(() => ({
       extension: {
-        name: "orca-eval-child-observer",
+        name: "child-observer",
         hidden: true,
         factory: (pi: ExtensionAPI) => {
           pi.on("session_shutdown", shutdown);

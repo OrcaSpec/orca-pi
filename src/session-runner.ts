@@ -104,6 +104,11 @@ export function createRealSessionFactory(
 ): (config: DelegationSessionConfig) => Promise<DelegationSession> {
   return async (config: DelegationSessionConfig): Promise<DelegationSession> => {
     const childObserver = prepareChildObserver(config, childObserverBridge);
+    const childObserverPath = childObserver
+      ? typeof childObserver.extension === "function"
+        ? "<inline:1>"
+        : `<inline:${childObserver.extension.name}>`
+      : undefined;
     const loader = new DefaultResourceLoader({
       cwd: config.cwd,
       agentDir: getAgentDir(),
@@ -112,10 +117,10 @@ export function createRealSessionFactory(
       extensionsOverride: (base) => ({
         ...base,
         extensions: base.extensions.filter(
-          (extension) => extension.path === "<inline:orca-eval-child-observer>",
+          (extension) => extension.path === childObserverPath,
         ),
         errors: base.errors.filter(
-          (error) => error.path === "<inline:orca-eval-child-observer>",
+          (error) => error.path === childObserverPath,
         ),
       }),
       systemPromptOverride: () => config.systemPrompt,
