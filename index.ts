@@ -41,7 +41,10 @@ import type {
   DelegationSession,
   DelegationSessionConfig,
 } from "./src/delegation";
-import { createRealSessionFactory } from "./src/session-runner";
+import {
+  createRealSessionFactory,
+  requestChildObserverBridge,
+} from "./src/session-runner";
 import { formatEnforcementSummary } from "./src/enforcement";
 import {
   DELEGATION_ENTRY_TYPE,
@@ -148,7 +151,10 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
   const createSession = async (config: DelegationSessionConfig): Promise<DelegationSession> => {
     if (overrides.createSession) return overrides.createSession(config);
     if (!sessionFactory) {
-      sessionFactory = createRealSessionFactory(await ModelRuntime.create());
+      sessionFactory = createRealSessionFactory(
+        await ModelRuntime.create(),
+        requestChildObserverBridge(pi.events),
+      );
     }
     return sessionFactory(config);
   };

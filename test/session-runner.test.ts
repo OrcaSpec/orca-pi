@@ -11,8 +11,6 @@ import { createDelegationRecord } from "../src/checkpoint";
 import type { DelegationSessionConfig } from "../src/delegation";
 import { createRealSessionFactory } from "../src/session-runner";
 
-const BRIDGE = Symbol.for("@orca-eval/pi-observer/child-session-bridge");
-
 function config(cwd: string): DelegationSessionConfig {
   return {
     cwd,
@@ -37,7 +35,6 @@ describe("real delegated session observer isolation", () => {
   let directory: string | undefined;
 
   afterEach(() => {
-    delete (globalThis as Record<symbol, unknown>)[BRIDGE];
     if (directory) rmSync(directory, { recursive: true, force: true });
     directory = undefined;
   });
@@ -60,9 +57,10 @@ describe("real delegated session observer isolation", () => {
       setOutcome,
       finish,
     }));
-    (globalThis as Record<symbol, unknown>)[BRIDGE] = { prepareDelegation };
-
-    const factory = createRealSessionFactory(await ModelRuntime.create());
+    const factory = createRealSessionFactory(
+      await ModelRuntime.create(),
+      { prepareDelegation },
+    );
     const session = await factory(config(directory));
     await session.finish?.({
       status: "completed",

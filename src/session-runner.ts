@@ -3,15 +3,15 @@ import {
   DefaultResourceLoader,
   getAgentDir,
   SessionManager,
+  type EventBus,
   type InlineExtension,
   type ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "@earendil-works/pi-ai";
 import { emptyUsage, type DelegationSession, type DelegationSessionConfig, type DelegationUsage } from "./delegation";
 
-const CHILD_OBSERVER_BRIDGE_SYMBOL = Symbol.for(
-  "@orca-eval/pi-observer/child-session-bridge",
-);
+const CHILD_OBSERVER_BRIDGE_REQUEST_CHANNEL =
+  "orca-eval:child-observer-bridge-request:v1";
 
 interface ChildObserverHandle {
   extension: InlineExtension;
@@ -24,7 +24,7 @@ interface ChildObserverHandle {
   finish(): void;
 }
 
-interface ChildObserverBridge {
+export interface ChildObserverBridge {
   prepareDelegation(input: {
     grantId: string;
     targetPaths: string[];
@@ -32,17 +32,25 @@ interface ChildObserverBridge {
   }): ChildObserverHandle;
 }
 
-function childObserverBridge(): ChildObserverBridge | undefined {
-  const scope = globalThis as typeof globalThis & {
-    [CHILD_OBSERVER_BRIDGE_SYMBOL]?: ChildObserverBridge;
+export function requestChildObserverBridge(
+  events: EventBus,
+): ChildObserverBridge | undefined {
+  const request: {
+    schema_version: "1.0";
+    kind: "child_observer_bridge_request";
+    bridge?: ChildObserverBridge;
+  } = {
+    schema_version: "1.0",
+    kind: "child_observer_bridge_request",
   };
-  return scope[CHILD_OBSERVER_BRIDGE_SYMBOL];
+  events.emit(CHILD_OBSERVER_BRIDGE_REQUEST_CHANNEL, request);
+  return request.bridge;
 }
 
 export function prepareChildObserver(
   config: DelegationSessionConfig,
+  bridge?: ChildObserverBridge,
 ): ChildObserverHandle | undefined {
-  const bridge = childObserverBridge();
   if (!bridge) return undefined;
   if (!config.grantId) {
     throw new Error("Observed delegated sessions require a stable grant ID");
@@ -92,9 +100,10 @@ function addUsage(total: DelegationUsage, usage: Usage): DelegationUsage {
  */
 export function createRealSessionFactory(
   modelRuntime: ModelRuntime,
+  childObserverBridge?: ChildObserverBridge,
 ): (config: DelegationSessionConfig) => Promise<DelegationSession> {
   return async (config: DelegationSessionConfig): Promise<DelegationSession> => {
-    const childObserver = prepareChildObserver(config);
+    const childObserver = prepareChildObserver(config, childObserverBridge);
     const loader = new DefaultResourceLoader({
       cwd: config.cwd,
       agentDir: getAgentDir(),
