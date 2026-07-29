@@ -87,6 +87,11 @@ function addUsage(total: DelegationUsage, usage: Usage): DelegationUsage {
   };
 }
 
+function throwLifecycleErrors(errors: unknown[], message: string): void {
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, message);
+}
+
 /**
  * The production `createSession` seam: build a real in-process pi session from a
  * {@link DelegationSessionConfig} (ADR 0078). Separated from `delegation.ts` so
@@ -111,6 +116,9 @@ function addUsage(total: DelegationUsage, usage: Usage): DelegationUsage {
 export function createRealSessionFactory(
   modelRuntime: ModelRuntime,
   childObserverBridge?: ChildObserverBridge,
+  dependencies: {
+    createAgentSession?: typeof createAgentSession;
+  } = {},
 ): (config: DelegationSessionConfig) => Promise<DelegationSession> {
   return async (config: DelegationSessionConfig): Promise<DelegationSession> => {
     const childObserver = prepareChildObserver(config, childObserverBridge);
@@ -139,16 +147,33 @@ export function createRealSessionFactory(
     await loader.reload();
 
     childObserver?.start();
-    const { session } = await createAgentSession({
-      cwd: config.cwd,
-      model: config.model,
-      thinkingLevel: config.thinkingLevel,
-      modelRuntime,
-      noTools: "builtin",
-      customTools: config.tools,
-      resourceLoader: loader,
-      sessionManager: SessionManager.inMemory(config.cwd),
-    });
+    let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
+    try {
+      ({ session } = await (
+        dependencies.createAgentSession ?? createAgentSession
+      )({
+        cwd: config.cwd,
+        model: config.model,
+        thinkingLevel: config.thinkingLevel,
+        modelRuntime,
+        noTools: "builtin",
+        customTools: config.tools,
+        resourceLoader: loader,
+        sessionManager: SessionManager.inMemory(config.cwd),
+      }));
+    } catch (error) {
+      const errors: unknown[] = [error];
+      try {
+        childObserver?.finish();
+      } catch (finishError) {
+        errors.push(finishError);
+      }
+      throwLifecycleErrors(
+        errors,
+        "Child session creation and observer finalization failed",
+      );
+      throw error;
+    }
 
     // Accumulate usage from the session's own events and forward lightweight
     // activity notes for live TUI progress. pi surfaces usage on assistant
@@ -179,16 +204,31 @@ export function createRealSessionFactory(
       },
       usage: () => usageTotal,
       finish: async (evidence) => {
-        childObserver?.setOutcome(evidence);
+        const errors: unknown[] = [];
+        try {
+          childObserver?.setOutcome(evidence);
+        } catch (error) {
+          errors.push(error);
+        }
         try {
           await session.extensionRunner.emit({
             type: "session_shutdown",
             reason: "quit",
           });
-        } finally {
-          session.dispose();
+        } catch (error) {
+          errors.push(error);
         }
-        childObserver?.finish();
+        try {
+          session.dispose();
+        } catch (error) {
+          errors.push(error);
+        }
+        try {
+          childObserver?.finish();
+        } catch (error) {
+          errors.push(error);
+        }
+        throwLifecycleErrors(errors, "Child session finalization failed");
       },
     };
   };
