@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Type, type Static } from "typebox";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
@@ -8,13 +9,16 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { normalizeTarget } from "./paths";
-import { resolve, type Resolution } from "./resolver";
+import { resolve, resolveEffective, type Resolution } from "./resolver";
 import { renderExplain, renderResolvePreview, summarizeResolution } from "./render";
 import { formatStatusLines, type ActiveState, type RepositoryState } from "./state";
 import type { OperatingMode } from "./mode";
 import type { CheckpointStatus } from "./checkpoint";
 import {
   runDelegationSequence,
+  buildAssignmentGraph,
+  buildIntegrationRecord,
+  AssignmentGraphError,
   stepCompleted,
   type DelegationEntry,
   type DelegationInputs,
@@ -23,6 +27,8 @@ import {
   type DelegationSession,
   type DelegationSessionConfig,
   type SequenceOutcome,
+  type OwnerAssignment,
+  type StewardDecisionRequest,
 } from "./delegation";
 import {
   buildDelegationRecord,
@@ -71,6 +77,7 @@ export type ResolveToolDetails =
   | { kind: "empty" }
   | { kind: "delegation"; outcome: DelegationOutcome; record: PersistedDelegationRecord }
   | { kind: "delegation_failed"; failureKind: DelegationFailureKind; diagnostics: string[] }
+  | { kind: "assignment_invalid"; diagnostics: string[] }
   | {
       kind: "delegation_sequence";
       sequence: SequenceOutcome;
@@ -155,7 +162,7 @@ export function createResolveTool(deps: ToolDeps): ToolDefinition<typeof paramsS
     promptSnippet: "orca_resolve — preview routing (owners + grants) for target paths, no side effects.",
     parameters: paramsSchema,
     async execute(
-      _toolCallId: string,
+      toolCallId: string,
       params: ToolParams,
       _signal: AbortSignal | undefined,
       _onUpdate: unknown,
@@ -192,7 +199,7 @@ export function createExplainTool(deps: ToolDeps): ToolDefinition<typeof paramsS
     promptSnippet: "orca_explain — render a human-readable routing explanation for target paths.",
     parameters: paramsSchema,
     async execute(
-      _toolCallId: string,
+      toolCallId: string,
       params: ToolParams,
       _signal: AbortSignal | undefined,
       _onUpdate: unknown,
@@ -230,12 +237,68 @@ const delegateParamsSchema = Type.Object(
           "Concrete repository-relative target paths the task will change. Not agent ids.",
       },
     ),
+    assignments: Type.Optional(
+      Type.Array(
+        Type.Object({
+          owner: Type.String({ minLength: 1 }),
+          task: Type.String({ minLength: 1 }),
+          paths: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+          depends_on: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+        }),
+      ),
+    ),
+    steward_decision: Type.Optional(
+      Type.Object({
+        status: Type.Union([
+          Type.Literal("ready"),
+          Type.Literal("acknowledged_gap"),
+          Type.Literal("stopped"),
+        ]),
+        reason: Type.String({ minLength: 1 }),
+        acknowledged_validation_gaps: Type.Optional(
+          Type.Array(Type.String({ minLength: 1 })),
+        ),
+      }),
+    ),
   },
   { description: "Delegate a task to the resolver-assigned owner(s) of the given target paths." },
 );
 
 /** Exported so `tool_call` handlers and tests can type the delegate input. */
 export type DelegateToolInput = Static<typeof delegateParamsSchema>;
+
+function stableId(kind: string, value: unknown): string {
+  const digest = createHash("sha256")
+    .update(JSON.stringify({ kind, value }))
+    .digest("hex");
+  return `${kind}_${digest}`;
+}
+
+function assignmentInvalidResult(
+  diagnostics: string[],
+): AgentToolResult<ResolveToolDetails> {
+  return text(
+    [
+      "Orca rejected the assignment graph before starting any child session:",
+      ...diagnostics.map((diagnostic) => `  - ${diagnostic}`),
+    ].join("\n"),
+    { kind: "assignment_invalid", diagnostics },
+  );
+}
+
+function stewardDecisionFromInput(
+  input: DelegateToolInput["steward_decision"],
+): StewardDecisionRequest | undefined {
+  if (!input) return undefined;
+  if (input.status === "acknowledged_gap") {
+    return {
+      status: input.status,
+      reason: input.reason,
+      acknowledgedValidationGaps: input.acknowledged_validation_gaps ?? [],
+    };
+  }
+  return { status: input.status, reason: input.reason };
+}
 
 /** Dependencies the delegate tool needs beyond routing: model, session factory, sink. */
 export interface DelegateDeps extends ToolDeps {
@@ -315,6 +378,38 @@ function checkpointBody(outcome: DelegationOutcome): string[] {
     failed: `Status: failed${synth}.`,
   };
   const lines = [headline[cp.status], `Summary: ${cp.summary}`, manifestLine(cp.changedPaths)];
+  lines.push(
+    `Validation: ${cp.validation.status}${
+      cp.status === "completed" && cp.validation.status !== "passed"
+        ? " — completed does not mean verified"
+        : ""
+    }.`,
+  );
+  for (const activity of cp.validation.activities) {
+    lines.push(`  - ${activity.name}: ${activity.status}${activity.summary ? ` — ${activity.summary}` : ""}`);
+  }
+  if (cp.validation.unavailablePrerequisites.length > 0) {
+    lines.push(
+      `Unavailable prerequisites: ${cp.validation.unavailablePrerequisites.join(", ")}`,
+    );
+  }
+  if (cp.validation.assumptions.length > 0) {
+    lines.push(`Assumptions: ${cp.validation.assumptions.join("; ")}`);
+  }
+  if (cp.validation.assertionChanges.length > 0) {
+    lines.push("Assertion/expected-output changes:");
+    for (const change of cp.validation.assertionChanges) {
+      lines.push(`  - ${change.path} (${change.kind}): ${change.description}`);
+    }
+  }
+  if ((cp.mutationViolations ?? []).length > 0) {
+    lines.push("Mutation violations:");
+    for (const violation of cp.mutationViolations ?? []) {
+      lines.push(
+        `  - ${violation.path}: ${violation.source}/${violation.disposition} (${violation.grantId})`,
+      );
+    }
+  }
   if (cp.status === "needs_scope") lines.push(...scopeExpansionGuidance(outcome));
   if (cp.remainingRisks && cp.remainingRisks.length > 0) {
     lines.push("Remaining risks:");
@@ -332,7 +427,17 @@ function delegationResult(
   outcome: DelegationOutcome,
   record: PersistedDelegationRecord,
 ): AgentToolResult<ResolveToolDetails> {
-  const body = [`Orca delegation to '${outcome.owner}' ended.`, ...checkpointBody(outcome)].join("\n");
+  const integration = record.integration;
+  const body = [
+    `Orca delegation to '${outcome.owner}' ended.`,
+    ...checkpointBody(outcome),
+    ...(integration
+      ? [
+          `Combined diff identity: ${integration.diffIdentity}`,
+          `Steward integration decision: ${integration.decision.status} — ${integration.decision.reason}`,
+        ]
+      : []),
+  ].join("\n");
   return text(body, { kind: "delegation", outcome, record });
 }
 
@@ -430,11 +535,19 @@ function delegationSequenceResult(
       lines.push("", `${index}. ${step.owner}: build failed (${step.failureKind}) — not spawned.`);
       for (const diagnostic of step.diagnostics) lines.push(`   - ${diagnostic}`);
     } else {
-      const why =
-        step.reason === "cancelled"
-          ? "not run — parent cancellation"
-          : "not run — the sequence stopped before this owner";
-      lines.push("", `${index}. ${step.owner}: ${why} (re-delegate once the earlier outcome is resolved).`);
+      const why: Record<typeof step.reason, string> = {
+        cancelled: "not run — parent cancellation",
+        sequence_stopped: "not run — the sequence stopped before this owner",
+        dependency_failed: "not run — a dependency failed",
+        dependency_blocked: "not run — a dependency was blocked",
+        dependency_needs_scope: "not run — a dependency requested new scope",
+      };
+      lines.push(
+        "",
+        `${index}. ${step.owner}: ${why[step.reason]}${
+          step.blockedBy?.length ? ` (${step.blockedBy.join(", ")})` : ""
+        }.`,
+      );
     }
   }
 
@@ -444,6 +557,13 @@ function delegationSequenceResult(
       `Unmanaged targets (advisory): ${unmanaged.join(", ")}.`,
       "No agent owns these; Orca did not delegate them. In advisory mode they proceed only under your " +
         "existing authority and were recorded as an advisory policy violation (ADR 0012).",
+    );
+  }
+  if (record.integration) {
+    lines.push(
+      "",
+      `Combined diff identity: ${record.integration.diffIdentity}`,
+      `Steward integration decision: ${record.integration.decision.status} — ${record.integration.decision.reason}`,
     );
   }
 
@@ -505,7 +625,7 @@ export function createDelegateTool(
     parameters: delegateParamsSchema,
     renderResult: (result) => linesComponent(delegateResultLines(result)),
     async execute(
-      _toolCallId: string,
+      toolCallId: string,
       params: DelegateToolInput,
       signal: AbortSignal | undefined,
       onUpdate: AgentToolUpdateCallback<ResolveToolDetails> | undefined,
@@ -521,9 +641,21 @@ export function createDelegateTool(
         case "invalid":
           return invalidResult(outcome.rejections);
         case "resolution": {
-          const { resolution } = outcome;
-          deps.onRoute?.(resolution);
           const active = state as ActiveState;
+          const resolutionCycleId = stableId("resolution", {
+            toolCallId,
+            governance: active.digest.sha256,
+            paths: outcome.resolution.perTarget.map((target) => target.path).sort(),
+          });
+          const resolution = resolveEffective(
+            active.document,
+            outcome.resolution.perTarget.map((target) => target.path),
+            {
+              governanceIdentity: `sha256:${active.digest.sha256}`,
+              resolutionCycleId,
+            },
+          );
+          deps.onRoute?.(resolution);
           const mode = active.effectiveMode;
 
           // Unowned targets (ADR 0012). Enforce fails the whole delegation before
@@ -541,20 +673,104 @@ export function createDelegateTool(
             return allUnmanagedResult(resolution);
           }
 
-          // One delegation per owner in the resolver's owner-id order, each with
-          // its own compiled (frozen) grant; run them sequentially (ADR 0006, 0077).
+          const resolvedOwners = resolution.delegations.map((delegation) => delegation.owner);
+          if (resolvedOwners.length > 1 && !params.assignments) {
+            return assignmentInvalidResult([
+              "Multi-owner work requires one explicit assignment per resolved owner.",
+              `Resolved owners: ${resolvedOwners.join(", ")}.`,
+            ]);
+          }
+
+          const assignmentDiagnostics: string[] = [];
+          const suppliedByOwner = new Map<string, NonNullable<DelegateToolInput["assignments"]>[number]>();
+          for (const supplied of params.assignments ?? []) {
+            if (suppliedByOwner.has(supplied.owner)) {
+              assignmentDiagnostics.push(`duplicate assignment for owner '${supplied.owner}'.`);
+            }
+            suppliedByOwner.set(supplied.owner, supplied);
+            if (!resolvedOwners.includes(supplied.owner)) {
+              assignmentDiagnostics.push(`assignment names unresolved owner '${supplied.owner}'.`);
+            }
+          }
+          for (const owner of resolvedOwners) {
+            if (params.assignments && !suppliedByOwner.has(owner)) {
+              assignmentDiagnostics.push(`missing assignment for resolved owner '${owner}'.`);
+            }
+          }
+          if (assignmentDiagnostics.length > 0) {
+            return assignmentInvalidResult(assignmentDiagnostics);
+          }
+
+          const sequenceId = stableId("sequence", {
+            resolutionCycleId,
+            request: params.task,
+            owners: resolvedOwners,
+          });
+
+          // One explicit assignment per owner. The graph is validated completely
+          // before runDelegationSequence can start a child.
           const parent = { model: ctx.model, thinkingLevel: deps.getThinkingLevel() };
-          const ordered: DelegationInputs[] = resolution.delegations.map((delegation) => ({
-            document: active.document,
-            owner: delegation.owner,
-            targets: delegation.targets,
-            grant: delegation.grant,
-            grantId: digestGrants([delegation.grant]),
-            task: params.task,
-            effectiveMode: mode,
-            cwd: ctx.cwd,
-            parent,
-          }));
+          const ordered: DelegationInputs[] = resolution.delegations.map((delegation) => {
+            const supplied = suppliedByOwner.get(delegation.owner);
+            const rawTargets = supplied?.paths ?? delegation.targets;
+            const normalizedTargets: string[] = [];
+            for (const rawTarget of rawTargets) {
+              const normalized = normalizeTarget(rawTarget, ctx.cwd);
+              if (normalized.ok) normalizedTargets.push(normalized.path);
+              else {
+                assignmentDiagnostics.push(
+                  `assignment for '${delegation.owner}' has invalid target '${rawTarget}': ${normalized.reason}.`,
+                );
+              }
+            }
+            const assignmentId = stableId("step", {
+              sequenceId,
+              owner: delegation.owner,
+              task: supplied?.task ?? params.task,
+              targets: normalizedTargets,
+              dependencies: [...(supplied?.depends_on ?? [])].sort(),
+            });
+            const assignment: OwnerAssignment = {
+              schemaVersion: "1.1",
+              assignmentId,
+              owner: delegation.owner,
+              task: supplied?.task ?? params.task,
+              targets: normalizedTargets,
+              dependencies: supplied?.depends_on ?? [],
+            };
+            const delegationId = stableId("delegation", {
+              stepId: assignmentId,
+              grantId: delegation.grant.grantId,
+            });
+            return {
+              document: active.document,
+              owner: delegation.owner,
+              targets: delegation.targets,
+              grant: delegation.grant,
+              grantId: delegation.grant.grantId,
+              task: assignment.task,
+              originalRequest: params.task,
+              effectiveMode: mode,
+              cwd: ctx.cwd,
+              parent,
+              assignment,
+              sequenceId,
+              stepId: assignmentId,
+              delegationId,
+              childSessionId: stableId("child", delegationId),
+            };
+          });
+          if (assignmentDiagnostics.length > 0) {
+            return assignmentInvalidResult(assignmentDiagnostics);
+          }
+          try {
+            buildAssignmentGraph(ordered);
+          } catch (error) {
+            if (error instanceof AssignmentGraphError) {
+              return assignmentInvalidResult(error.diagnostics);
+            }
+            throw error;
+          }
 
           // Stream live progress into the tool's onUpdate (TUI) and hand each
           // event to the extension (widget + notify) with the tool's own ctx.
@@ -576,6 +792,11 @@ export function createDelegateTool(
           for (const step of sequence.steps) {
             if (step.kind === "delegated") deps.onDelegation?.(step.outcome.appendEntry);
           }
+          const integration = buildIntegrationRecord(
+            sequence,
+            ctx.cwd,
+            stewardDecisionFromInput(params.steward_decision),
+          );
 
           // Persist the whole sequence as one durable session entry (PRD "User
           // Surface"): owners, task, targets, grant digest, per-step statuses,
@@ -587,6 +808,8 @@ export function createDelegateTool(
             sequence,
             startedAt,
             endedAt,
+            sequenceId,
+            integration,
           });
           deps.onDelegationRecord?.(record);
 

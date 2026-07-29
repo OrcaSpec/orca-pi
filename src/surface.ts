@@ -69,7 +69,9 @@ export function progressLine(progress: DelegationProgress): string {
     case "sequence_start":
       return `Orca: delegating to ${progress.total} owner(s) — ${progress.owners.join(", ")}.`;
     case "step_start":
-      return `Orca: [${progress.index}/${progress.total}] ${progress.owner} — running…`;
+      return `Orca: [${progress.index}/${progress.total}] ${progress.owner}${
+        progress.assignmentId ? ` (${progress.assignmentId})` : ""
+      } — running…`;
     case "step_activity":
       return `Orca: [${progress.index}/${progress.total}] ${progress.owner} — ${progress.note}`;
     case "step_end":
@@ -88,6 +90,7 @@ export interface InflightDelegation {
   index: number;
   total: number;
   status: "running" | CheckpointStatus | "build_failed";
+  assignmentId?: string;
 }
 
 /** Track the in-flight delegation as progress events arrive; undefined when idle. */
@@ -99,14 +102,27 @@ export function inflightFromProgress(
     case "sequence_start":
       return undefined;
     case "step_start":
-      return { owner: progress.owner, index: progress.index, total: progress.total, status: "running" };
+      return {
+        owner: progress.owner,
+        ...(progress.assignmentId ? { assignmentId: progress.assignmentId } : {}),
+        index: progress.index,
+        total: progress.total,
+        status: "running",
+      };
     case "step_activity":
       return current
         ? { ...current }
-        : { owner: progress.owner, index: progress.index, total: progress.total, status: "running" };
+        : {
+            owner: progress.owner,
+            ...(progress.assignmentId ? { assignmentId: progress.assignmentId } : {}),
+            index: progress.index,
+            total: progress.total,
+            status: "running",
+          };
     case "step_end":
       return {
         owner: progress.owner,
+        ...(progress.assignmentId ? { assignmentId: progress.assignmentId } : {}),
         index: progress.index,
         total: progress.total,
         status: progress.status,
@@ -139,7 +155,9 @@ export function statusWidgetLines(input: WidgetInput): string[] {
   lines.push(`Delegations recorded: ${input.historyCount}`);
   if (input.inflight) {
     lines.push(
-      `In-flight: ${input.inflight.owner} (step ${input.inflight.index}/${input.inflight.total}) — ${input.inflight.status}`,
+      `In-flight: ${input.inflight.owner}${
+        input.inflight.assignmentId ? ` [${input.inflight.assignmentId}]` : ""
+      } (step ${input.inflight.index}/${input.inflight.total}) — ${input.inflight.status}`,
     );
   }
   return lines;

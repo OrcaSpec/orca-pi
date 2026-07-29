@@ -426,8 +426,16 @@ describe("dogfood repo: delegation lifecycle (scripted sessions)", () => {
     return { registered, captured };
   }
 
-  async function delegate(registered: Registered, task: string, paths: string[], ctx = makeCtx(repo)) {
-    return registered.tools.get("orca_delegate")!.execute("d", { task, paths }, undefined, undefined, ctx);
+  async function delegate(
+    registered: Registered,
+    task: string,
+    paths: string[],
+    ctx = makeCtx(repo),
+    assignments?: Array<{ owner: string; task: string; paths: string[]; depends_on?: string[] }>,
+  ) {
+    return registered.tools
+      .get("orca_delegate")!
+      .execute("d", { task, paths, assignments }, undefined, undefined, ctx);
   }
 
   it("runs a single-owner delegation end-to-end and persists it", async () => {
@@ -441,11 +449,17 @@ describe("dogfood repo: delegation lifecycle (scripted sessions)", () => {
 
   it("splits a multi-owner task into sequential per-owner delegations (owner-id order)", async () => {
     const { registered, captured } = install();
-    const result = await delegate(registered, "cross-cutting change", [
-      "apps/web/src/app.tsx",
-      "services/billing/invoice.ts",
-      "apps/web-admin/src/dashboard.tsx",
-    ]);
+    const result = await delegate(
+      registered,
+      "cross-cutting change",
+      ["apps/web/src/app.tsx", "services/billing/invoice.ts", "apps/web-admin/src/dashboard.tsx"],
+      makeCtx(repo),
+      [
+        { owner: "billing", task: "update billing", paths: ["services/billing/invoice.ts"] },
+        { owner: "web", task: "update web", paths: ["apps/web/src/app.tsx"] },
+        { owner: "web-admin", task: "update web admin", paths: ["apps/web-admin/src/dashboard.tsx"] },
+      ],
+    );
     // Owner-id ascending: billing < web < web-admin.
     expect(captured.map((c) => c.owner)).toEqual(["billing", "web", "web-admin"]);
     expect(result.details?.kind).toBe("delegation_sequence");
@@ -479,7 +493,19 @@ describe("dogfood repo: delegation lifecycle (scripted sessions)", () => {
     const second = install();
     const resumed = await second.registered.tools.get("orca_delegate")!.execute(
       "d2",
-      { task: "wire the shell to billing", paths: ["apps/web/src/app.tsx", "services/billing/invoice.ts"] },
+      {
+        task: "wire the shell to billing",
+        paths: ["apps/web/src/app.tsx", "services/billing/invoice.ts"],
+        assignments: [
+          { owner: "billing", task: "prepare billing support", paths: ["services/billing/invoice.ts"] },
+          {
+            owner: "web",
+            task: "wire the shell to prepared billing support",
+            paths: ["apps/web/src/app.tsx"],
+            depends_on: ["billing"],
+          },
+        ],
+      },
       undefined,
       undefined,
       makeCtx(repo),

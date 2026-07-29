@@ -28,6 +28,19 @@ function config(cwd: string): DelegationSessionConfig {
     warnings: [],
     instructionDigests: [],
     contextDigests: [],
+    assignment: {
+      schemaVersion: "1.1",
+      assignmentId: "step-runtime",
+      owner: "runtime",
+      task: "update duration behavior",
+      targets: ["src/duration.py"],
+      dependencies: [],
+    },
+    upstreamHandoffs: [],
+    sequenceId: "sequence-1",
+    stepId: "step-1",
+    delegationId: "delegation-1",
+    childSessionId: "child-1",
   };
 }
 
@@ -66,12 +79,18 @@ describe("real delegated session observer isolation", () => {
       status: "completed",
       checkpointStatus: "completed",
       changedPaths: ["src/duration.py"],
+      validationStatus: "passed",
+      mutationViolations: [],
     });
 
     expect(prepareDelegation).toHaveBeenCalledWith({
       grantId: "grant-1",
       targetPaths: ["src/duration.py"],
       resolvedOwners: ["runtime"],
+      sequenceId: "sequence-1",
+      stepId: "step-1",
+      delegationId: "delegation-1",
+      childSessionId: "child-1",
     });
     expect(start).toHaveBeenCalledOnce();
     expect(shutdown).toHaveBeenCalledOnce();
@@ -79,6 +98,8 @@ describe("real delegated session observer isolation", () => {
       status: "completed",
       checkpointStatus: "completed",
       changedPaths: ["src/duration.py"],
+      validationStatus: "passed",
+      mutationViolations: [],
     });
     expect(finish).toHaveBeenCalledOnce();
   });

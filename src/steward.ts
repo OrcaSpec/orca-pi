@@ -87,5 +87,13 @@ export function composeStewardPrompt(state: ActiveState): string {
       "with the task and the concrete target paths; Orca resolves the structural owner and runs the " +
       "write under that agent's grant. Use orca_resolve to preview routing and orca_explain to explain a " +
       "decision. You do not have orca_checkpoint — that terminates a delegated session, not the steward.",
+    "For multi-owner work, provide one explicit owner-specific assignment covering exactly that owner's " +
+      "resolved targets. Declare deterministic acyclic dependencies before any child starts. Do not send " +
+      "shared ambiguous task text to every owner. Downstream owners receive only bounded structured handoffs " +
+      "from completed dependencies.",
+    "After assignments terminate, review the combined diff identity, ownership and dependency audits, " +
+      "structured validation, assertion/expected-output changes, unresolved risks, overlap, and zero-change " +
+      "signals. Request ready only when every required audit passes. Otherwise explicitly acknowledge exact " +
+      "permitted validation gaps or stop integration with a reason; completed is not synonymous with verified.",
   ].join("\n");
 }

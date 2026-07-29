@@ -7,6 +7,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { DomainAgent, OrcaSpecDocument } from "orcaspec";
 import { compileGrant, resolve } from "../src/resolver";
 import {
+  buildIntegrationRecord,
   runDelegationSequence,
   stepCompleted,
   type DelegationInputs,
@@ -106,6 +107,147 @@ describe("runDelegationSequence", () => {
     expect(seq.steps.map(stepCompleted)).toEqual([true, true, true]);
   });
 
+  it("validates dependencies before spawning and executes provider before dependent tests", async () => {
+    const events: string[] = [];
+    const capture: Script = async (config) => {
+      events.push(config.owner);
+      if (config.owner === "web") {
+        expect(config.systemPrompt).toContain("Dependencies: billing");
+        expect(config.systemPrompt).toContain("Bounded upstream handoff");
+        expect(config.systemPrompt).toContain("billing implementation complete");
+      }
+      await callTool(config, "orca_checkpoint", {
+        status: "completed",
+        summary:
+          config.owner === "billing"
+            ? "billing implementation complete"
+            : "dependent tests complete",
+      });
+    };
+    const { createSession } = sessions({ billing: capture, web: capture });
+    const [billing, web] = orderedFor(dir, [
+      "apps/web/app.tsx",
+      "services/billing/x.rb",
+    ]);
+    billing.assignment = {
+      schemaVersion: "1.1",
+      assignmentId: "provider",
+      owner: "billing",
+      task: "implement provider behavior",
+      targets: billing.targets,
+      dependencies: [],
+    };
+    web.assignment = {
+      schemaVersion: "1.1",
+      assignmentId: "tests",
+      owner: "web",
+      task: "add public regression tests",
+      targets: web.targets,
+      dependencies: ["billing"],
+    };
+
+    const sequence = await runDelegationSequence([web, billing], { createSession });
+
+    expect(events).toEqual(["billing", "web"]);
+    expect(sequence.assignmentGraph.executionOrder).toEqual(["billing", "web"]);
+    expect(sequence.allCompleted).toBe(true);
+  });
+
+  it("rejects a cyclic assignment graph before starting any child session", async () => {
+    const [billing, web] = orderedFor(dir, [
+      "services/billing/x.rb",
+      "apps/web/app.tsx",
+    ]);
+    billing.assignment = {
+      schemaVersion: "1.1",
+      assignmentId: "billing-step",
+      owner: "billing",
+      task: "billing work",
+      targets: billing.targets,
+      dependencies: ["web"],
+    };
+    web.assignment = {
+      schemaVersion: "1.1",
+      assignmentId: "web-step",
+      owner: "web",
+      task: "web work",
+      targets: web.targets,
+      dependencies: ["billing"],
+    };
+    const { createSession, captured } = sessions({});
+
+    await expect(runDelegationSequence([billing, web], { createSession })).rejects.toThrow(
+      /cycle/i,
+    );
+    expect(captured).toHaveLength(0);
+  });
+
+  it("gates readiness on validation and allows only explicit acknowledgement of available gaps", async () => {
+    const validate: Script = async (config) => {
+      await callTool(config, "write", {
+        path: OWNED[config.owner],
+        content: `// ${config.owner}`,
+      });
+      await callTool(config, "orca_checkpoint", {
+        status: "completed",
+        summary: `${config.owner} done`,
+        validation_activities:
+          config.owner === "billing"
+            ? [
+                {
+                  kind: "test",
+                  name: "provider focused tests",
+                  status: "passed",
+                  summary: "passed",
+                },
+              ]
+            : [
+                {
+                  kind: "test",
+                  name: "browser public tests",
+                  status: "unavailable",
+                  summary: "browser dependency missing",
+                },
+              ],
+        unavailable_prerequisites:
+          config.owner === "web" ? ["browser dependency"] : [],
+        assertion_changes:
+          config.owner === "billing"
+            ? [
+                {
+                  path: "services/billing/x.rb",
+                  kind: "expected_output",
+                  description: "updated public alias output",
+                },
+              ]
+            : [],
+      });
+    };
+    const { createSession } = sessions({ billing: validate, web: validate });
+    const sequence = await runDelegationSequence(
+      orderedFor(dir, ["services/billing/x.rb", "apps/web/app.tsx"]),
+      { createSession },
+    );
+
+    const refused = buildIntegrationRecord(sequence, dir, {
+      status: "ready",
+      reason: "ship it",
+    });
+    expect(refused.decision.status).toBe("stopped");
+    expect(refused.validationAudit.gaps).toEqual(["web"]);
+    expect(refused.validationAudit.assertionChanges).toEqual([
+      expect.objectContaining({ path: "services/billing/x.rb", kind: "expected_output" }),
+    ]);
+
+    const acknowledged = buildIntegrationRecord(sequence, dir, {
+      status: "acknowledged_gap",
+      reason: "browser dependency is unavailable in this environment",
+      acknowledgedValidationGaps: ["web"],
+    });
+    expect(acknowledged.decision.status).toBe("acknowledged_gap");
+    expect(acknowledged.diffIdentity).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
   it("gives each owner its own distinct, correct grant (no authority merge)", async () => {
     const { createSession, captured } = sessions({});
     await runDelegationSequence(orderedFor(dir, ["apps/web/app.tsx", "services/billing/x.rb"]), {
@@ -136,7 +278,16 @@ describe("runDelegationSequence", () => {
       expect(seq.cancelled).toBe(false);
       expect(seq.allCompleted).toBe(false);
       expect(seq.steps[1].kind).toBe("not_run");
-      if (seq.steps[1].kind === "not_run") expect(seq.steps[1].reason).toBe("sequence_stopped");
+      if (seq.steps[1].kind === "not_run") {
+        expect(seq.steps[1].reason).toBe(
+          status === "needs_scope"
+            ? "dependency_needs_scope"
+            : status === "blocked"
+              ? "dependency_blocked"
+              : "dependency_failed",
+        );
+        expect(seq.steps[1].blockedBy).toEqual(["billing"]);
+      }
     });
   }
 

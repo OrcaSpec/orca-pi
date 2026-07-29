@@ -5,6 +5,7 @@ import {
   capabilitySummaryFor,
   capabilitySummaryLine,
   ENFORCEMENT_PROFILE,
+  ENFORCEMENT_PROFILE_1_1,
   formatEnforcementSummary,
 } from "../src/enforcement";
 import { compileGrant } from "../src/resolver";
@@ -96,5 +97,25 @@ describe("capability summary derivation (ADR 0023/0079)", () => {
     expect(toolNames).toContain(BASH_TOOL_NAME);
     expect(capabilitySummaryFor(toolNames)).toBe("partially_enforced");
     expect(capabilitySummaryFor(toolNames)).not.toBe("enforced");
+  });
+});
+
+describe("mutation-accountability capability contract 1.1", () => {
+  it("claims shell mutation acceptance only when post-command reconciliation is active", () => {
+    const shell = ENFORCEMENT_PROFILE_1_1.find(
+      (row) => row.dimension === "Subprocess filesystem effects (bash)",
+    );
+    expect(shell).toMatchObject({
+      claim: "reconciled",
+      detail: "Post-command and post-session reconciled against the effective grant",
+    });
+    expect(
+      capabilitySummaryFor(["read", "write", "edit", BASH_TOOL_NAME], {
+        shellMutationReconciliation: true,
+      }),
+    ).toBe("enforced");
+    expect(capabilitySummaryFor(["read", "write", "edit", BASH_TOOL_NAME])).toBe(
+      "partially_enforced",
+    );
   });
 });

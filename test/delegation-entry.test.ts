@@ -6,6 +6,7 @@ import * as orcaspec from "orcaspec";
 import type { Model } from "@earendil-works/pi-ai";
 import { resolve } from "../src/resolver";
 import {
+  buildIntegrationRecord,
   runDelegationSequence,
   type DelegationInputs,
   type DelegationSession,
@@ -103,12 +104,16 @@ describe("delegation record: build, digest, round-trip", () => {
   it("builds a versioned, JSON-safe record with per-owner statuses and observed manifests", async () => {
     const record = await buildRecord(["apps/web/app.tsx", "services/billing/x.rb"]);
     expect(record.v).toBe(DELEGATION_ENTRY_VERSION);
+    expect(record.evidenceSchemaVersion).toBe("1.1");
     expect(record.owners).toEqual(["billing", "web"]);
     expect(record.steps.map((s) => s.status)).toEqual(["completed", "completed"]);
     const billing = record.steps.find((s) => s.owner === "billing")!;
+    expect(billing.targets).toEqual(["services/billing/x.rb"]);
+    expect(billing.targets).toEqual(billing.assignment?.targets);
     expect(billing.changedPaths).toEqual(["services/billing/x.rb"]);
-    expect(billing.capabilitySummary).toBe("partially_enforced");
-    expect(billing.bashActivity?.[0]?.command).toContain("npm run build");
+    expect(billing.capabilitySummary).toBe("enforced");
+    expect(billing.shellActivities?.[0]?.commandDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(JSON.stringify(record)).not.toContain("npm run build");
     // JSON-safe: a full stringify/parse cycle preserves the record exactly.
     expect(JSON.parse(JSON.stringify(record))).toEqual(record);
   });
@@ -148,6 +153,34 @@ describe("delegation record: build, digest, round-trip", () => {
       }),
     ).toBeNull();
     expect(parseDelegationEntry(undefined)).toBeNull();
+  });
+
+  it("keeps historical version-1 delegation records readable", () => {
+    const legacy = {
+      v: 1,
+      task: "legacy task",
+      owners: ["web"],
+      targets: ["apps/web/app.tsx"],
+      grantDigest: "abc123",
+      steps: [
+        {
+          owner: "web",
+          status: "completed",
+          summary: "done",
+          changedPaths: ["apps/web/app.tsx"],
+        },
+      ],
+      usage: usageOf(0, 0),
+      startedAt: 1,
+      endedAt: 2,
+    };
+    expect(
+      parseDelegationEntry({
+        type: "custom",
+        customType: DELEGATION_ENTRY_TYPE,
+        data: legacy,
+      }),
+    ).toEqual(legacy);
   });
 });
 
@@ -242,10 +275,59 @@ describe("renderRecordLines (transcript + last-delegation detail)", () => {
     expect(text).toContain("restyle the primary button");
     expect(text).toContain("web: completed");
     expect(text).toContain("Observed changed paths (1): apps/web/app.tsx");
-    expect(text).toContain("Capability summary (not a mode): partially_enforced");
-    expect(text).toContain("Bash activity — VISIBILITY ONLY, not enforcement (ADR 0079)");
-    expect(text).toContain("npm run build");
+    expect(text).toContain("Capability summary (not a mode): enforced");
+    expect(text).toContain("Shell activities (sanitized digests)");
+    expect(text).not.toContain("npm run build");
     expect(text).toContain("1234 tokens");
     expect(text).toContain("$0.0456");
+  });
+
+  it("surfaces integration signals, validation details, and dependency omissions", async () => {
+    const ordered = orderedFor(dir, ["apps/web/app.tsx", "services/billing/x.rb"]);
+    const sequence = await runDelegationSequence(ordered, {
+      createSession: async (config) => ({
+        prompt: async () => {
+          if (config.owner === "billing") {
+            await callTool(config, "orca_checkpoint", {
+              status: "needs_scope",
+              summary: "requires another provider path",
+              scope_request: ["services/provider/new.rb"],
+            });
+          }
+        },
+        abort: () => {},
+      }),
+    });
+    const integration = buildIntegrationRecord(sequence, dir, {
+      status: "stopped",
+      reason: "dependency did not complete",
+    });
+    integration.signals.declaredTargetOverlaps = [
+      { path: "shared/api.ts", owners: ["billing", "web"] },
+    ];
+    integration.signals.changedPathOverlaps = [
+      { path: "shared/generated.ts", owners: ["billing", "web"] },
+    ];
+    integration.signals.repeatedValidationActivities = [
+      { name: "inspect provider aliases", owners: ["billing", "web"] },
+    ];
+    const record = buildDelegationRecord({
+      task: "coordinate provider and consumer",
+      targets: ordered.flatMap((input) => input.targets),
+      grantDigest: digestGrants(ordered.map((input) => input.grant)),
+      sequence,
+      integration,
+      startedAt: 1,
+      endedAt: 2,
+    });
+
+    const text = renderRecordLines(record).join("\n");
+    expect(text).toContain("Not-run reason: dependency_needs_scope");
+    expect(text).toContain("Blocked by: billing");
+    expect(text).toContain("Overlapping assignments: shared/api.ts [billing, web]");
+    expect(text).toContain("Observed changed-path overlap: shared/generated.ts [billing, web]");
+    expect(text).toContain(
+      "Repeated validation/investigation: inspect provider aliases [billing, web]",
+    );
   });
 });

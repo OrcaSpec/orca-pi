@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   DomainAgent,
   EffectiveScope,
@@ -31,6 +32,46 @@ import { matchScope, matchesAny, specificityRank } from "./paths";
 export interface CompiledGrant {
   read: EffectiveScope;
   write: EffectiveScope;
+  /** Present only on target-scoped contract 1.1 grants. */
+  schemaVersion?: typeof EFFECTIVE_GRANT_SCHEMA_VERSION;
+  /** Stable checksum binding every authority input for this delegation. */
+  grantId?: string;
+  /** Resolved structural owner of the assigned targets. */
+  owner?: string;
+  /** Concrete assigned targets; never an ownership-wide wildcard. */
+  targets?: readonly string[];
+  /** Operations for which at least one assigned target is allowed. */
+  allowedOperations?: readonly GrantOperation[];
+  /** Identity of the governance document used for this resolution. */
+  governanceIdentity?: string;
+  /** Identity of the resolution cycle; scope expansion must use a fresh one. */
+  resolutionCycleId?: string;
+  /** Protected denies are bound explicitly, independently of agent denies. */
+  protectedDenies?: Readonly<{
+    read: readonly string[];
+    write: readonly string[];
+  }>;
+}
+
+/** Explicit next-version identity for target-scoped effective grants. */
+export const EFFECTIVE_GRANT_SCHEMA_VERSION = "1.1" as const;
+
+/** Grant operations bound into a 1.1 effective-grant identity. */
+export type GrantOperation = "read" | "write";
+
+/** A compiled grant carrying every required 1.1 identity field. */
+export interface EffectiveGrant extends CompiledGrant {
+  schemaVersion: typeof EFFECTIVE_GRANT_SCHEMA_VERSION;
+  grantId: string;
+  owner: string;
+  targets: readonly string[];
+  allowedOperations: readonly GrantOperation[];
+  governanceIdentity: string;
+  resolutionCycleId: string;
+  protectedDenies: Readonly<{
+    read: readonly string[];
+    write: readonly string[];
+  }>;
 }
 
 /** One delegation: an owner, its owned targets (input order), and its grant. */
@@ -70,10 +111,18 @@ export interface TargetReasoning {
 
 /** The full resolver output. */
 export interface Resolution {
+  /** `0.1` is the legacy ownership-wide vector contract; `1.1` is target-scoped. */
+  contractVersion: "0.1" | typeof EFFECTIVE_GRANT_SCHEMA_VERSION;
   perTarget: VectorPerTarget[];
   delegations: ResolvedDelegation[];
   unownedPaths: string[];
   reasoning: TargetReasoning[];
+}
+
+/** Resolution whose delegations are guaranteed to carry complete 1.1 grants. */
+export interface EffectiveResolution extends Resolution {
+  contractVersion: typeof EFFECTIVE_GRANT_SCHEMA_VERSION;
+  delegations: Array<Omit<ResolvedDelegation, "grant"> & { grant: EffectiveGrant }>;
 }
 
 /** Sort ascending and de-duplicate a scope list. */
@@ -104,6 +153,13 @@ export function freezeGrant(grant: CompiledGrant): CompiledGrant {
   Object.freeze(grant.write.allow);
   Object.freeze(grant.write.deny);
   Object.freeze(grant.write);
+  if (grant.targets) Object.freeze(grant.targets);
+  if (grant.allowedOperations) Object.freeze(grant.allowedOperations);
+  if (grant.protectedDenies) {
+    Object.freeze(grant.protectedDenies.read);
+    Object.freeze(grant.protectedDenies.write);
+    Object.freeze(grant.protectedDenies);
+  }
   return Object.freeze(grant);
 }
 
@@ -134,6 +190,93 @@ export function compileGrant(
       deny: sortUnique([...deny(permissions.write), ...editDeny, ...(protectedDenies.write ?? [])]),
     },
   });
+}
+
+/** Resolution contract selection. The default remains the readable 0.1 vector shape. */
+export interface ResolveOptions {
+  contractVersion?: "0.1" | typeof EFFECTIVE_GRANT_SCHEMA_VERSION;
+  /**
+   * Prefer the raw governance-document checksum supplied by the repository
+   * loader. A deterministic canonical-document checksum is used when omitted.
+   */
+  governanceIdentity?: string;
+  /**
+   * Stable identity for this resolution attempt. A scope request must be
+   * followed by a new resolve call carrying a different cycle identity.
+   */
+  resolutionCycleId?: string;
+}
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, child]) => [key, canonicalize(child)]),
+    );
+  }
+  return value;
+}
+
+function checksum(value: unknown): string {
+  return `sha256:${createHash("sha256").update(JSON.stringify(canonicalize(value))).digest("hex")}`;
+}
+
+/** True when a grant is the explicit target-scoped 1.1 contract. */
+export function isEffectiveGrant(grant: CompiledGrant): grant is EffectiveGrant {
+  return (
+    grant.schemaVersion === EFFECTIVE_GRANT_SCHEMA_VERSION &&
+    typeof grant.grantId === "string" &&
+    typeof grant.owner === "string" &&
+    Array.isArray(grant.targets)
+  );
+}
+
+/**
+ * Restrict an owner's compiled authority to the concrete targets assigned by
+ * the most-specific resolver. Denies remain complete and at least as
+ * restrictive as the legacy grant.
+ */
+export function compileEffectiveGrant(
+  agent: DomainAgent,
+  targets: readonly string[],
+  protectedDenies: OrcaSpecDocument["protected_denies"],
+  governanceIdentity: string,
+  resolutionCycleId: string,
+): EffectiveGrant {
+  const base = compileGrant(agent, protectedDenies);
+  const concreteTargets = sortUnique(targets);
+  const scoped = (operation: GrantOperation): string[] =>
+    concreteTargets.filter((path) => checkScope(base, operation, path));
+  const readAllow = scoped("read");
+  const writeAllow = scoped("write");
+  const allowedOperations: GrantOperation[] = [];
+  if (readAllow.length > 0) allowedOperations.push("read");
+  if (writeAllow.length > 0) allowedOperations.push("write");
+  const protectedRead = sortUnique(protectedDenies?.read ?? []);
+  const protectedWrite = sortUnique(protectedDenies?.write ?? []);
+
+  const identityPayload = {
+    schemaVersion: EFFECTIVE_GRANT_SCHEMA_VERSION,
+    owner: agent.id,
+    targets: concreteTargets,
+    allowedOperations,
+    read: { allow: readAllow, deny: base.read.deny },
+    write: { allow: writeAllow, deny: base.write.deny },
+    protectedDenies: { read: protectedRead, write: protectedWrite },
+    governanceIdentity,
+    resolutionCycleId,
+  };
+  return freezeGrant({
+    ...identityPayload,
+    grantId: checksum(identityPayload),
+  }) as EffectiveGrant;
+}
+
+function checkScope(grant: CompiledGrant, operation: GrantOperation, path: string): boolean {
+  const scope = operation === "read" ? grant.read : grant.write;
+  return matchesAny(path, scope.allow) && !scope.deny.some((candidate) => matchScope(path, candidate));
 }
 
 interface OwnerSelection {
@@ -204,12 +347,30 @@ function writability(
  * normalized (the tool layer does that); the resolver treats them verbatim so it
  * matches the vectors, which supply repository-relative paths directly.
  */
-export function resolve(document: OrcaSpecDocument, targets: readonly string[]): Resolution {
+export function resolve(
+  document: OrcaSpecDocument,
+  targets: readonly string[],
+  options: ResolveOptions = {},
+): Resolution {
+  const contractVersion = options.contractVersion ?? "0.1";
   const protectedDenies = document.protected_denies ?? {};
   const protectedWrite = protectedDenies.write ?? [];
+  const governanceIdentity = options.governanceIdentity ?? checksum(document);
+  const resolutionCycleId =
+    options.resolutionCycleId ?? checksum({ governanceIdentity, targets: sortUnique(targets) });
 
   const grants = new Map<string, CompiledGrant>();
-  const grantFor = (owner: string): CompiledGrant => {
+  const grantFor = (owner: string, assignedTargets?: readonly string[]): CompiledGrant => {
+    if (contractVersion === EFFECTIVE_GRANT_SCHEMA_VERSION && assignedTargets) {
+      const agent = document.agents.find((candidate) => candidate.id === owner)!;
+      return compileEffectiveGrant(
+        agent,
+        assignedTargets,
+        protectedDenies,
+        governanceIdentity,
+        resolutionCycleId,
+      );
+    }
     let grant = grants.get(owner);
     if (!grant) {
       const agent = document.agents.find((candidate) => candidate.id === owner)!;
@@ -261,7 +422,29 @@ export function resolve(document: OrcaSpecDocument, targets: readonly string[]):
 
   const delegations: ResolvedDelegation[] = [...ownedTargets.keys()]
     .sort()
-    .map((owner) => ({ owner, targets: ownedTargets.get(owner)!, grant: grantFor(owner) }));
+    .map((owner) => {
+      const ownerTargets = ownedTargets.get(owner)!;
+      return { owner, targets: ownerTargets, grant: grantFor(owner, ownerTargets) };
+    });
 
-  return { perTarget, delegations, unownedPaths, reasoning };
+  return { contractVersion, perTarget, delegations, unownedPaths, reasoning };
+}
+
+/**
+ * Deliberate runtime opt-in to the 1.1 authority contract. Both identities are
+ * required so orchestration cannot accidentally issue a grant detached from its
+ * loaded governance bytes or reuse a live grant during scope expansion.
+ */
+export function resolveEffective(
+  document: OrcaSpecDocument,
+  targets: readonly string[],
+  identities: {
+    governanceIdentity: string;
+    resolutionCycleId: string;
+  },
+): EffectiveResolution {
+  return resolve(document, targets, {
+    contractVersion: EFFECTIVE_GRANT_SCHEMA_VERSION,
+    ...identities,
+  }) as EffectiveResolution;
 }

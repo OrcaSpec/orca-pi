@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 import * as orcaspec from "orcaspec";
 import type { DomainAgent, OrcaSpecDocument } from "orcaspec";
-import { compileGrant, resolve, type Resolution } from "../src/resolver";
+import {
+  EFFECTIVE_GRANT_SCHEMA_VERSION,
+  compileGrant,
+  resolve,
+  resolveEffective,
+  type Resolution,
+} from "../src/resolver";
+import { checkGrant } from "../src/grant";
 
 /** Project a Resolution onto the exact normative vector `expected` shape. */
 function toVectorExpected(resolution: Resolution) {
@@ -225,5 +232,115 @@ describe("delegation grouping", () => {
     expect(resolution.delegations.map((delegation) => delegation.owner)).toEqual(["api", "web"]);
     const web = resolution.delegations.find((delegation) => delegation.owner === "web")!;
     expect(web.targets).toEqual(["apps/web/one.tsx", "apps/web/three.tsx"]);
+  });
+});
+
+describe("effective grant contract 1.1", () => {
+  const replacementShape = doc([
+    agent("core", {
+      ownership: ["providers/**"],
+      permissions: { edit: { allow: ["providers/**"] } },
+    }),
+    agent("openai-provider", {
+      ownership: ["providers/openai/**"],
+      permissions: { edit: { allow: ["providers/openai/**"] } },
+    }),
+  ]);
+
+  it("binds a most-specific owner to only its assigned concrete targets", () => {
+    const resolution = resolveEffective(
+      replacementShape,
+      ["providers/base.ts", "providers/openai/chat.ts"],
+      {
+        governanceIdentity: "sha256:replacement-11-governance",
+        resolutionCycleId: "replacement-11-cycle",
+      },
+    );
+
+    const core = resolution.delegations.find((delegation) => delegation.owner === "core")!;
+    const provider = resolution.delegations.find(
+      (delegation) => delegation.owner === "openai-provider",
+    )!;
+    expect(core.targets).toEqual(["providers/base.ts"]);
+    expect(core.grant).toMatchObject({
+      schemaVersion: EFFECTIVE_GRANT_SCHEMA_VERSION,
+      owner: "core",
+      targets: ["providers/base.ts"],
+      governanceIdentity: "sha256:replacement-11-governance",
+      allowedOperations: ["read", "write"],
+    });
+    expect(core.grant.write.allow).toEqual(["providers/base.ts"]);
+    expect(core.grant.write.allow).not.toContain("providers/**");
+    expect(provider.grant.write.allow).toEqual(["providers/openai/chat.ts"]);
+    expect(checkGrant(core.grant, "write", "providers/base.ts").allowed).toBe(true);
+    expect(checkGrant(core.grant, "write", "providers/openai/chat.ts").allowed).toBe(false);
+  });
+
+  it("changes identity when owner, targets, operations, denies, or governance identity changes", () => {
+    const base = resolve(replacementShape, ["providers/base.ts"], {
+      contractVersion: "1.1",
+      governanceIdentity: "sha256:governance-a",
+    }).delegations[0].grant;
+    const otherTarget = resolve(replacementShape, ["providers/other.ts"], {
+      contractVersion: "1.1",
+      governanceIdentity: "sha256:governance-a",
+    }).delegations[0].grant;
+    const otherOwner = resolve(replacementShape, ["providers/openai/chat.ts"], {
+      contractVersion: "1.1",
+      governanceIdentity: "sha256:governance-a",
+    }).delegations[0].grant;
+    const otherGovernance = resolve(replacementShape, ["providers/base.ts"], {
+      contractVersion: "1.1",
+      governanceIdentity: "sha256:governance-b",
+    }).delegations[0].grant;
+    const denied = resolve(
+      doc(replacementShape.agents, { write: ["providers/generated/**"] }),
+      ["providers/base.ts"],
+      { contractVersion: "1.1", governanceIdentity: "sha256:governance-a" },
+    ).delegations[0].grant;
+    const readOnlyDocument = doc([
+      agent("core", {
+        ownership: ["providers/**"],
+        permissions: { read: { allow: ["providers/**"] } },
+      }),
+    ]);
+    const readOnly = resolve(readOnlyDocument, ["providers/base.ts"], {
+      contractVersion: "1.1",
+      governanceIdentity: "sha256:governance-a",
+    }).delegations[0].grant;
+
+    const identities = [base, otherTarget, otherOwner, otherGovernance, denied, readOnly].map(
+      (grant) => grant.grantId,
+    );
+    expect(new Set(identities)).toHaveLength(identities.length);
+    expect(base.grantId).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(readOnly.allowedOperations).toEqual(["read"]);
+  });
+
+  it("keeps legacy resolution explicitly readable for normative 0.1 vectors", () => {
+    const legacy = resolve(replacementShape, ["providers/base.ts"], { contractVersion: "0.1" });
+    expect(legacy.contractVersion).toBe("0.1");
+    expect(legacy.delegations[0].grant).toEqual(
+      compileGrant(replacementShape.agents[0], replacementShape.protected_denies ?? {}),
+    );
+    expect("grantId" in legacy.delegations[0].grant).toBe(false);
+  });
+
+  it("issues an independently identified grant for a fresh scope-resolution cycle", () => {
+    const first = resolve(replacementShape, ["providers/base.ts"], {
+      contractVersion: "1.1",
+      governanceIdentity: "sha256:replacement-11-governance",
+      resolutionCycleId: "cycle-1",
+    }).delegations[0].grant;
+    const second = resolve(replacementShape, ["providers/base.ts"], {
+      contractVersion: "1.1",
+      governanceIdentity: "sha256:replacement-11-governance",
+      resolutionCycleId: "cycle-2",
+    }).delegations[0].grant;
+
+    expect(first).not.toBe(second);
+    expect(first.grantId).not.toBe(second.grantId);
+    expect(first.resolutionCycleId).toBe("cycle-1");
+    expect(second.resolutionCycleId).toBe("cycle-2");
   });
 });

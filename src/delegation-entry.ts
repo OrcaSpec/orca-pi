@@ -1,12 +1,21 @@
 import { createHash } from "node:crypto";
 import type { CompiledGrant } from "./resolver";
-import type { BashActivity, CheckpointStatus } from "./checkpoint";
+import type {
+  BashActivity,
+  CheckpointStatus,
+  ValidationEvidence,
+} from "./checkpoint";
+import type { MutationViolation } from "./mutation-accountability";
 import {
   emptyUsage,
   sumUsage,
   type DelegationUsage,
   type SequenceOutcome,
   type SequenceStep,
+  type AssignmentGraph,
+  type IntegrationRecord,
+  type OwnerAssignment,
+  type UpstreamHandoff,
 } from "./delegation";
 import type { CapabilitySummary } from "./enforcement";
 
@@ -34,28 +43,51 @@ import type { CapabilitySummary } from "./enforcement";
 export const DELEGATION_ENTRY_TYPE = "orca-delegation";
 
 /** The record schema version; bump on any breaking shape change. */
-export const DELEGATION_ENTRY_VERSION = 1;
+export const LEGACY_DELEGATION_ENTRY_VERSION = 1;
+export const DELEGATION_ENTRY_VERSION = 2;
+export const DELEGATION_EVIDENCE_SCHEMA_VERSION = "1.1" as const;
+
+export interface PersistedShellActivity {
+  commandDigest: string;
+}
 
 /** One owner's slot in a persisted sequence, flattened to plain JSON. */
 export interface PersistedStep {
   owner: string;
+  /** Direct evaluator-facing target projection; v1 records may omit it. */
+  targets?: string[];
   /** A checkpoint status, or a lifecycle state for owners that never checkpointed. */
   status: CheckpointStatus | "build_failed" | "not_run";
   summary: string;
-  /** Observed changed paths for this owner (file-tool mutations only). */
+  /** Reconciled changed paths accepted under this owner's effective grant. */
   changedPaths: string[];
   /** True when Orca synthesized the checkpoint for a statusless session (ADR 0083). */
   synthesized?: boolean;
   /** The ADR 0023 capability summary for this owner's grant (never a mode). */
   capabilitySummary?: CapabilitySummary;
-  /** Observed bash commands — visibility only, never enforcement (ADR 0079). */
+  /** Legacy v1 raw bash evidence retained solely for backward readability. */
   bashActivity?: BashActivity[];
+  /** Contract 2 shell evidence retains identity, never raw command text. */
+  shellActivities?: PersistedShellActivity[];
+  assignment?: OwnerAssignment;
+  sequenceId?: string;
+  stepId?: string;
+  delegationId?: string;
+  childSessionId?: string;
+  grantId?: string;
+  validation?: ValidationEvidence;
+  mutationViolations?: MutationViolation[];
+  upstreamHandoffs?: UpstreamHandoff[];
+  notRunReason?: string;
+  blockedBy?: string[];
 }
 
 /** The persisted record for one completed delegation SEQUENCE. */
 export interface PersistedDelegationRecord {
   /** Schema version ({@link DELEGATION_ENTRY_VERSION}). */
   v: number;
+  /** Cross-package evidence contract identity; absent on legacy v1 records. */
+  evidenceSchemaVersion?: typeof DELEGATION_EVIDENCE_SCHEMA_VERSION;
   /** The delegated task (scoped assignment). */
   task: string;
   /** Every owner the sequence resolved, in execution order. */
@@ -71,6 +103,10 @@ export interface PersistedDelegationRecord {
   /** Wall-clock start/end (Date.now at runtime). */
   startedAt: number;
   endedAt: number;
+  /** Stable sequence identity for evaluator child reconciliation. */
+  sequenceId?: string;
+  assignmentGraph?: AssignmentGraph;
+  integration?: IntegrationRecord;
 }
 
 /**
@@ -80,6 +116,7 @@ export interface PersistedDelegationRecord {
  */
 export function digestGrants(grants: readonly CompiledGrant[]): string {
   const canonical = grants.map((grant) => ({
+    grantId: grant.grantId,
     read: { allow: grant.read.allow, deny: grant.read.deny },
     write: { allow: grant.write.allow, deny: grant.write.deny },
   }));
@@ -93,30 +130,48 @@ function toPersistedStep(step: SequenceStep): PersistedStep {
       const { outcome } = step;
       return {
         owner: outcome.owner,
+        targets: [...outcome.assignment.targets],
         status: outcome.checkpoint.status,
         summary: outcome.checkpoint.summary,
         changedPaths: outcome.checkpoint.changedPaths,
         synthesized: outcome.checkpoint.synthesized,
         capabilitySummary: outcome.appendEntry.capabilitySummary,
-        bashActivity: outcome.appendEntry.bashActivity,
+        shellActivities: outcome.appendEntry.bashActivity.map((activity) => ({
+          commandDigest: `sha256:${createHash("sha256").update(activity.command).digest("hex")}`,
+        })),
+        assignment: outcome.assignment,
+        sequenceId: outcome.appendEntry.sequenceId,
+        stepId: outcome.appendEntry.stepId,
+        delegationId: outcome.appendEntry.delegationId,
+        childSessionId: outcome.appendEntry.childSessionId,
+        grantId: outcome.appendEntry.grantId,
+        validation: outcome.checkpoint.validation,
+        mutationViolations: outcome.checkpoint.mutationViolations ?? [],
+        upstreamHandoffs: outcome.upstreamHandoffs,
       };
     }
     case "build_failed":
       return {
         owner: step.owner,
+        targets: [...step.assignment.targets],
         status: "build_failed",
         summary: `Build failed (${step.failureKind}): ${step.diagnostics.join(" ")}`,
         changedPaths: [],
+        assignment: step.assignment,
       };
     case "not_run":
       return {
         owner: step.owner,
+        targets: [...step.assignment.targets],
         status: "not_run",
         summary:
           step.reason === "cancelled"
             ? "Not run — parent cancellation."
             : "Not run — the sequence stopped before this owner.",
         changedPaths: [],
+        assignment: step.assignment,
+        notRunReason: step.reason,
+        blockedBy: step.blockedBy,
       };
   }
 }
@@ -129,6 +184,8 @@ export interface BuildRecordInput {
   sequence: SequenceOutcome;
   startedAt: number;
   endedAt: number;
+  sequenceId?: string;
+  integration?: IntegrationRecord;
 }
 
 /**
@@ -145,6 +202,7 @@ export function buildDelegationRecord(input: BuildRecordInput): PersistedDelegat
   );
   return {
     v: DELEGATION_ENTRY_VERSION,
+    evidenceSchemaVersion: DELEGATION_EVIDENCE_SCHEMA_VERSION,
     task: input.task,
     owners: steps.map((step) => step.owner),
     targets: input.targets,
@@ -153,6 +211,9 @@ export function buildDelegationRecord(input: BuildRecordInput): PersistedDelegat
     usage,
     startedAt: input.startedAt,
     endedAt: input.endedAt,
+    sequenceId: input.sequenceId,
+    assignmentGraph: input.sequence.assignmentGraph,
+    integration: input.integration,
   };
 }
 
@@ -173,7 +234,12 @@ export function parseDelegationEntry(entry: unknown): PersistedDelegationRecord 
   const data = candidate.data;
   if (!data || typeof data !== "object") return null;
   const record = data as Partial<PersistedDelegationRecord>;
-  if (record.v !== DELEGATION_ENTRY_VERSION) return null;
+  if (
+    record.v !== LEGACY_DELEGATION_ENTRY_VERSION &&
+    record.v !== DELEGATION_ENTRY_VERSION
+  ) {
+    return null;
+  }
   if (typeof record.task !== "string") return null;
   if (!Array.isArray(record.owners) || !Array.isArray(record.targets) || !Array.isArray(record.steps)) {
     return null;
@@ -192,12 +258,6 @@ export function formatUsage(usage: DelegationUsage): string {
   return `${usage.totalTokens} tokens, $${usage.costUsd.toFixed(4)}`;
 }
 
-/** The first line of a bash command, capped, for a compact activity display. */
-function commandPreview(command: string, max = 80): string {
-  const firstLine = command.split("\n")[0] ?? command;
-  return firstLine.length > max ? `${firstLine.slice(0, max - 1)}…` : firstLine;
-}
-
 /** One compact history line summarising a whole sequence for `/orca`. */
 export function recordSummaryLine(record: PersistedDelegationRecord): string {
   const statuses = record.steps.map((step) => `${step.owner}=${step.status}`).join(", ");
@@ -207,11 +267,10 @@ export function recordSummaryLine(record: PersistedDelegationRecord): string {
 
 /**
  * The full, readable rendering of one delegation record: task, provenance, each
- * owner's status / manifest / capability summary / bash activity, then the
+ * owner's status, assignment, manifest, validation, and reconciled shell
+ * evidence, followed by the steward's consolidated integration audit and
  * sequence usage. Shared by the transcript entry renderer and the `/orca`
- * last-delegation detail so both read identically. The bash-activity block is
- * explicitly labelled VISIBILITY ONLY (ADR 0079) so it can never be mistaken for
- * an enforcement record.
+ * last-delegation detail so both read identically.
  */
 export function renderRecordLines(record: PersistedDelegationRecord): string[] {
   const lines = [
@@ -220,6 +279,7 @@ export function renderRecordLines(record: PersistedDelegationRecord): string[] {
     `Targets: ${record.targets.join(", ")}`,
     `Grant digest: ${record.grantDigest}`,
   ];
+  if (record.sequenceId) lines.push(`Sequence identity: ${record.sequenceId}`);
   for (const step of record.steps) {
     const synth = step.synthesized ? " (synthesized checkpoint)" : "";
     lines.push(`  ${step.owner}: ${step.status}${synth}`);
@@ -232,10 +292,98 @@ export function renderRecordLines(record: PersistedDelegationRecord): string[] {
     if (step.capabilitySummary) {
       lines.push(`    Capability summary (not a mode): ${step.capabilitySummary}`);
     }
-    const bash = step.bashActivity ?? [];
-    if (bash.length > 0) {
-      lines.push(`    Bash activity — VISIBILITY ONLY, not enforcement (ADR 0079) (${bash.length}):`);
-      for (const activity of bash) lines.push(`      $ ${commandPreview(activity.command)}`);
+    if (step.assignment) {
+      lines.push(`    Assignment: ${step.assignment.assignmentId} — ${step.assignment.task}`);
+      lines.push(
+        `    Dependencies: ${step.assignment.dependencies.join(", ") || "(none)"}`,
+      );
+    }
+    if (step.notRunReason) {
+      lines.push(`    Not-run reason: ${step.notRunReason}`);
+      if ((step.blockedBy?.length ?? 0) > 0) {
+        lines.push(`    Blocked by: ${step.blockedBy!.join(", ")}`);
+      }
+    }
+    if (step.validation) {
+      lines.push(`    Validation: ${step.validation.status}`);
+      for (const activity of step.validation.activities) {
+        lines.push(`      - ${activity.name} (${activity.kind}): ${activity.status}`);
+      }
+      if (step.validation.unavailablePrerequisites.length > 0) {
+        lines.push(
+          `    Unavailable prerequisites: ${step.validation.unavailablePrerequisites.join(", ")}`,
+        );
+      }
+      if (step.validation.assumptions.length > 0) {
+        lines.push(`    Assumptions: ${step.validation.assumptions.join("; ")}`);
+      }
+      if (step.validation.assertionChanges.length > 0) {
+        lines.push("    Assertion/expected-output changes:");
+        for (const change of step.validation.assertionChanges) {
+          lines.push(`      - ${change.path} (${change.kind}): ${change.description}`);
+        }
+      }
+    }
+    const shell = step.shellActivities ?? [];
+    if (shell.length > 0) {
+      lines.push(`    Shell activities (sanitized digests) (${shell.length}):`);
+      for (const activity of shell) lines.push(`      - ${activity.commandDigest}`);
+    }
+  }
+  if (record.integration) {
+    lines.push(`Combined diff identity: ${record.integration.diffIdentity}`);
+    lines.push(
+      `Integration decision: ${record.integration.decision.status} — ${record.integration.decision.reason}`,
+    );
+    lines.push(
+      `Ownership audit: ${record.integration.ownershipAudit.compliant ? "compliant" : "failed"}`,
+    );
+    lines.push(
+      `Dependency audit: ${record.integration.dependencyAudit.complete ? "complete" : "incomplete"}`,
+    );
+    lines.push(
+      `Validation audit: ${record.integration.validationAudit.verified ? "verified" : "not verified"}`,
+    );
+    if (record.integration.validationAudit.failed.length > 0) {
+      lines.push(`Failed validation owners: ${record.integration.validationAudit.failed.join(", ")}`);
+    }
+    if (record.integration.validationAudit.gaps.length > 0) {
+      lines.push(`Validation gaps: ${record.integration.validationAudit.gaps.join(", ")}`);
+    }
+    for (const violation of record.integration.ownershipAudit.violations) {
+      lines.push(
+        `Mutation violation: ${violation.owner} ${violation.operation} ${violation.path} ` +
+          `(${violation.source}, ${violation.disposition})`,
+      );
+    }
+    for (const risk of record.integration.risks) {
+      lines.push(`Remaining risk (${risk.owner}): ${risk.risk}`);
+    }
+    if (record.integration.signals.declaredTargetOverlaps.length > 0) {
+      lines.push(
+        `Overlapping assignments: ${record.integration.signals.declaredTargetOverlaps
+          .map((entry) => `${entry.path} [${entry.owners.join(", ")}]`)
+          .join("; ")}`,
+      );
+    }
+    if (record.integration.signals.changedPathOverlaps.length > 0) {
+      lines.push(
+        `Observed changed-path overlap: ${record.integration.signals.changedPathOverlaps
+          .map((entry) => `${entry.path} [${entry.owners.join(", ")}]`)
+          .join("; ")}`,
+      );
+    }
+    if (record.integration.signals.zeroChangeAssignments.length > 0) {
+      lines.push(
+        `Zero-change assignments: ${record.integration.signals.zeroChangeAssignments.join(", ")}`,
+      );
+    }
+    if (record.integration.signals.repeatedValidationActivities.length > 0) {
+      lines.push(
+        `Repeated validation/investigation: ${record.integration.signals.repeatedValidationActivities
+          .map((entry) => `${entry.name} [${entry.owners.join(", ")}]`)
+          .join("; ")}`,
+      );
     }
   }
   lines.push(`Usage: ${formatUsage(record.usage)}`);

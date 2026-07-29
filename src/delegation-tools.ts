@@ -15,7 +15,14 @@ import {
 import type { CompiledGrant } from "./resolver";
 import { normalizeTarget } from "./paths";
 import { checkGrant } from "./grant";
-import { checkpointSchema, fromInput, type CheckpointResult, type DelegationRecord } from "./checkpoint";
+import {
+  checkpointSchema,
+  fromInput,
+  reconcileDelegationMutations,
+  type CheckpointResult,
+  type DelegationRecord,
+} from "./checkpoint";
+import { MutationAccountability } from "./mutation-accountability";
 
 /**
  * The delegated session's tool set, compiled from its grant (ADR 0078, 0079,
@@ -40,8 +47,9 @@ import { checkpointSchema, fromInput, type CheckpointResult, type DelegationReco
  *   means an in-repo symlink cannot alias a read into a scope the grant forbids.
  * - Successful mutations are recorded into a per-delegation
  *   {@link DelegationRecord}; that set is the sole source of the checkpoint's
- *   observed manifest (ADR 0083). `bash` is included UNMODIFIED (ADR 0079) — no
- *   heuristic inspection — and its filesystem effects are outside the manifest.
+ *   observed manifest (ADR 0083). `bash` commands are never heuristically
+ *   inspected, but their retained filesystem effects are reconciled after each
+ *   command and again at checkpoint against the same grant.
  * - `orca_checkpoint` is the terminating structured-output tool; it exists only
  *   in delegated sessions and attaches only observed paths.
  */
@@ -137,6 +145,7 @@ function guardWrite(
   cwd: string,
   grant: CompiledGrant,
   params: PathParams,
+  record?: DelegationRecord,
 ): { rel: string; abs: string } {
   const logical = logicalTarget(cwd, params.path);
   if ("reason" in logical) throw new Error(logical.reason);
@@ -166,8 +175,20 @@ function guardWrite(
   }
 
   const decision = checkGrant(grant, "write", logical.rel);
-  if (!decision.allowed) throw new Error(decision.reason);
+  if (!decision.allowed) {
+    record?.accountability?.recordBlockedFileMutation(logical.rel);
+    throw new Error(decision.reason);
+  }
   return { rel: logical.rel, abs };
+}
+
+function ensureAccountability(
+  cwd: string,
+  grant: CompiledGrant,
+  record: DelegationRecord,
+): MutationAccountability {
+  record.accountability ??= new MutationAccountability(cwd, grant, record);
+  return record.accountability;
 }
 
 /**
@@ -215,7 +236,10 @@ function recordingMutation(record: DelegationRecord) {
     exec: () => Promise<AgentToolResult<D>>,
   ): Promise<AgentToolResult<D>> => {
     const result = await exec();
-    if ((result as { isError?: boolean }).isError !== true) record.changedPaths.add(guarded.rel);
+    if ((result as { isError?: boolean }).isError !== true) {
+      if (record.accountability) record.accountability.recordAuthorizedFileMutation(guarded.rel);
+      else record.changedPaths.add(guarded.rel);
+    }
     return result;
   };
 }
@@ -226,9 +250,10 @@ export function createGrantedWriteTool(
   grant: CompiledGrant,
   record: DelegationRecord,
 ): ToolDefinition {
+  ensureAccountability(cwd, grant, record);
   return withGrant(
     createWriteToolDefinition(cwd),
-    (params) => guardWrite(cwd, grant, params as PathParams),
+    (params) => guardWrite(cwd, grant, params as PathParams, record),
     recordingMutation(record),
   ) as ToolDefinition;
 }
@@ -239,9 +264,10 @@ export function createGrantedEditTool(
   grant: CompiledGrant,
   record: DelegationRecord,
 ): ToolDefinition {
+  ensureAccountability(cwd, grant, record);
   return withGrant(
     createEditToolDefinition(cwd),
-    (params) => guardWrite(cwd, grant, params as PathParams),
+    (params) => guardWrite(cwd, grant, params as PathParams, record),
     recordingMutation(record),
   ) as ToolDefinition;
 }
@@ -250,12 +276,12 @@ export function createGrantedEditTool(
  * A `spawnHook` that RECORDS each bash invocation's command and cwd into the
  * delegation record and returns the spawn context UNCHANGED (ADR 0079).
  *
- * This is visibility, never enforcement. The hook is a pure pass-through for
+ * This hook is visibility, never enforcement. The hook is a pure pass-through for
  * execution — it returns exactly the `{ command, cwd, env }` it received, so it
  * cannot alter, rewrite, sandbox, or block a command — and nothing anywhere
- * reads `record.bashActivity` to make an allow/deny decision. The log exists only
- * so the human can SEE, after the fact, what shell commands a delegation ran; the
- * subprocess filesystem dimension stays advisory (see `enforcement.ts`).
+ * reads `record.bashActivity` to make an allow/deny decision. The separate
+ * post-execution mutation-accountability layer checks retained filesystem
+ * effects; it does not infer authority from command text.
  */
 export function recordingSpawnHook(record: DelegationRecord): BashSpawnHook {
   return (context: BashSpawnContext): BashSpawnContext => {
@@ -265,16 +291,31 @@ export function recordingSpawnHook(record: DelegationRecord): BashSpawnHook {
 }
 
 /**
- * The `bash` tool (ADR 0079), included by default so domain agents keep shells
- * for tests, builds, and codegen. Orca applies no heuristic command inspection;
- * the delegation prompt states the write boundary so the model self-polices, and
- * the enforcement summary discloses that bash filesystem effects are advisory,
- * never counted in the observed manifest. The only Orca addition is the
- * {@link recordingSpawnHook}, which logs commands for visibility and never
- * changes what runs.
+ * The `bash` tool, included by default so domain agents keep shells for tests,
+ * builds, and codegen. Orca applies no heuristic command inspection. When a
+ * grant is supplied, the wrapper diffs retained repository state after command
+ * completion and restores unauthorized paths before returning; checkpoint
+ * performs a final pass for delayed effects. Omitting `grant` preserves the
+ * historical visibility-only constructor for old callers.
  */
-export function createDelegationBashTool(cwd: string, record: DelegationRecord): ToolDefinition {
-  return createBashToolDefinition(cwd, { spawnHook: recordingSpawnHook(record) }) as ToolDefinition;
+export function createDelegationBashTool(
+  cwd: string,
+  record: DelegationRecord,
+  grant?: CompiledGrant,
+): ToolDefinition {
+  const base = createBashToolDefinition(cwd, { spawnHook: recordingSpawnHook(record) });
+  if (!grant) return base as ToolDefinition;
+  const accountability = ensureAccountability(cwd, grant, record);
+  return {
+    ...base,
+    async execute(...args: Parameters<typeof base.execute>) {
+      try {
+        return await base.execute(...args);
+      } finally {
+        accountability.reconcileShellMutations();
+      }
+    },
+  } as ToolDefinition;
 }
 
 function renderCheckpointText(result: CheckpointResult): string {
@@ -315,10 +356,12 @@ export function createCheckpointTool(
     ],
     parameters: checkpointSchema,
     async execute(_toolCallId, params) {
+      reconcileDelegationMutations(record);
       const result: CheckpointResult = {
         ...fromInput(params),
         changedPaths: [...record.changedPaths].sort(),
         synthesized: false,
+        mutationViolations: [...record.mutationViolations],
       };
       record.checkpoint = result;
       return {
@@ -332,7 +375,7 @@ export function createCheckpointTool(
 
 /**
  * The complete delegated-session tool set for one grant: grant-checked
- * `read`/`write`/`edit`, unmodified `bash`, and the terminating
+ * `read`/`write`/`edit`, mutation-reconciled `bash`, and the terminating
  * `orca_checkpoint`. Nothing else — no `orca_delegate`, `orca_resolve`, or
  * `orca_explain` (those are the steward's), and no ungoverned built-ins.
  */
@@ -341,11 +384,12 @@ export function createDelegationTools(
   grant: CompiledGrant,
   record: DelegationRecord,
 ): ToolDefinition[] {
+  ensureAccountability(cwd, grant, record);
   return [
     createGrantedReadTool(cwd, grant),
     createGrantedWriteTool(cwd, grant, record),
     createGrantedEditTool(cwd, grant, record),
-    createDelegationBashTool(cwd, record),
+    createDelegationBashTool(cwd, record, grant),
     createCheckpointTool(record) as ToolDefinition,
   ];
 }

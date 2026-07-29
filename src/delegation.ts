@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -6,7 +9,7 @@ import type { OperatingMode } from "./mode";
 import type { CompiledGrant, ResolvedDelegation } from "./resolver";
 import {
   createDelegationRecord,
-  synthesizeFailed,
+  synthesizeFailedFromRecord,
   type BashActivity,
   type CheckpointResult,
   type CheckpointStatus,
@@ -63,6 +66,48 @@ export interface DelegationInputs {
   effectiveMode: OperatingMode;
   cwd: string;
   parent: ParentModel;
+  /** Canonical owner-specific assignment. Omitted only by legacy single-step callers. */
+  assignment?: OwnerAssignment;
+  /** Bounded evidence from completed dependency assignments. */
+  upstreamHandoffs?: UpstreamHandoff[];
+  sequenceId?: string;
+  stepId?: string;
+  delegationId?: string;
+  childSessionId?: string;
+}
+
+export interface OwnerAssignment {
+  schemaVersion: "1.1";
+  assignmentId: string;
+  owner: string;
+  task: string;
+  targets: string[];
+  /** Owner ids whose assignments must complete before this one starts. */
+  dependencies: string[];
+}
+
+export interface UpstreamHandoff {
+  assignmentId: string;
+  owner: string;
+  summary: string;
+  changedPaths: string[];
+  validationStatus: CheckpointResult["validation"]["status"];
+  remainingRisks: string[];
+}
+
+export interface AssignmentGraph {
+  schemaVersion: "1.1";
+  assignments: OwnerAssignment[];
+  /** Deterministic topological owner order. */
+  executionOrder: string[];
+  declaredTargetOverlaps: Array<{ path: string; owners: string[] }>;
+}
+
+export class AssignmentGraphError extends Error {
+  constructor(readonly diagnostics: string[]) {
+    super(`Invalid assignment graph: ${diagnostics.join(" ")}`);
+    this.name = "AssignmentGraphError";
+  }
 }
 
 /** A pinned source digest for provenance in the delegation record (ADR 0018). */
@@ -94,6 +139,12 @@ export interface DelegationSessionConfig {
   warnings: InjectionWarning[];
   instructionDigests: SourceDigest[];
   contextDigests: SourceDigest[];
+  assignment: OwnerAssignment;
+  upstreamHandoffs: UpstreamHandoff[];
+  sequenceId?: string;
+  stepId?: string;
+  delegationId?: string;
+  childSessionId?: string;
 }
 
 /** Assembly outcome: a spawnable config, or a pre-spawn failure with diagnostics. */
@@ -146,6 +197,8 @@ export function composeDelegationPrompt(
 
   const delegation: ResolvedDelegation = { owner: inputs.owner, targets: inputs.targets, grant: inputs.grant };
   const writeAllow = scopeList(inputs.grant.write.allow);
+  const assignment = inputs.assignment ?? canonicalAssignment(inputs);
+  const upstream = inputs.upstreamHandoffs ?? [];
 
   const lines: string[] = [
     invariants,
@@ -154,11 +207,9 @@ export function composeDelegationPrompt(
       "or by the task. Orca compiled your tools from a grant: your read/write/edit tools enforce it and " +
       "will refuse paths outside it.",
     "",
-    "WRITE BOUNDARY (read carefully): your file tools (read/write/edit) are constructively enforced — " +
-      `you may write only within: ${writeAllow}. The \`bash\` tool is NOT enforced: a shell command can ` +
-      "touch any path on the filesystem, and Orca cannot block that. You must self-police shell usage — " +
-      "do not use bash to create, move, or modify files outside your write boundary. Changes made through " +
-      "file tools are recorded; changes made through bash are not and are only advisory.",
+    "WRITE BOUNDARY (read carefully): file-tool and retained shell mutations are reconciled against " +
+      `the same effective grant. You may write only within: ${writeAllow}. Unauthorized shell effects ` +
+      "are reverted and recorded as violations; never try to work around the boundary.",
     "",
     stewardHeading,
     stewardInstructions.length > 0
@@ -173,14 +224,26 @@ export function composeDelegationPrompt(
     "",
     handoff,
     `Original request: ${inputs.originalRequest ?? inputs.task}`,
-    `Scoped assignment: ${inputs.task}`,
-    `Authorized target paths: ${inputs.targets.join(", ")}`,
+    `Scoped assignment: ${assignment.task}`,
+    `Assignment identity: ${assignment.assignmentId}`,
+    `Delegation identity: ${inputs.delegationId ?? "(legacy unavailable)"}`,
+    `Grant identity: ${inputs.grantId ?? inputs.grant.grantId ?? "(legacy unavailable)"}`,
+    `Authorized target paths: ${assignment.targets.join(", ")}`,
+    `Dependencies: ${assignment.dependencies.length > 0 ? assignment.dependencies.join(", ") : "(none)"}`,
+    "Bounded upstream handoff:",
+    ...(upstream.length > 0
+      ? upstream.flatMap((handoff) => [
+          `  - ${handoff.owner} (${handoff.assignmentId}): ${handoff.summary}`,
+          `    changed=${handoff.changedPaths.join(", ") || "(none)"}; validation=${handoff.validationStatus}`,
+        ])
+      : ["  (none)"]),
     "Authorized operations (compiled grant — read/write/edit are enforced against these):",
     ...formatGrant(delegation),
     `Effective mode: ${inputs.effectiveMode}.`,
     "Expected checkpoint output: when you finish (or cannot proceed), call orca_checkpoint exactly once " +
       "with a terminal status ('completed' when the assignment is done within your grant) and a summary. " +
-      "Do not list changed files — Orca records those from your tool calls. Calling it ends the session.",
+      "Report structured validation activities, unavailable prerequisites, assumptions, assertion or expected-output " +
+      "changes, and remaining risks. Do not list changed files — Orca observes them. Calling it ends the session.",
   ];
 
   return lines.join("\n");
@@ -260,6 +323,7 @@ export function buildDelegationSession(inputs: DelegationInputs): BuildResult {
 
   const record = createDelegationRecord();
   const tools = createDelegationTools(inputs.cwd, inputs.grant, record);
+  const assignment = inputs.assignment ?? canonicalAssignment(inputs);
 
   return {
     ok: true,
@@ -275,12 +339,116 @@ export function buildDelegationSession(inputs: DelegationInputs): BuildResult {
       model: inputs.parent.model,
       thinkingLevel: inputs.parent.thinkingLevel,
       kickoffPrompt:
-        `Begin your assigned task now, working only within your grant. Task: ${inputs.task}`,
+        `Begin assignment '${assignment.assignmentId}' now, working only within its targets and grant. Task: ${assignment.task}`,
       record,
       warnings: resolved.warnings,
       instructionDigests: digestsOf(resolved.instructions),
       contextDigests: digestsOf(resolved.context),
+      assignment,
+      upstreamHandoffs: inputs.upstreamHandoffs ?? [],
+      sequenceId: inputs.sequenceId,
+      stepId: inputs.stepId,
+      delegationId: inputs.delegationId,
+      childSessionId: inputs.childSessionId,
     },
+  };
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return (
+    left.length === right.length &&
+    [...left].sort().every((value, index) => value === [...right].sort()[index])
+  );
+}
+
+function canonicalAssignment(inputs: DelegationInputs): OwnerAssignment {
+  return {
+    schemaVersion: "1.1",
+    assignmentId: inputs.owner,
+    owner: inputs.owner,
+    task: inputs.task,
+    targets: [...inputs.targets],
+    dependencies: [],
+  };
+}
+
+/** Validate completeness, ownership, overlap, and acyclicity before any child starts. */
+export function buildAssignmentGraph(inputs: readonly DelegationInputs[]): AssignmentGraph {
+  const diagnostics: string[] = [];
+  const assignments = inputs.map((input) => input.assignment ?? canonicalAssignment(input));
+  if (inputs.length > 1 && inputs.every((input) => input.assignment === undefined)) {
+    const legacyOrder = [...assignments].sort((left, right) => left.owner.localeCompare(right.owner));
+    for (let index = 1; index < legacyOrder.length; index += 1) {
+      legacyOrder[index].dependencies = [legacyOrder[index - 1].owner];
+    }
+  }
+  const owners = new Set<string>();
+  const ids = new Set<string>();
+  for (let index = 0; index < inputs.length; index += 1) {
+    const input = inputs[index];
+    const assignment = assignments[index];
+    if (owners.has(assignment.owner)) diagnostics.push(`duplicate assignment owner '${assignment.owner}'.`);
+    owners.add(assignment.owner);
+    if (ids.has(assignment.assignmentId)) {
+      diagnostics.push(`duplicate assignment identity '${assignment.assignmentId}'.`);
+    }
+    ids.add(assignment.assignmentId);
+    if (assignment.owner !== input.owner) {
+      diagnostics.push(`assignment '${assignment.assignmentId}' names owner '${assignment.owner}', expected '${input.owner}'.`);
+    }
+    if (!sameStrings(assignment.targets, input.targets)) {
+      diagnostics.push(`assignment '${assignment.assignmentId}' targets do not exactly cover resolved owner '${input.owner}'.`);
+    }
+  }
+
+  const targetOwners = new Map<string, Set<string>>();
+  for (const assignment of assignments) {
+    for (const target of assignment.targets) {
+      const bucket = targetOwners.get(target) ?? new Set<string>();
+      bucket.add(assignment.owner);
+      targetOwners.set(target, bucket);
+    }
+    for (const dependency of assignment.dependencies) {
+      if (dependency === assignment.owner) {
+        diagnostics.push(`assignment '${assignment.assignmentId}' depends on itself.`);
+      } else if (!owners.has(dependency)) {
+        diagnostics.push(`assignment '${assignment.assignmentId}' has unknown dependency '${dependency}'.`);
+      }
+    }
+  }
+  const declaredTargetOverlaps = [...targetOwners]
+    .filter(([, matchingOwners]) => matchingOwners.size > 1)
+    .map(([path, matchingOwners]) => ({ path, owners: [...matchingOwners].sort() }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  if (declaredTargetOverlaps.length > 0) {
+    diagnostics.push(
+      `overlapping assignment targets: ${declaredTargetOverlaps.map((entry) => entry.path).join(", ")}.`,
+    );
+  }
+
+  const byOwner = new Map(assignments.map((assignment) => [assignment.owner, assignment]));
+  const remaining = new Set(assignments.map((assignment) => assignment.owner));
+  const executionOrder: string[] = [];
+  while (remaining.size > 0) {
+    const ready = [...remaining]
+      .filter((owner) => byOwner.get(owner)!.dependencies.every((dependency) => !remaining.has(dependency)))
+      .sort();
+    if (ready.length === 0) {
+      diagnostics.push(`assignment dependencies contain a cycle among: ${[...remaining].sort().join(", ")}.`);
+      break;
+    }
+    for (const owner of ready) {
+      executionOrder.push(owner);
+      remaining.delete(owner);
+    }
+  }
+
+  if (diagnostics.length > 0) throw new AssignmentGraphError(diagnostics);
+  return {
+    schemaVersion: "1.1",
+    assignments,
+    executionOrder,
+    declaredTargetOverlaps,
   };
 }
 
@@ -339,6 +507,8 @@ export interface DelegationSession {
     status: "completed" | "error" | "cancelled";
     checkpointStatus: CheckpointStatus;
     changedPaths: string[];
+    validationStatus: CheckpointResult["validation"]["status"];
+    mutationViolations: NonNullable<CheckpointResult["mutationViolations"]>;
   }): Promise<void>;
 }
 
@@ -350,11 +520,19 @@ export interface DelegationSession {
  */
 export type DelegationProgress =
   | { kind: "sequence_start"; owners: string[]; total: number }
-  | { kind: "step_start"; owner: string; index: number; total: number }
-  | { kind: "step_activity"; owner: string; index: number; total: number; note: string }
+  | { kind: "step_start"; owner: string; assignmentId?: string; index: number; total: number }
+  | {
+      kind: "step_activity";
+      owner: string;
+      assignmentId?: string;
+      index: number;
+      total: number;
+      note: string;
+    }
   | {
       kind: "step_end";
       owner: string;
+      assignmentId?: string;
       index: number;
       total: number;
       status: CheckpointStatus | "build_failed";
@@ -395,6 +573,15 @@ export interface DelegationEntry {
   bashActivity: BashActivity[];
   /** Per-delegation usage totalled from the session's events. */
   usage: DelegationUsage;
+  assignment: OwnerAssignment;
+  upstreamHandoffs: UpstreamHandoff[];
+  grantId?: string;
+  mutationViolations: NonNullable<CheckpointResult["mutationViolations"]>;
+  validation: CheckpointResult["validation"];
+  sequenceId?: string;
+  stepId?: string;
+  delegationId?: string;
+  childSessionId?: string;
 }
 
 /** The steward-facing result of one delegation. */
@@ -405,6 +592,8 @@ export interface DelegationOutcome {
   warnings: InjectionWarning[];
   usage: DelegationUsage;
   appendEntry: DelegationEntry;
+  assignment: OwnerAssignment;
+  upstreamHandoffs: UpstreamHandoff[];
 }
 
 /** Run result: a completed delegation outcome, or a pre-spawn build failure. */
@@ -436,9 +625,20 @@ function toEntry(
     contextDigests: config.contextDigests,
     warnings: config.warnings,
     toolNames: config.toolNames,
-    capabilitySummary: capabilitySummaryFor(config.toolNames),
+    capabilitySummary: capabilitySummaryFor(config.toolNames, {
+      shellMutationReconciliation: true,
+    }),
     bashActivity: [...config.record.bashActivity],
     usage,
+    assignment: config.assignment,
+    upstreamHandoffs: config.upstreamHandoffs,
+    grantId: config.grantId,
+    mutationViolations: checkpoint.mutationViolations ?? [],
+    validation: checkpoint.validation,
+    sequenceId: config.sequenceId,
+    stepId: config.stepId,
+    delegationId: config.delegationId,
+    childSessionId: config.childSessionId,
   };
 }
 
@@ -478,8 +678,8 @@ export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Pr
     // fall through to synthesize a failed checkpoint below unless one was recorded.
     if (!config.record.checkpoint) {
       const reason = error instanceof Error ? error.message : String(error);
-      config.record.checkpoint = synthesizeFailed(
-        [...config.record.changedPaths].sort(),
+      config.record.checkpoint = synthesizeFailedFromRecord(
+        config.record,
         `The session errored or was aborted: ${reason}`,
       );
     }
@@ -489,13 +689,15 @@ export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Pr
 
   const checkpoint =
     config.record.checkpoint ??
-    synthesizeFailed([...config.record.changedPaths].sort(), "No checkpoint was recorded.");
+    synthesizeFailedFromRecord(config.record, "No checkpoint was recorded.");
 
   const usage = session.usage ? session.usage() : emptyUsage();
   await session.finish?.({
     status: completionStatus,
     checkpointStatus: checkpoint.status,
     changedPaths: [...checkpoint.changedPaths].sort(),
+    validationStatus: checkpoint.validation.status,
+    mutationViolations: checkpoint.mutationViolations ?? [],
   });
 
   return {
@@ -507,6 +709,8 @@ export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Pr
       warnings: config.warnings,
       usage,
       appendEntry: toEntry(config, checkpoint, usage),
+      assignment: config.assignment,
+      upstreamHandoffs: config.upstreamHandoffs,
     },
   };
 }
@@ -526,6 +730,7 @@ export type SequenceStep =
       kind: "build_failed";
       owner: string;
       targets: string[];
+      assignment: OwnerAssignment;
       failureKind: "unknown_owner" | "required_missing" | "oversized";
       diagnostics: string[];
       warnings: InjectionWarning[];
@@ -534,7 +739,14 @@ export type SequenceStep =
       kind: "not_run";
       owner: string;
       targets: string[];
-      reason: "sequence_stopped" | "cancelled";
+      assignment: OwnerAssignment;
+      reason:
+        | "sequence_stopped"
+        | "cancelled"
+        | "dependency_failed"
+        | "dependency_blocked"
+        | "dependency_needs_scope";
+      blockedBy?: string[];
     };
 
 /**
@@ -550,7 +762,7 @@ export type SequenceStep =
  * the completed owners' work (already written in place) reported and intact.
  */
 export interface SequenceOutcome {
-  /** Per-owner results in the resolver's execution order (owner id ascending). */
+  /** Per-owner results in deterministic dependency order, then owner id. */
   steps: SequenceStep[];
   /** True only when every owner ran and returned a `completed` checkpoint. */
   allCompleted: boolean;
@@ -558,6 +770,210 @@ export interface SequenceOutcome {
   stoppedAt?: string;
   /** True when parent cancellation cut the sequence short (ADR 0083). */
   cancelled: boolean;
+  assignmentGraph: AssignmentGraph;
+  signals: OrchestrationSignals;
+}
+
+export interface OrchestrationSignals {
+  declaredTargetOverlaps: AssignmentGraph["declaredTargetOverlaps"];
+  changedPathOverlaps: Array<{ path: string; owners: string[] }>;
+  zeroChangeAssignments: string[];
+  repeatedValidationActivities: Array<{ name: string; owners: string[] }>;
+}
+
+export type StewardDecisionRequest =
+  | { status: "ready"; reason: string }
+  | {
+      status: "acknowledged_gap";
+      reason: string;
+      acknowledgedValidationGaps: string[];
+    }
+  | { status: "stopped"; reason: string };
+
+export interface IntegrationRecord {
+  schemaVersion: "1.1";
+  diffIdentity: string;
+  assignmentGraph: AssignmentGraph;
+  ownershipAudit: {
+    compliant: boolean;
+    violations: NonNullable<CheckpointResult["mutationViolations"]>;
+    changedPathOverlaps: OrchestrationSignals["changedPathOverlaps"];
+  };
+  dependencyAudit: {
+    complete: boolean;
+    notRun: Array<{ owner: string; reason: string; blockedBy: string[] }>;
+  };
+  validationAudit: {
+    verified: boolean;
+    states: Array<{ owner: string; status: CheckpointResult["validation"]["status"] }>;
+    failed: string[];
+    gaps: string[];
+    assertionChanges: Array<
+      CheckpointResult["validation"]["assertionChanges"][number] & { owner: string }
+    >;
+  };
+  risks: Array<{ owner: string; risk: string }>;
+  signals: OrchestrationSignals;
+  decision: {
+    status: StewardDecisionRequest["status"];
+    reason: string;
+    acknowledgedValidationGaps: string[];
+  };
+}
+
+function hashAcceptedDiff(sequence: SequenceOutcome, cwd: string): string {
+  const paths = [
+    ...new Set(
+      sequence.steps.flatMap((step) =>
+        step.kind === "delegated" ? step.outcome.checkpoint.changedPaths : [],
+      ),
+    ),
+  ].sort();
+  const hash = createHash("sha256");
+  for (const path of paths) {
+    const absolute = join(cwd, path);
+    hash.update(path);
+    hash.update("\0");
+    if (existsSync(absolute)) hash.update(readFileSync(absolute));
+    else hash.update("<deleted>");
+    hash.update("\0");
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+
+/**
+ * Consolidate the combined accepted change and apply the steward's explicit
+ * integration decision. A requested ready/acknowledged state is downgraded to
+ * stopped when its required audit predicates are not satisfied.
+ */
+export function buildIntegrationRecord(
+  sequence: SequenceOutcome,
+  cwd: string,
+  requestedDecision?: StewardDecisionRequest,
+): IntegrationRecord {
+  const delegated = sequence.steps.filter(
+    (step): step is Extract<SequenceStep, { kind: "delegated" }> => step.kind === "delegated",
+  );
+  const violations = delegated.flatMap(
+    (step) => step.outcome.checkpoint.mutationViolations ?? [],
+  );
+  const states = delegated.map((step) => ({
+    owner: step.outcome.owner,
+    status: step.outcome.checkpoint.validation.status,
+  }));
+  const failed = states
+    .filter((state) => state.status === "failed")
+    .map((state) => state.owner)
+    .sort();
+  const gaps = states
+    .filter((state) => state.status === "unavailable" || state.status === "not_run")
+    .map((state) => state.owner)
+    .sort();
+  const assertionChanges = delegated.flatMap((step) =>
+    step.outcome.checkpoint.validation.assertionChanges.map((change) => ({
+      owner: step.outcome.owner,
+      ...change,
+    })),
+  );
+  const notRun = sequence.steps.flatMap((step) =>
+    step.kind === "not_run"
+      ? [
+          {
+            owner: step.owner,
+            reason: step.reason,
+            blockedBy: step.blockedBy ?? [],
+          },
+        ]
+      : [],
+  );
+  const ownershipCompliant =
+    sequence.signals.changedPathOverlaps.length === 0 &&
+    violations.every(
+      (violation) =>
+        violation.disposition === "blocked" || violation.disposition === "reverted",
+    );
+  const dependencyComplete = sequence.allCompleted && notRun.length === 0;
+  const blockers: string[] = [];
+  if (!ownershipCompliant) blockers.push("ownership audit failed");
+  if (!dependencyComplete) blockers.push("dependency audit incomplete");
+  if (failed.length > 0) blockers.push(`validation failed: ${failed.join(", ")}`);
+
+  const requested = requestedDecision ?? {
+    status: "stopped" as const,
+    reason: "Explicit steward review and decision required.",
+  };
+  let decision: IntegrationRecord["decision"];
+  if (requested.status === "stopped") {
+    decision = {
+      status: "stopped",
+      reason: requested.reason,
+      acknowledgedValidationGaps: [],
+    };
+  } else if (blockers.length > 0) {
+    decision = {
+      status: "stopped",
+      reason: `Requested ${requested.status} was rejected: ${blockers.join("; ")}.`,
+      acknowledgedValidationGaps: [],
+    };
+  } else if (requested.status === "ready" && gaps.length > 0) {
+    decision = {
+      status: "stopped",
+      reason: `Requested ready was rejected because validation gaps require acknowledgement: ${gaps.join(", ")}.`,
+      acknowledgedValidationGaps: [],
+    };
+  } else if (requested.status === "acknowledged_gap") {
+    const acknowledged = [...new Set(requested.acknowledgedValidationGaps)].sort();
+    const uncovered = gaps.filter((owner) => !acknowledged.includes(owner));
+    const unrelated = acknowledged.filter((owner) => !gaps.includes(owner));
+    decision =
+      uncovered.length === 0 && unrelated.length === 0 && gaps.length > 0
+        ? {
+            status: "acknowledged_gap",
+            reason: requested.reason,
+            acknowledgedValidationGaps: acknowledged,
+          }
+        : {
+            status: "stopped",
+            reason:
+              "Requested gap acknowledgement did not exactly cover current validation gaps" +
+              `${uncovered.length > 0 ? `; uncovered: ${uncovered.join(", ")}` : ""}` +
+              `${unrelated.length > 0 ? `; unrelated: ${unrelated.join(", ")}` : ""}.`,
+            acknowledgedValidationGaps: [],
+          };
+  } else {
+    decision = {
+      status: "ready",
+      reason: requested.reason,
+      acknowledgedValidationGaps: [],
+    };
+  }
+
+  return {
+    schemaVersion: "1.1",
+    diffIdentity: hashAcceptedDiff(sequence, cwd),
+    assignmentGraph: sequence.assignmentGraph,
+    ownershipAudit: {
+      compliant: ownershipCompliant,
+      violations,
+      changedPathOverlaps: sequence.signals.changedPathOverlaps,
+    },
+    dependencyAudit: { complete: dependencyComplete, notRun },
+    validationAudit: {
+      verified: states.length > 0 && failed.length === 0 && gaps.length === 0,
+      states,
+      failed,
+      gaps,
+      assertionChanges,
+    },
+    risks: delegated.flatMap((step) =>
+      (step.outcome.checkpoint.remainingRisks ?? []).map((risk) => ({
+        owner: step.outcome.owner,
+        risk,
+      })),
+    ),
+    signals: sequence.signals,
+    decision,
+  };
 }
 
 /** A step counts as completed only when its session returned status `completed`. */
@@ -579,46 +995,118 @@ export async function runDelegationSequence(
   ordered: DelegationInputs[],
   deps: RunDeps,
 ): Promise<SequenceOutcome> {
+  const assignmentGraph = buildAssignmentGraph(ordered);
+  const inputsByOwner = new Map(ordered.map((inputs) => [inputs.owner, inputs]));
+  const assignmentsByOwner = new Map(
+    assignmentGraph.assignments.map((assignment) => [assignment.owner, assignment]),
+  );
+  const executionInputs = assignmentGraph.executionOrder.map((owner) => inputsByOwner.get(owner)!);
   const steps: SequenceStep[] = [];
-  let stopped = false;
   let stoppedAt: string | undefined;
   let cancelled = false;
-  const total = ordered.length;
+  const total = executionInputs.length;
+  const stepsByOwner = new Map<string, SequenceStep>();
 
-  const markStopped = (owner: string): void => {
-    stopped = true;
-    if (stoppedAt === undefined) stoppedAt = owner;
+  const noteStopped = (owner: string): void => {
+    stoppedAt ??= owner;
   };
 
-  deps.onProgress?.({ kind: "sequence_start", owners: ordered.map((o) => o.owner), total });
+  deps.onProgress?.({
+    kind: "sequence_start",
+    owners: assignmentGraph.executionOrder,
+    total,
+  });
 
   let index = 0;
-  for (const inputs of ordered) {
+  for (const baseInputs of executionInputs) {
     index += 1;
-    if (stopped) {
-      steps.push({
-        kind: "not_run",
-        owner: inputs.owner,
-        targets: inputs.targets,
-        reason: cancelled ? "cancelled" : "sequence_stopped",
-      });
-      continue;
-    }
+    const assignment = assignmentsByOwner.get(baseInputs.owner)!;
+    const dependencySteps = assignment.dependencies
+      .map((owner) => [owner, stepsByOwner.get(owner)] as const)
+      .filter((entry): entry is readonly [string, SequenceStep] => entry[1] !== undefined);
+
     // Parent cancelled before this owner started: do not spawn it at all.
     if (deps.signal?.aborted) {
       cancelled = true;
-      markStopped(inputs.owner);
-      steps.push({ kind: "not_run", owner: inputs.owner, targets: inputs.targets, reason: "cancelled" });
+      noteStopped(baseInputs.owner);
+      const step: SequenceStep = {
+        kind: "not_run",
+        owner: baseInputs.owner,
+        targets: baseInputs.targets,
+        assignment,
+        reason: "cancelled",
+      };
+      steps.push(step);
+      stepsByOwner.set(baseInputs.owner, step);
       continue;
     }
 
-    deps.onProgress?.({ kind: "step_start", owner: inputs.owner, index, total });
+    const incompleteDependencies = dependencySteps.filter(([, step]) => !stepCompleted(step));
+    if (incompleteDependencies.length > 0) {
+      const statuses = incompleteDependencies.map(([, step]) =>
+        step.kind === "delegated" ? step.outcome.checkpoint.status : step.kind,
+      );
+      const reason: Extract<SequenceStep, { kind: "not_run" }>["reason"] =
+        statuses.includes("needs_scope")
+          ? "dependency_needs_scope"
+          : statuses.includes("blocked")
+            ? "dependency_blocked"
+            : "dependency_failed";
+      noteStopped(baseInputs.owner);
+      const step: SequenceStep = {
+        kind: "not_run",
+        owner: baseInputs.owner,
+        targets: baseInputs.targets,
+        assignment,
+        reason,
+        blockedBy: incompleteDependencies.map(([owner]) => owner).sort(),
+      };
+      steps.push(step);
+      stepsByOwner.set(baseInputs.owner, step);
+      continue;
+    }
+
+    const upstreamHandoffs: UpstreamHandoff[] = dependencySteps.flatMap(([, step]) =>
+      step.kind === "delegated"
+        ? [
+            {
+              assignmentId: step.outcome.assignment.assignmentId,
+              owner: step.outcome.owner,
+              summary: step.outcome.checkpoint.summary,
+              changedPaths: [...step.outcome.checkpoint.changedPaths],
+              validationStatus: step.outcome.checkpoint.validation.status,
+              remainingRisks: step.outcome.checkpoint.remainingRisks ?? [],
+            },
+          ]
+        : [],
+    );
+    const inputs: DelegationInputs = {
+      ...baseInputs,
+      task: assignment.task,
+      assignment,
+      upstreamHandoffs,
+    };
+
+    deps.onProgress?.({
+      kind: "step_start",
+      owner: inputs.owner,
+      assignmentId: assignment.assignmentId,
+      index,
+      total,
+    });
     // Scope this owner's activity notes with its position so the widget/onUpdate
     // stream can attribute streaming activity to the right in-flight delegation.
     const stepDeps: RunDeps = {
       ...deps,
       onActivity: (note) =>
-        deps.onProgress?.({ kind: "step_activity", owner: inputs.owner, index, total, note }),
+        deps.onProgress?.({
+          kind: "step_activity",
+          owner: inputs.owner,
+          assignmentId: assignment.assignmentId,
+          index,
+          total,
+          note,
+        }),
     };
     const result = await runDelegation(inputs, stepDeps);
     // A cancellation observed during this delegation (its session was aborted and
@@ -630,6 +1118,7 @@ export async function runDelegationSequence(
         kind: "build_failed",
         owner: inputs.owner,
         targets: inputs.targets,
+        assignment,
         failureKind: result.kind,
         diagnostics: result.diagnostics,
         warnings: result.warnings,
@@ -637,25 +1126,31 @@ export async function runDelegationSequence(
       deps.onProgress?.({
         kind: "step_end",
         owner: inputs.owner,
+        assignmentId: assignment.assignmentId,
         index,
         total,
         status: "build_failed",
         changedPaths: 0,
       });
-      markStopped(inputs.owner);
+      const step = steps[steps.length - 1];
+      stepsByOwner.set(inputs.owner, step);
+      noteStopped(inputs.owner);
       continue;
     }
 
-    steps.push({ kind: "delegated", outcome: result.outcome });
+    const delegatedStep: SequenceStep = { kind: "delegated", outcome: result.outcome };
+    steps.push(delegatedStep);
+    stepsByOwner.set(inputs.owner, delegatedStep);
     deps.onProgress?.({
       kind: "step_end",
       owner: inputs.owner,
+      assignmentId: assignment.assignmentId,
       index,
       total,
       status: result.outcome.checkpoint.status,
       changedPaths: result.outcome.checkpoint.changedPaths.length,
     });
-    if (result.outcome.checkpoint.status !== "completed") markStopped(inputs.owner);
+    if (result.outcome.checkpoint.status !== "completed") noteStopped(inputs.owner);
   }
 
   const allCompleted = steps.length > 0 && steps.every(stepCompleted);
@@ -666,5 +1161,37 @@ export async function runDelegationSequence(
     allCompleted,
   });
 
-  return { steps, allCompleted, stoppedAt, cancelled };
+  const changedOwners = new Map<string, Set<string>>();
+  const activityOwners = new Map<string, Set<string>>();
+  const zeroChangeAssignments: string[] = [];
+  for (const step of steps) {
+    if (step.kind !== "delegated") continue;
+    if (step.outcome.checkpoint.changedPaths.length === 0) {
+      zeroChangeAssignments.push(step.outcome.assignment.assignmentId);
+    }
+    for (const path of step.outcome.checkpoint.changedPaths) {
+      const owners = changedOwners.get(path) ?? new Set<string>();
+      owners.add(step.outcome.owner);
+      changedOwners.set(path, owners);
+    }
+    for (const activity of step.outcome.checkpoint.validation.activities) {
+      const owners = activityOwners.get(activity.name) ?? new Set<string>();
+      owners.add(step.outcome.owner);
+      activityOwners.set(activity.name, owners);
+    }
+  }
+  const signals: OrchestrationSignals = {
+    declaredTargetOverlaps: assignmentGraph.declaredTargetOverlaps,
+    changedPathOverlaps: [...changedOwners]
+      .filter(([, owners]) => owners.size > 1)
+      .map(([path, owners]) => ({ path, owners: [...owners].sort() }))
+      .sort((left, right) => left.path.localeCompare(right.path)),
+    zeroChangeAssignments: zeroChangeAssignments.sort(),
+    repeatedValidationActivities: [...activityOwners]
+      .filter(([, owners]) => owners.size > 1)
+      .map(([name, owners]) => ({ name, owners: [...owners].sort() }))
+      .sort((left, right) => left.name.localeCompare(right.name)),
+  };
+
+  return { steps, allCompleted, stoppedAt, cancelled, assignmentGraph, signals };
 }

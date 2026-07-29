@@ -20,6 +20,8 @@ interface ChildObserverHandle {
     status: "completed" | "error" | "cancelled";
     checkpointStatus: string;
     changedPaths: string[];
+    validationStatus: string;
+    mutationViolations: unknown[];
   }): void;
   finish(): void;
 }
@@ -29,6 +31,10 @@ export interface ChildObserverBridge {
     grantId: string;
     targetPaths: string[];
     resolvedOwners: string[];
+    sequenceId?: string;
+    stepId?: string;
+    delegationId?: string;
+    childSessionId?: string;
   }): ChildObserverHandle;
 }
 
@@ -59,6 +65,10 @@ export function prepareChildObserver(
     grantId: config.grantId,
     targetPaths: config.targets,
     resolvedOwners: [config.owner],
+    ...(config.sequenceId ? { sequenceId: config.sequenceId } : {}),
+    ...(config.stepId ? { stepId: config.stepId } : {}),
+    ...(config.delegationId ? { delegationId: config.delegationId } : {}),
+    ...(config.childSessionId ? { childSessionId: config.childSessionId } : {}),
   });
 }
 

@@ -56,6 +56,10 @@ describe("composeStewardPrompt", () => {
     expect(prompt).toContain("apps/web/**");
     // Steward has no orca_checkpoint.
     expect(prompt).toContain("do not have orca_checkpoint");
+    expect(prompt).toContain("one explicit owner-specific assignment");
+    expect(prompt).toContain("acyclic dependencies");
+    expect(prompt).toContain("combined diff identity");
+    expect(prompt).toContain("acknowledge");
   });
 
   it("reflects the advisory effective mode and declared steward instruction sources", () => {

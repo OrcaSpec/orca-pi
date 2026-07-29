@@ -6,6 +6,7 @@ import {
   createDelegationRecord,
   fromInput,
   synthesizeFailed,
+  synthesizeFailedFromRecord,
   type CheckpointResult,
 } from "../src/checkpoint";
 import { createCheckpointTool } from "../src/delegation-tools";
@@ -31,7 +32,8 @@ describe("checkpoint schema and vocabulary", () => {
 
   it("has no changed-paths field — the model cannot report the manifest", () => {
     const keys = Object.keys(checkpointSchema.properties);
-    expect(keys).toEqual(["status", "summary", "scope_request", "remaining_risks"]);
+    expect(keys).not.toContain("changed_paths");
+    expect(keys).toContain("validation_activities");
   });
 
   it("maps validated input to the agent-supplied result fields", () => {
@@ -46,7 +48,51 @@ describe("checkpoint schema and vocabulary", () => {
       summary: "need more",
       scopeRequest: ["pkg/other/x.ts"],
       remainingRisks: ["untested"],
+      validation: {
+        status: "not_run",
+        activities: [],
+        unavailablePrerequisites: [],
+        assumptions: [],
+        assertionChanges: [],
+      },
     });
+  });
+
+  it("derives validation separately from checkpoint status and sanitizes retained activities", () => {
+    const result = fromInput({
+      status: "completed",
+      summary: "implementation complete",
+      validation_activities: [
+        {
+          kind: "command",
+          name: "focused unit tests",
+          command: "API_TOKEN=top-secret npm test -- provider",
+          status: "passed",
+          summary: "12 tests passed",
+        },
+      ],
+      unavailable_prerequisites: [],
+      assumptions: ["public fixture matches production shape"],
+      assertion_changes: [
+        {
+          path: "test/provider.test.ts",
+          kind: "assertion",
+          description: "updated alias assertion for the new supported model",
+        },
+      ],
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.validation).toMatchObject({
+      status: "passed",
+      assumptions: ["public fixture matches production shape"],
+      assertionChanges: [
+        expect.objectContaining({ path: "test/provider.test.ts", kind: "assertion" }),
+      ],
+    });
+    expect(result.validation.activities[0].command).toContain("[REDACTED]");
+    expect(result.validation.activities[0].command).not.toContain("top-secret");
+    expect([...CHECKPOINT_STATUSES]).toEqual(["completed", "needs_scope", "blocked", "failed"]);
   });
 });
 
@@ -100,5 +146,24 @@ describe("synthesized failed checkpoint", () => {
     expect(result.synthesized).toBe(true);
     expect(result.changedPaths).toEqual(["src/x.ts"]);
     expect(result.summary).toContain("without calling orca_checkpoint");
+  });
+
+  it("retains sanitized violation dispositions without adding a fifth status", () => {
+    const record = createDelegationRecord();
+    record.mutationViolations.push({
+      schemaVersion: "1.1",
+      path: "provider/specific.ts",
+      owner: "core",
+      grantId: `sha256:${"a".repeat(64)}`,
+      operation: "write",
+      source: "shell",
+      disposition: "reverted",
+    });
+
+    const result = synthesizeFailedFromRecord(record, "The session stopped.");
+
+    expect(result.status).toBe("failed");
+    expect(result.mutationViolations).toEqual(record.mutationViolations);
+    expect([...CHECKPOINT_STATUSES]).toEqual(["completed", "needs_scope", "blocked", "failed"]);
   });
 });

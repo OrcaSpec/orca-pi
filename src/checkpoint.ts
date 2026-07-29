@@ -1,4 +1,5 @@
 import { Type, type Static } from "typebox";
+import type { MutationAccountability, MutationViolation } from "./mutation-accountability";
 
 /**
  * The structured terminal checkpoint that ends every delegated session (ADR
@@ -27,6 +28,39 @@ export const CHECKPOINT_STATUSES = ["completed", "needs_scope", "blocked", "fail
 
 /** One of the four terminal checkpoint statuses. */
 export type CheckpointStatus = (typeof CHECKPOINT_STATUSES)[number];
+
+/** Validation is evidence orthogonal to the four delegation statuses. */
+export const VALIDATION_STATUSES = ["passed", "failed", "unavailable", "not_run"] as const;
+export type ValidationStatus = (typeof VALIDATION_STATUSES)[number];
+
+export interface ValidationActivity {
+  kind: "command" | "test" | "inspection" | "build" | "other";
+  name: string;
+  command?: string;
+  status: ValidationStatus;
+  summary?: string;
+}
+
+export interface AssertionChange {
+  path: string;
+  kind: "assertion" | "expected_output";
+  description: string;
+}
+
+export interface ValidationEvidence {
+  status: ValidationStatus;
+  activities: ValidationActivity[];
+  unavailablePrerequisites: string[];
+  assumptions: string[];
+  assertionChanges: AssertionChange[];
+}
+
+const validationStatusSchema = Type.Union([
+  Type.Literal("passed"),
+  Type.Literal("failed"),
+  Type.Literal("unavailable"),
+  Type.Literal("not_run"),
+]);
 
 /**
  * The `orca_checkpoint` parameter schema. Note the absence of any changed-path
@@ -72,6 +106,36 @@ export const checkpointSchema = Type.Object(
         description: "Optional free-text notes on risks, caveats, or follow-ups the steward should know.",
       }),
     ),
+    validation_activities: Type.Optional(
+      Type.Array(
+        Type.Object({
+          kind: Type.Union([
+            Type.Literal("command"),
+            Type.Literal("test"),
+            Type.Literal("inspection"),
+            Type.Literal("build"),
+            Type.Literal("other"),
+          ]),
+          name: Type.String({ minLength: 1, maxLength: 160 }),
+          command: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
+          status: validationStatusSchema,
+          summary: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
+        }),
+      ),
+    ),
+    unavailable_prerequisites: Type.Optional(
+      Type.Array(Type.String({ minLength: 1, maxLength: 300 })),
+    ),
+    assumptions: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 300 }))),
+    assertion_changes: Type.Optional(
+      Type.Array(
+        Type.Object({
+          path: Type.String({ minLength: 1, maxLength: 300 }),
+          kind: Type.Union([Type.Literal("assertion"), Type.Literal("expected_output")]),
+          description: Type.String({ minLength: 1, maxLength: 500 }),
+        }),
+      ),
+    ),
   },
   {
     description:
@@ -98,6 +162,13 @@ export interface CheckpointResult {
   changedPaths: string[];
   /** True when the extension synthesized this checkpoint for a statusless session. */
   synthesized: boolean;
+  /** Structured validation evidence; independent of terminal status. */
+  validation: ValidationEvidence;
+  /**
+   * Contract 1.1 violation evidence. Optional so persisted 1.0 checkpoints
+   * remain readable; new delegated tool sets always emit the array.
+   */
+  mutationViolations?: MutationViolation[];
 }
 
 /**
@@ -118,31 +189,118 @@ export interface BashActivity {
  * whatever the tools recorded, nothing the agent asserts.
  *
  * {@link bashActivity} is a parallel, purely-informational log of the shell
- * commands the delegation ran, captured by the bash `spawnHook` for visibility
- * (ADR 0079). It is NEVER consulted in any allow/deny decision and its contents
- * are outside {@link changedPaths}: bash filesystem effects remain advisory.
+ * commands the delegation ran, captured by the bash `spawnHook`. It is NEVER
+ * consulted in any allow/deny decision. The runtime accountability tracker
+ * separately reconciles retained shell effects and adds only authorized paths
+ * to {@link changedPaths}.
  */
 export interface DelegationRecord {
   /** Repository-relative paths of successful file-tool mutations, observed. */
   changedPaths: Set<string>;
   /** Observed bash commands (visibility only, never enforcement — ADR 0079). */
   bashActivity: BashActivity[];
+  /** Sanitized unauthorized-mutation evidence under contract 1.1. */
+  mutationViolations: MutationViolation[];
+  /** Runtime-only post-command/post-session reconciliation seam. */
+  accountability?: MutationAccountability;
   /** The checkpoint once the session ends (agent-called or synthesized). */
   checkpoint?: CheckpointResult;
 }
 
 /** A fresh, empty observed record for one delegation. */
 export function createDelegationRecord(): DelegationRecord {
-  return { changedPaths: new Set(), bashActivity: [] };
+  return { changedPaths: new Set(), bashActivity: [], mutationViolations: [] };
+}
+
+/**
+ * Post-session integration seam. Orchestration calls this after the child stops
+ * and before it synthesizes or persists a terminal checkpoint, so delayed
+ * shell effects receive the same reconciliation as ordinary bash completion.
+ */
+export function reconcileDelegationMutations(record: DelegationRecord): void {
+  record.accountability?.reconcileShellMutations();
 }
 
 /** Normalize a validated checkpoint input into the agent-supplied part of a result. */
 export function fromInput(input: CheckpointInput): Omit<CheckpointResult, "changedPaths" | "synthesized"> {
+  const activities: ValidationActivity[] = (input.validation_activities ?? []).map((activity) => ({
+    kind: activity.kind,
+    name: sanitizeEvidenceText(activity.name),
+    command: activity.command ? sanitizeCommand(activity.command) : undefined,
+    status: activity.status,
+    summary: activity.summary ? sanitizeEvidenceText(activity.summary) : undefined,
+  }));
+  const unavailablePrerequisites = (input.unavailable_prerequisites ?? []).map(
+    sanitizeEvidenceText,
+  );
   return {
     status: input.status,
     summary: input.summary,
     scopeRequest: input.scope_request,
     remainingRisks: input.remaining_risks,
+    validation: {
+      status: deriveValidationStatus(activities, unavailablePrerequisites),
+      activities,
+      unavailablePrerequisites,
+      assumptions: (input.assumptions ?? []).map(sanitizeEvidenceText),
+      assertionChanges: (input.assertion_changes ?? []).map((change) => ({
+        path: change.path,
+        kind: change.kind,
+        description: sanitizeEvidenceText(change.description),
+      })),
+    },
+  };
+}
+
+function sanitizeEvidenceText(value: string): string {
+  return value
+    .replace(
+      /\b([A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|PASSWORD|SECRET))\s*=\s*(?:"[^"]*"|'[^']*'|\S+)/gi,
+      "$1=[REDACTED]",
+    )
+    .replace(
+      /(--?(?:api[_-]?key|access[_-]?token|token|password|secret))\s+\S+/gi,
+      "$1 [REDACTED]",
+    )
+    .replace(/\bBearer\s+\S+/gi, "Bearer [REDACTED]")
+    .replace(
+      /\b(api[_-]?key|access[_-]?token|token|password|secret)\b(\s*[:=]\s*|\s+)[^\s,;]+/gi,
+      "$1=[REDACTED]",
+    );
+}
+
+function sanitizeCommand(command: string): string {
+  return sanitizeEvidenceText(command).slice(0, 500);
+}
+
+function deriveValidationStatus(
+  activities: readonly ValidationActivity[],
+  unavailablePrerequisites: readonly string[],
+): ValidationStatus {
+  if (activities.some((activity) => activity.status === "failed")) return "failed";
+  if (
+    unavailablePrerequisites.length > 0 ||
+    activities.some((activity) => activity.status === "unavailable")
+  ) {
+    return "unavailable";
+  }
+  if (
+    activities.length === 0 ||
+    activities.some((activity) => activity.status === "not_run")
+  ) {
+    return "not_run";
+  }
+  return "passed";
+}
+
+/** The empty validation state used for synthesized and legacy-compatible checkpoints. */
+export function notRunValidation(): ValidationEvidence {
+  return {
+    status: "not_run",
+    activities: [],
+    unavailablePrerequisites: [],
+    assumptions: [],
+    assertionChanges: [],
   };
 }
 
@@ -159,5 +317,22 @@ export function synthesizeFailed(changedPaths: string[], reason: string): Checkp
       `checkpoint so the delegation does not end statusless (ADR 0083). ${reason}`.trim(),
     changedPaths,
     synthesized: true,
+    validation: notRunValidation(),
+  };
+}
+
+/**
+ * Contract 1.1 statusless-session finalizer. It reconciles delayed shell
+ * effects first, then carries both the accepted manifest and sanitized
+ * violations into the synthesized terminal checkpoint.
+ */
+export function synthesizeFailedFromRecord(
+  record: DelegationRecord,
+  reason: string,
+): CheckpointResult {
+  reconcileDelegationMutations(record);
+  return {
+    ...synthesizeFailed([...record.changedPaths].sort(), reason),
+    mutationViolations: [...record.mutationViolations],
   };
 }

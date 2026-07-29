@@ -301,10 +301,10 @@ describe("orca-pi extension entry", () => {
     const status = orcaText(statusCtx);
     expect(status).toContain("Delegation history (1):");
     expect(status).toContain("restyle the button");
-    // Last-delegation detail carries the capability summary and the bash activity,
-    // labelled visibility-only (ADR 0079).
-    expect(status).toContain("Capability summary (not a mode): partially_enforced");
-    expect(status).toContain("Bash activity — VISIBILITY ONLY, not enforcement (ADR 0079)");
+    // Last-delegation detail carries the reconciled shell capability and retains
+    // only a sanitized command digest, never the raw command.
+    expect(status).toContain("Capability summary (not a mode): enforced");
+    expect(status).toContain("Shell activities (sanitized digests)");
   });
 
   it("a resumed session rebuilds delegation history from session entries ALONE", async () => {
@@ -314,7 +314,19 @@ describe("orca-pi extension entry", () => {
     writeSpec("multi-owner");
     await first.registered.tools.get("orca_delegate")!.execute(
       "d1",
-      { task: "the earlier task", paths: ["apps/web/app.tsx", "services/billing/x.rb"] },
+      {
+        task: "the earlier task",
+        paths: ["apps/web/app.tsx", "services/billing/x.rb"],
+        assignments: [
+          { owner: "billing", task: "update billing", paths: ["services/billing/x.rb"] },
+          {
+            owner: "web",
+            task: "update web after billing",
+            paths: ["apps/web/app.tsx"],
+            depends_on: ["billing"],
+          },
+        ],
+      },
       undefined,
       undefined,
       makeCtx(dir, true),

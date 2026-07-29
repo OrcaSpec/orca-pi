@@ -93,10 +93,10 @@ describe("buildDelegationSession assembly", () => {
     expect(indices.every((i) => i >= 0)).toBe(true);
     expect(indices).toEqual([...indices].sort((a, b) => a - b));
 
-    // Write boundary (ADR 0079) names the enforced write scope and the bash gap.
+    // Write boundary names the target scope and reconciled shell accountability.
     expect(prompt).toContain("WRITE BOUNDARY");
     expect(prompt).toContain("apps/web/**");
-    expect(prompt).toMatch(/bash.*not enforced|NOT enforced/i);
+    expect(prompt).toMatch(/shell mutations are reconciled/i);
 
     // Operator handoff (original request, scoped assignment, authorized paths/ops).
     expect(prompt).toContain("Original request: Please make the button blue");
@@ -270,6 +270,8 @@ describe("runDelegation end-to-end (scripted, offline)", () => {
       status: "completed",
       checkpointStatus: "completed",
       changedPaths: ["apps/web/app.tsx"],
+      validationStatus: "not_run",
+      mutationViolations: [],
     });
   });
 

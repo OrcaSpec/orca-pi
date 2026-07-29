@@ -9,14 +9,10 @@
  *   result; the capability summary below is ADR 0023's explanatory shorthand.
  * - {@link capabilitySummaryFor} — a PURE derivation of the ADR 0023 summary
  *   (`enforced` / `partially_enforced` / `advisory`) from a delegation's tool-set
- *   names. Its single load-bearing invariant: a tool set containing `bash` can
- *   NEVER derive `enforced` (ADR 0079 — the subprocess dimension is not
- *   technically passable). This is a property, not a convention: the function has
- *   no branch that returns `enforced` while `bash` is present, so the code cannot
- *   emit a dishonest claim. Since every MVP delegation includes `bash`
- *   (`createDelegationTools`), the summary for a real delegation is always at most
- *   `partially_enforced`; the `enforced` branch is reachable only by a
- *   hypothetical future no-bash grant.
+ *   names and the versioned shell-accountability capability. Historical callers
+ *   retain the 1.0 rule that bash caps the result below enforced. Contract 1.1
+ *   callers may claim enforced only when post-command/post-session mutation
+ *   reconciliation is explicitly active.
  *
  * The summary is explicitly a CAPABILITY SUMMARY, never an operating mode: modes
  * are `advisory`/`enforce` (see `mode.ts`); `partially_enforced` describes what a
@@ -24,7 +20,12 @@
  */
 
 /** How a single enforcement dimension is treated in the MVP. */
-export type DimensionClaim = "enforced" | "advisory_disclosed" | "observed" | "not_applicable";
+export type DimensionClaim =
+  | "enforced"
+  | "advisory_disclosed"
+  | "observed"
+  | "reconciled"
+  | "not_applicable";
 
 /** One row of the dimensioned enforcement profile (mirrors the PRD table). */
 export interface EnforcementDimension {
@@ -63,6 +64,32 @@ export const ENFORCEMENT_PROFILE: readonly EnforcementDimension[] = [
   { dimension: "Promotion gating", claim: "not_applicable", detail: "Not applicable (in-place editing)" },
 ] as const;
 
+/**
+ * Contract 1.1 profile. The 1.0 profile above remains readable for historical
+ * evidence; new delegations may claim this profile only when their bash tool is
+ * wrapped by post-command and checkpoint reconciliation.
+ */
+export const ENFORCEMENT_PROFILE_1_1: readonly EnforcementDimension[] = [
+  { dimension: "Repository reads via file tools", claim: "enforced", detail: "Enforced" },
+  { dimension: "Repository writes via file tools", claim: "enforced", detail: "Enforced" },
+  {
+    dimension: "Subprocess filesystem effects (bash)",
+    claim: "reconciled",
+    detail: "Post-command and post-session reconciled against the effective grant",
+  },
+  {
+    dimension: "Delegation creation",
+    claim: "enforced",
+    detail: "Enforced (only the steward's orca_delegate creates delegations)",
+  },
+  {
+    dimension: "Change verification",
+    claim: "reconciled",
+    detail: "Observed manifests plus sanitized mutation-disposition evidence",
+  },
+  { dimension: "Promotion gating", claim: "enforced", detail: "Unauthorized mutations excluded" },
+] as const;
+
 /** The ADR 0023 explanatory summary for a delegation's tool set. */
 export type CapabilitySummary = "enforced" | "partially_enforced" | "advisory";
 
@@ -76,18 +103,23 @@ export const ENFORCED_FILE_TOOLS: readonly string[] = ["read", "write", "edit"];
  * Derive the ADR 0023 capability summary for a delegation's tool set. PURE and
  * total.
  *
- * The rule is deliberately simple so the honesty invariant is obvious by
- * inspection: the presence of `bash` alone caps the summary below `enforced`,
- * because the subprocess filesystem dimension is not technically passable (ADR
- * 0079). With `bash` present, the summary is `partially_enforced` when at least
- * one constructively-enforced file tool is also present, else `advisory` (a shell
- * with no enforceable file boundary). Only a tool set WITHOUT `bash` can be
- * `enforced` — a case the MVP never produces (every delegation carries `bash`),
- * kept reachable so a future no-bash grant can honestly claim full enforcement.
+ * Without the 1.1 capability flag, bash continues to cap the result below
+ * `enforced`, preserving historical evidence semantics. With the flag, a
+ * bash-bearing set is enforced only when it also carries constructively-enforced
+ * file tools. Bash alone remains advisory.
  */
-export function capabilitySummaryFor(toolNames: readonly string[]): CapabilitySummary {
+export interface CapabilityOptions {
+  /** True only when bash effects are diffed and unauthorized changes restored. */
+  shellMutationReconciliation?: boolean;
+}
+
+export function capabilitySummaryFor(
+  toolNames: readonly string[],
+  options: CapabilityOptions = {},
+): CapabilitySummary {
   const hasBash = toolNames.includes(BASH_TOOL_NAME);
   const hasEnforcedFileTool = toolNames.some((name) => ENFORCED_FILE_TOOLS.includes(name));
+  if (hasBash && options.shellMutationReconciliation && hasEnforcedFileTool) return "enforced";
   if (hasBash) return hasEnforcedFileTool ? "partially_enforced" : "advisory";
   return "enforced";
 }
@@ -96,7 +128,7 @@ export function capabilitySummaryFor(toolNames: readonly string[]): CapabilitySu
 export function describeCapabilitySummary(summary: CapabilitySummary): string {
   switch (summary) {
     case "enforced":
-      return "every relevant file boundary is constructively enforced and this grant carries no bash";
+      return "every relevant retained filesystem mutation boundary is constructively enforced or reconciled";
     case "partially_enforced":
       return "file reads/writes are constructively enforced; bash subprocess filesystem effects are advisory and disclosed (ADR 0079)";
     case "advisory":
@@ -109,8 +141,11 @@ export function describeCapabilitySummary(summary: CapabilitySummary): string {
  * never as an operating mode, so the reader cannot mistake `partially_enforced`
  * for a third mode.
  */
-export function capabilitySummaryLine(toolNames: readonly string[]): string {
-  const summary = capabilitySummaryFor(toolNames);
+export function capabilitySummaryLine(
+  toolNames: readonly string[],
+  options: CapabilityOptions = {},
+): string {
+  const summary = capabilitySummaryFor(toolNames, options);
   return `Capability summary (not an operating mode): ${summary} — ${describeCapabilitySummary(summary)}.`;
 }
 
@@ -119,16 +154,25 @@ export function capabilitySummaryLine(toolNames: readonly string[]): string {
  * row-for-row, then the bash disclosure. No mode or per-delegation claim here —
  * this is the repository-wide profile; the capability summary is per delegation.
  */
-export function formatEnforcementSummary(): string[] {
-  const lines = ["Enforcement profile (dimensioned — ADR 0023, authoritative):"];
-  for (const dimension of ENFORCEMENT_PROFILE) {
+export function formatEnforcementSummary(version: "1.0" | "1.1" = "1.0"): string[] {
+  const profile = version === "1.1" ? ENFORCEMENT_PROFILE_1_1 : ENFORCEMENT_PROFILE;
+  const lines = [
+    version === "1.1"
+      ? "Enforcement profile 1.1 (dimensioned — ADR 0023, authoritative):"
+      : "Enforcement profile (dimensioned — ADR 0023, authoritative):",
+  ];
+  for (const dimension of profile) {
     lines.push(`  - ${dimension.dimension}: ${dimension.detail}`);
   }
   lines.push(
-    "Bash disclosure: every delegation includes the `bash` tool (ADR 0079). Its filesystem effects are " +
-      "advisory, not enforced — Orca applies no heuristic command inspection, cannot block shell-mediated " +
-      "writes, and leaves them outside the observed manifest. Any delegation carrying bash reports at most " +
-      "the `partially_enforced` capability summary and is never claimed fully enforced.",
+    version === "1.1"
+      ? "Bash accountability: Orca does not inspect command text. It reconciles retained filesystem effects " +
+          "against the effective grant after every command and at session finalization, reverting unauthorized " +
+          "paths before they can enter the accepted patch."
+      : "Bash disclosure: every delegation includes the `bash` tool (ADR 0079). Its filesystem effects are " +
+          "advisory, not enforced — Orca applies no heuristic command inspection, cannot block shell-mediated " +
+          "writes, and leaves them outside the observed manifest. Any delegation carrying bash reports at most " +
+          "the `partially_enforced` capability summary and is never claimed fully enforced.",
   );
   return lines;
 }

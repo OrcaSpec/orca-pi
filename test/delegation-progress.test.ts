@@ -136,7 +136,23 @@ describe("orca_delegate streams progress into onUpdate", () => {
     };
     await createDelegateTool(deps).execute(
       "d1",
-      { task: "do the work", paths: ["apps/web/app.tsx", "services/billing/x.rb"] },
+      {
+        task: "do the work",
+        paths: ["apps/web/app.tsx", "services/billing/x.rb"],
+        assignments: [
+          {
+            owner: "billing",
+            task: "update billing",
+            paths: ["services/billing/x.rb"],
+          },
+          {
+            owner: "web",
+            task: "update web",
+            paths: ["apps/web/app.tsx"],
+            depends_on: ["billing"],
+          },
+        ],
+      },
       undefined,
       onUpdate as never,
       { cwd: dir, model: fakeModel } as never,
