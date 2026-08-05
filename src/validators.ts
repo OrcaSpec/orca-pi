@@ -128,6 +128,14 @@ function runValidator(
     let settled = false;
     let escalation: NodeJS.Timeout | undefined;
 
+    /**
+     * Stop the validator. The signal goes to the CHILD, not to a process group: a
+     * validator that spawned its own workers can leave them behind, exactly as it
+     * could under `spawnSync`. Widening this to a group kill would mean detaching
+     * every validator into its own session, which changes how ordinary programs see
+     * their terminal and their signals for a leak the gate does not depend on — the
+     * run is over and its verdict is a refusal either way.
+     */
     const kill = (reason: KillReason): void => {
       killedBecause ??= reason;
       child.kill();

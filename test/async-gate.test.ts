@@ -11,6 +11,10 @@ import {
   type DelegationSession,
   type DelegationSessionConfig,
 } from "../src/delegation";
+import type { RuntimeOverlay, ValidatorDeclaration } from "../src/runtime-overlay";
+import type { AcceptanceGate, StagedWorkspace } from "../src/staging";
+import { gitWorktreeStaging } from "../src/staging-worktree";
+import { createAcceptanceGate } from "../src/validators";
 import { git, makeGitRepo, makeStateRoot, snapshotTree } from "./git-fixture";
 
 /**
@@ -152,6 +156,45 @@ function alive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+/** One normalized declaration, as the overlay loader would have produced it. */
+function decl(script: string, overrides: Partial<ValidatorDeclaration> = {}): ValidatorDeclaration {
+  return {
+    program: process.execPath,
+    args: ["-e", script],
+    cwd: "",
+    timeoutSeconds: 10,
+    ...overrides,
+  };
+}
+
+/**
+ * The gate exactly as `delegation.ts` builds it — from a validated overlay, for the
+ * owners that ran — over a real staged checkout. Driving the gate directly is what
+ * lets a test pin how one validator ends without also arranging a whole delegation
+ * around it; the workspace is real because where a validator runs, and where its
+ * output is preserved, are part of what is being asserted.
+ */
+function gateOver(
+  repo: string,
+  stateRoot: string,
+  declarations: ValidatorDeclaration[],
+): { gate: AcceptanceGate; workspace: StagedWorkspace; close: () => void } {
+  const opened = gitWorktreeStaging.open({
+    cwd: repo,
+    delegationId: "delegation_edges",
+    stateRoot,
+  });
+  if (!opened.ok) throw new Error(`staging refused: ${opened.diagnostics.join(" ")}`);
+  const overlay: RuntimeOverlay = { schemaVersion: 1, validations: { web: declarations } };
+  const gate = createAcceptanceGate(overlay, ["web"]);
+  if (!gate) throw new Error("the overlay declared no validators");
+  return {
+    gate,
+    workspace: opened.workspace,
+    close: () => gitWorktreeStaging.close(opened.workspace),
+  };
 }
 
 /**
@@ -305,6 +348,157 @@ describe("cancelling a delegation while a validator runs", () => {
       expect(result.outcome.promotion.diagnostics.join("\n")).toContain(
         "1 later validator(s) were not run",
       );
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("spawns nothing at all when the cancellation arrived before the gate did", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    const trail = join(stateRoot, "trail.txt");
+    const { gate, workspace, close } = gateOver(repo, stateRoot, [
+      decl(`require('fs').appendFileSync(${JSON.stringify(trail)}, 'ran\\n');`),
+    ]);
+    try {
+      const controller = new AbortController();
+      controller.abort();
+
+      const result = await gate(workspace, controller.signal);
+
+      // Already cancelled is not "run it anyway" and not "pass it silently": the run is
+      // recorded so the evidence names the validator that never got its chance.
+      expect(existsSync(trail)).toBe(false);
+      expect(result.ok).toBe(false);
+      expect(result.validations.map((run) => run.status)).toEqual(["cancelled"]);
+      expect(result.validations[0].stderr).toContain("cancelled before this validator started");
+      expect(readFileSync(result.validatorOutputPath!, "utf8")).toContain("CANCELLED");
+    } finally {
+      close();
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("a validator the runtime has to stop", () => {
+  it("kills a validator that ignores SIGTERM rather than letting it outlive its budget", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    const { gate, workspace, close } = gateOver(repo, stateRoot, [
+        // A program that traps the polite signal and keeps running. Under the
+        // synchronous gate this was unbounded: `spawnSync` waited for a child that
+        // never left.
+        decl("process.on('SIGTERM', () => {});setInterval(() => {}, 1000);", {
+          timeoutSeconds: 0.25,
+        }),
+      ]);
+    try {
+
+      const result = await gate(workspace, undefined);
+
+      expect(result.ok).toBe(false);
+      // Still a timeout — that is what happened — and the escalation is visible in the
+      // signal that actually ended it.
+      expect(result.validations[0].status).toBe("timed_out");
+      expect(result.validations[0].signal).toBe("SIGKILL");
+    } finally {
+      close();
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("stops a validator whose output passes the capture cap, and says so", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    const { gate, workspace, close } = gateOver(repo, stateRoot, [
+        // More output than the gate will hold. The cap bounds THIS process's memory,
+        // so passing it is a refusal rather than a truncated pass.
+        decl("const line = 'x'.repeat(1024 * 1024);for (let i = 0; i < 12; i++) process.stdout.write(line);"),
+      ]);
+    try {
+
+      const result = await gate(workspace, undefined);
+
+      expect(result.ok).toBe(false);
+      expect(result.validations[0].status).toBe("unavailable");
+      expect(result.validations[0].stderr).toContain("bytes of output and was stopped");
+      // What was captured before the cap is still evidence, bounded for the log.
+      expect(result.validations[0].stdout).toContain("… (truncated at 4000 characters)");
+    } finally {
+      close();
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a validator something else killed as one that could not be run", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    const { gate, workspace, close } = gateOver(repo, stateRoot, [
+        decl("process.kill(process.pid, 'SIGKILL');setInterval(() => {}, 1000);"),
+      ]);
+    try {
+
+      const result = await gate(workspace, undefined);
+
+      // A death by signal that the gate did not order is not a verdict the program
+      // gave, so it refuses the promotion rather than counting as a pass.
+      expect(result.ok).toBe(false);
+      expect(result.validations[0].status).toBe("unavailable");
+      expect(result.validations[0].signal).toBe("SIGKILL");
+      expect(result.validations[0].exitCode).toBeUndefined();
+    } finally {
+      close();
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the window a real validator opens", () => {
+  it("still catches a checkout the user moved while a validator was running", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    const startedAt = join(stateRoot, "validator-started");
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: {
+          web: [
+            nodeValidator(
+              "const fs = require('fs');" +
+                `fs.writeFileSync(${JSON.stringify(startedAt)}, 'started');` +
+                "setTimeout(() => {}, 400);",
+            ),
+          ],
+        },
+      });
+      const { createSession } = sessions(writeAndComplete);
+
+      // The base guard bracketing the gate is pinned by `stale-base.test.ts` with a
+      // synthetic gate standing in for elapsed time. Now that the gate is really
+      // asynchronous, the same window can be entered for real: this edit happens on
+      // the parent's event loop WHILE a validator process is running.
+      const running = runDelegation(inputsFor(repo), { createSession, stateRoot });
+      await waitForFile(startedAt);
+      writeFileSync(join(repo, "apps", "web", "app.tsx"), "the user got there first\n");
+      const result = await running;
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const promotion = result.outcome.promotion;
+      expect(promotion.status).toBe("conflict");
+      expect(promotion.driftedPaths).toEqual(["apps/web/app.tsx"]);
+      // The user's own edit stands, and the delegation's work is recoverable.
+      expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe(
+        "the user got there first\n",
+      );
+      expect(readFileSync(promotion.patchPath!, "utf8")).toContain("reviewed");
+      // The gate itself passed; the base is what moved.
+      expect(promotion.validations[0].status).toBe("passed");
     } finally {
       rmSync(repo, { recursive: true, force: true });
       rmSync(stateRoot, { recursive: true, force: true });

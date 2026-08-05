@@ -995,7 +995,10 @@ async function promoteSequence(
   if (blocker) return abandonStagedWork(workspace, blocker);
   // The parent's cancellation goes only to the gate, and only here: it is the one
   // stage of promotion that runs programs, and a cancellation during it must kill
-  // them rather than wait for them (hardening plan, Phase 1).
+  // them rather than wait for them (hardening plan, Phase 1). A cancellation this
+  // late does NOT make the sequence `cancelled`: that flag says a cancellation cut
+  // the OWNERS short, and here every owner completed — what the cancellation stopped
+  // is the promotion, which is what the promotion record says it stopped.
   return promoteStagedCommits(workspace, staged, acceptance, signal);
 }
 

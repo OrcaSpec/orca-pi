@@ -801,7 +801,11 @@ export function commitAuthorizedWork(
  * cancellation reaching the gate comes back as a refusal with the killed run
  * recorded, which is why this function needs no cancellation branch of its own — the
  * work is refused, the patch is preserved, and the checkout is untouched, exactly as
- * for a validator that failed.
+ * for a validator that failed. An abort that arrives AFTER the gate has returned is
+ * deliberately not honored: by then the declared checks have accepted the work, and
+ * what remains is one `git apply` of an already-computed patch. Racing a cancellation
+ * against it could only mean a half-applied patch, which is the one outcome this gate
+ * exists to make impossible.
  *
  * This never throws: a promotion failure must not destroy the delegation's
  * outcome, so an unexpected git error becomes a `rejected` record with the reason
