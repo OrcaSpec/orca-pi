@@ -17,6 +17,7 @@ import {
   commitAuthorizedWork,
   detectBaseDrift,
   promoteStagedCommits,
+  type AcceptanceGate,
   type PromotionRecord,
   type StagedWorkspace,
 } from "../src/staging";
@@ -308,6 +309,103 @@ describe("what the overlay digest does and does not count as drift", () => {
 
     expect(drift?.unreadable).toMatch(/HEAD could not be read/);
     expect(drift?.paths).toEqual([]);
+  });
+});
+
+describe("the window the acceptance gate opens", () => {
+  it("catches a checkout that moved while the validators were running", () => {
+    const { repo, stateRoot } = fixture();
+    writeFileSync(join(repo, "keep.md"), "my uncommitted draft\n");
+    const workspace = open(repo, stateRoot);
+    writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "delegated work\n");
+
+    // Declared validators are arbitrary programs taking arbitrary time, and the user
+    // keeps working the whole while. This gate stands in for that elapsed time: the
+    // base was intact when it started and is not when it returns.
+    const slowGate: AcceptanceGate = () => {
+      writeFileSync(join(repo, "keep.md"), "edited while the tests ran\n");
+      return { ok: true, validations: [], diagnostics: ["type-check passed"] };
+    };
+
+    const record = promoteStagedCommits(
+      workspace,
+      [commitAuthorizedWork(workspace, webGrant, "web")],
+      slowGate,
+    );
+
+    expect(record.status).toBe("conflict");
+    expect(record.driftedPaths).toEqual(["keep.md"]);
+    expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("committed\n");
+    // The gate's own verdict is still carried: it passed, and the base moved anyway.
+    expect(record.diagnostics.join("\n")).not.toContain("did not pass");
+    expect(readFileSync(record.patchPath!, "utf8")).toContain("delegated work");
+  });
+
+  it("does not run the validators at all once the base is already stale", () => {
+    const { repo, stateRoot } = fixture();
+    const workspace = open(repo, stateRoot);
+    writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "delegated work\n");
+    writeFileSync(join(repo, "apps", "web", "app.tsx"), "the user got there first\n");
+    let ran = 0;
+    const countingGate: AcceptanceGate = () => {
+      ran += 1;
+      return { ok: true, validations: [], diagnostics: [] };
+    };
+
+    const record = promoteStagedCommits(
+      workspace,
+      [commitAuthorizedWork(workspace, webGrant, "web")],
+      countingGate,
+    );
+
+    // A stale base makes the promotion impossible whatever the validators think, so
+    // the user's time is not spent proving it.
+    expect(ran).toBe(0);
+    expect(record.status).toBe("conflict");
+  });
+});
+
+describe("recovering the work a conflict preserved", () => {
+  it("preserves a patch that applies with plain `git apply` on the base it was staged from", () => {
+    const { repo, stateRoot } = fixture();
+    writeFileSync(join(repo, "keep.md"), "my uncommitted draft\n");
+    const workspace = open(repo, stateRoot);
+    writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "delegated work\n");
+    writeFileSync(join(workspace.dir, "apps", "web", "added.tsx"), "a new component\n");
+    // The user drifts, so nothing is promoted and the patch is all that survives.
+    writeFileSync(join(repo, "keep.md"), "second thoughts\n");
+
+    const record = gate(workspace);
+    expect(record.status).toBe("conflict");
+
+    // The recovery route the conflict recommends, followed literally: put the base
+    // back the way the delegation was staged from, then hand the preserved patch to
+    // git. The user needs no Orca-specific tool to get their work back.
+    expect(record.diagnostics.join("\n")).toContain(`git apply ${record.patchPath!}`);
+    writeFileSync(join(repo, "keep.md"), "my uncommitted draft\n");
+    git(repo, "apply", record.patchPath!);
+
+    expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("delegated work\n");
+    expect(readFileSync(join(repo, "apps", "web", "added.tsx"), "utf8")).toBe("a new component\n");
+    // Recovering the delegation's work does not undo the user's own edit.
+    expect(readFileSync(join(repo, "keep.md"), "utf8")).toBe("my uncommitted draft\n");
+  });
+
+  it("preserves a binary change the user can recover byte-for-byte", () => {
+    const { repo, stateRoot } = fixture();
+    const bytes = Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe, 0x00, 0x7f]);
+    const workspace = open(repo, stateRoot);
+    writeFileSync(join(workspace.dir, "apps", "web", "logo.bin"), bytes);
+    writeFileSync(join(repo, "apps", "web", "logo.bin"), Buffer.from([0x09]));
+
+    const record = gate(workspace);
+    expect(record.status).toBe("conflict");
+    expect(record.driftedPaths).toEqual(["apps/web/logo.bin"]);
+
+    rmSync(join(repo, "apps", "web", "logo.bin"));
+    git(repo, "apply", record.patchPath!);
+
+    expect(readFileSync(join(repo, "apps", "web", "logo.bin"))).toEqual(bytes);
   });
 });
 
