@@ -1,4 +1,4 @@
-import type { GovernanceApproval, GovernanceHold } from "./approval";
+import { approvalStateOf, isSettled, type GovernanceApproval } from "./approval";
 import type { ResolvedDelegation, Resolution, TargetReasoning } from "./resolver";
 import { GOVERNANCE_SCOPE, type HeldGovernance, type PromotionStatus } from "./staging";
 
@@ -37,6 +37,14 @@ export interface PromotionView {
   driftedPaths: string[];
   patchPath?: string;
   heldGovernance?: HeldGovernance;
+  /**
+   * What the user decided about {@link heldGovernance} afterwards (hardening plan,
+   * Phase 3), when they have decided anything. It is not part of the promotion — the
+   * promotion ended before the decision existed — which is exactly why it is a separate
+   * field the caller supplies: the live report a delegation prints has none, and a
+   * history entry has whatever the approval action last recorded.
+   */
+  governanceApproval?: GovernanceApproval;
   diagnostics: string[];
 }
 
@@ -51,11 +59,22 @@ export interface PromotionView {
  */
 export function promotionHeadline(promotion: PromotionView, label = "Promotion"): string {
   const held = promotion.heldGovernance?.paths.length ?? 0;
+  // An approved hold must change the HEADLINE too, not only the detail: "await your
+  // approval" is an instruction, and repeating it after the user has approved sends them
+  // to do a thing they already did.
+  const approved = isSettled(promotion.governanceApproval);
   const headline: Record<PromotionStatus, string> = {
     promoted:
       `${label}: promoted — ${promotion.appliedPaths.length} path(s) applied to your checkout` +
-      (held > 0 ? `, ${held} governance path(s) HELD for your approval.` : "."),
-    held: `${label}: HELD — nothing was applied; ${held} governance path(s) await your approval.`,
+      (held > 0
+        ? approved
+          ? `, ${held} governance path(s) APPROVED and applied.`
+          : `, ${held} governance path(s) HELD for your approval.`
+        : "."),
+    held: approved
+      ? `${label}: HELD, then APPROVED — the delegation applied nothing; its ${held} governance ` +
+        "path(s) were approved and applied."
+      : `${label}: HELD — nothing was applied; ${held} governance path(s) await your approval.`,
     rejected: `${label}: REJECTED — nothing was applied; your checkout is unchanged.`,
     conflict: `${label}: CONFLICT — your checkout moved; nothing was applied.`,
     not_attempted: `${label}: not attempted — nothing was applied; your checkout is unchanged.`,
@@ -71,14 +90,31 @@ export function promotionHeadline(promotion: PromotionView, label = "Promotion")
  * that was deliberately not applied, and the hint has to name the base it expects so
  * a user applying it days later knows what it was computed against.
  */
-function heldGovernanceLines(held: HeldGovernance, indent: string): string[] {
+function heldGovernanceLines(
+  held: HeldGovernance,
+  approval: GovernanceApproval | undefined,
+  indent: string,
+): string[] {
+  // An approved hold is no longer an instruction, so it stops reading like one: the paths
+  // and the patch stay on the record (the patch is what was approved), and the pending
+  // sentence and the apply hint go away. A refused ATTEMPT keeps the instruction and adds
+  // what happened, because the change still has not landed and the reason is what the
+  // steward needs before they try again.
+  if (approval && isSettled(approval)) {
+    return [
+      `${indent}APPROVED — ${held.paths.length} governance path(s) under \`${GOVERNANCE_SCOPE}\` were ` +
+        `${approvalStateOf(approval)}: ${held.paths.join(", ")}.`,
+      `${indent}The approved patch is preserved at ${held.patchPath}.`,
+    ];
+  }
   return [
     `${indent}HELD FOR YOUR APPROVAL — ${held.paths.length} governance path(s) under ` +
       `\`${GOVERNANCE_SCOPE}\` were NOT applied: ${held.paths.join(", ")}.`,
     `${indent}A delegated agent may not change the documents that govern the agents, so the change ` +
       `is waiting as a patch at ${held.patchPath}.`,
-    `${indent}To apply it yourself: \`git apply ${held.patchPath}\` — it was generated against ` +
-      `${held.baseCommit}, the base captured when the delegation was staged.`,
+    ...(approval ? [`${indent}Last attempt: ${approvalStateOf(approval)}.`] : []),
+    `${indent}To approve it: \`/orca approve\`. To apply it yourself: \`git apply ${held.patchPath}\` ` +
+      `— it was generated against ${held.baseCommit}, the base captured when the delegation was staged.`,
   ];
 }
 
@@ -91,38 +127,13 @@ function heldGovernanceLines(held: HeldGovernance, indent: string): string[] {
  */
 export function promotionDetailLines(promotion: PromotionView, indent = "  "): string[] {
   const lines = promotion.heldGovernance
-    ? heldGovernanceLines(promotion.heldGovernance, indent)
+    ? heldGovernanceLines(promotion.heldGovernance, promotion.governanceApproval, indent)
     : [];
   for (const diagnostic of promotion.diagnostics) lines.push(`${indent}${diagnostic}`);
   if (promotion.rejectedPaths.length > 0) {
     lines.push(`${indent}Unauthorized paths in the staged change: ${promotion.rejectedPaths.join(", ")}`);
   }
   return lines;
-}
-
-/** When an approval happened, in a form that reads the same in every timezone. */
-export function approvalTimestamp(approval: GovernanceApproval): string {
-  return new Date(approval.at).toISOString();
-}
-
-/**
- * One held governance change as every surface lists it (hardening plan, Phase 3): the
- * `/orca` pending-approval section, and the approval action's own listing when it needs
- * the user to say which hold they meant.
- *
- * `position` is the selector `/orca approve <n>` takes, so the list a user reads and the
- * list the selector counts through are the same list. A settled hold has no position
- * because there is nothing left to approve about it.
- */
-export function governanceHoldLine(hold: GovernanceHold, position?: number): string {
-  const marker = position === undefined ? "  -" : `  ${position}.`;
-  const state = hold.approval
-    ? ` — ${hold.approval.outcome === "applied" ? "approved" : hold.approval.outcome} ` +
-      approvalTimestamp(hold.approval)
-    : "";
-  return (
-    `${marker} ${hold.held.paths.join(", ")} — "${hold.task}"${state} — patch: ${hold.held.patchPath}`
-  );
 }
 
 function delegationHeader(delegation: ResolvedDelegation): string {

@@ -1,8 +1,24 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as orcaspec from "orcaspec";
 import type { DomainAgent } from "orcaspec";
-import { compileGrant, type CompiledGrant } from "../src/resolver";
+import type { Model } from "@earendil-works/pi-ai";
+import { compileGrant, resolve, type CompiledGrant } from "../src/resolver";
+import {
+  runDelegationSequence,
+  type DelegationInputs,
+  type DelegationSession,
+  type DelegationSessionConfig,
+} from "../src/delegation";
+import {
+  buildDelegationRecord,
+  digestGrants,
+  DelegationHistory,
+  APPROVAL_ENTRY_TYPE,
+  DELEGATION_ENTRY_TYPE,
+  toPersistedApproval,
+} from "../src/delegation-entry";
 import {
   commitAuthorizedWork,
   promoteStagedCommits,
@@ -97,6 +113,53 @@ function pending(held: HeldGovernance, task = "tighten the governance overlay"):
   return { held, task, sequenceId: "sequence_abc123" };
 }
 
+/** A session entry as pi stores it, JSON round-tripped like the real store. */
+function entryOf(customType: string, data: unknown): unknown {
+  return { type: "custom", customType, data: JSON.parse(JSON.stringify(data)) };
+}
+
+/** A real delegated session writing the given files, then checkpointing completed. */
+function writesThenCompletes(files: Record<string, string>) {
+  const createSession = async (config: DelegationSessionConfig): Promise<DelegationSession> => ({
+    abort: vi.fn(),
+    prompt: async () => {
+      for (const [path, content] of Object.entries(files)) {
+        const write = config.tools.find((tool) => tool.name === "write");
+        if (!write) throw new Error("the delegated session has no write tool");
+        await write.execute("t", { path, content } as never, undefined, undefined, {
+          cwd: config.cwd,
+        } as never);
+      }
+      const checkpoint = config.tools.find((tool) => tool.name === "orca_checkpoint")!;
+      await checkpoint.execute(
+        "t",
+        { status: "completed", summary: "overlay tightened" } as never,
+        undefined,
+        undefined,
+        { cwd: config.cwd } as never,
+      );
+    },
+  });
+  return { createSession };
+}
+
+const monolithDoc = orcaspec.loadFixture("root-recursive-owner");
+
+/** A one-owner delegation of the given targets under a spec that owns everything. */
+function monolithInputs(cwd: string, targets: string[]): DelegationInputs {
+  const delegation = resolve(monolithDoc, targets).delegations[0];
+  return {
+    document: monolithDoc,
+    owner: delegation.owner,
+    targets: delegation.targets,
+    grant: delegation.grant,
+    task: "tighten the governance overlay",
+    effectiveMode: "enforce",
+    cwd,
+    parent: { model: { id: "fake", provider: "fake" } as unknown as Model<any>, thinkingLevel: "high" },
+  };
+}
+
 describe("approving a held governance change", () => {
   it("applies the patch to the user's checkout and records what landed", async () => {
     const { repo, stateRoot } = fixture();
@@ -135,6 +198,118 @@ describe("approving a patch the checkout has moved under", () => {
     // Nothing about the user's files moved, and the proposal is still there to retry.
     expect(snapshotTree(repo)).toEqual(before);
     expect(readFileSync(held.patchPath, "utf8")).toContain("tightened by the agent");
+  });
+});
+
+/**
+ * The durable side. A held patch outlives the session that proposed it, so the history
+ * is the only thing that remembers a hold exists — and once it is approved, the only
+ * thing that can stop telling the steward to go and approve it.
+ */
+describe("what the history says about a hold before and after approval", () => {
+  /** A delegation that rewrites the governance overlay, persisted as a session entry. */
+  async function delegatedHold(repo: string, stateRoot: string) {
+    const inputs = monolithInputs(repo, [".orca/runtime.yaml"]);
+    const { createSession } = writesThenCompletes({ ".orca/runtime.yaml": AGENT_OVERLAY });
+    const sequence = await runDelegationSequence([inputs], { createSession, stateRoot });
+    const record = buildDelegationRecord({
+      task: "tighten the governance overlay",
+      targets: [".orca/runtime.yaml"],
+      grantDigest: digestGrants([inputs.grant]),
+      sequence,
+      startedAt: 1,
+      endedAt: 2,
+      sequenceId: "sequence_abc123",
+    });
+    return { record, entry: entryOf(DELEGATION_ENTRY_TYPE, record) };
+  }
+
+  it("offers the hold for approval, then reports it approved and when", async () => {
+    const { repo, stateRoot } = fixture();
+    const { record, entry } = await delegatedHold(repo, stateRoot);
+
+    const history = new DelegationHistory();
+    history.rebuildFrom([entry]);
+    expect(history.lastDetailLines().join("\n")).toContain("HELD FOR YOUR APPROVAL");
+    const holds = history.holds();
+    expect(holds).toHaveLength(1);
+    expect(holds[0].held.patchPath).toBe(record.promotion!.heldGovernance!.patchPath);
+    expect(holds[0].task).toBe("tighten the governance overlay");
+
+    const result = runApprovalAction({ cwd: repo, holds, now: APPROVED_AT });
+    expect(result.approval?.outcome).toBe("applied");
+    history.recordApproval(result.approval!);
+
+    const detail = history.lastDetailLines().join("\n");
+    expect(detail).not.toMatch(/HELD FOR YOUR APPROVAL|await/i);
+    expect(detail).toContain("APPROVED");
+    expect(detail).toContain(new Date(APPROVED_AT).toISOString());
+    // And nothing is left waiting for a decision.
+    expect(history.holds().filter((hold) => !hold.approval)).toEqual([]);
+  });
+
+  it("recovers the approval in a resumed session, from session entries alone", async () => {
+    const { repo, stateRoot } = fixture();
+    const { entry } = await delegatedHold(repo, stateRoot);
+
+    const live = new DelegationHistory();
+    live.rebuildFrom([entry]);
+    const result = runApprovalAction({ cwd: repo, holds: live.holds(), now: APPROVED_AT });
+    const approvalEntry = entryOf(APPROVAL_ENTRY_TYPE, toPersistedApproval(result.approval!));
+
+    // A fresh history, rebuilt from the branch the way `session_start` does it: the
+    // approval has to travel as its own entry, because the delegation entry was written
+    // before the user ever decided.
+    const resumed = new DelegationHistory();
+    resumed.rebuildFrom([entry, approvalEntry]);
+
+    const detail = resumed.lastDetailLines().join("\n");
+    expect(detail).toContain("APPROVED");
+    expect(detail).not.toContain("HELD FOR YOUR APPROVAL");
+    expect(resumed.statusLines().join("\n")).toContain("governance approved");
+    // Approving again in the resumed session is refused as already approved.
+    const again = runApprovalAction({
+      cwd: repo,
+      selector: result.approval!.patchPath,
+      holds: resumed.holds(),
+      now: APPROVED_AT + 60_000,
+    });
+    expect(again.approval).toBeUndefined();
+    expect(again.lines.join("\n")).toMatch(/already approved/i);
+  });
+
+  it("shows a refused approval attempt without retiring the hold", async () => {
+    const { repo, stateRoot } = fixture();
+    const { entry } = await delegatedHold(repo, stateRoot);
+    // The user edits the file themselves, so the held patch no longer applies.
+    writeFileSync(join(repo, ".orca", "runtime.yaml"), "schema_version: 1\n# mine\n");
+
+    const history = new DelegationHistory();
+    history.rebuildFrom([entry]);
+    const result = runApprovalAction({ cwd: repo, holds: history.holds(), now: APPROVED_AT });
+    history.recordApproval(result.approval!);
+
+    const detail = history.lastDetailLines().join("\n");
+    // Still awaiting — a refusal is not a decision — but the attempt is on the record,
+    // so a steward is not told to approve a patch that just refused to apply.
+    expect(detail).toContain("HELD FOR YOUR APPROVAL");
+    expect(detail).toContain("does_not_apply");
+    expect(detail).toContain(new Date(APPROVED_AT).toISOString());
+    expect(history.holds()).toHaveLength(1);
+  });
+
+  it("ignores an approval entry that is not one of ours", () => {
+    const history = new DelegationHistory();
+    // Rebuild has to survive an arbitrary branch: a foreign entry, a stale version, and
+    // a malformed payload must all be skipped rather than trusted or thrown on.
+    history.rebuildFrom([
+      { type: "custom", customType: APPROVAL_ENTRY_TYPE, data: { v: 99, patchPath: "/x" } },
+      { type: "custom", customType: APPROVAL_ENTRY_TYPE, data: "not an object" },
+      { type: "custom", customType: APPROVAL_ENTRY_TYPE },
+      { type: "message", message: { role: "user" } },
+    ]);
+    expect(history.count()).toBe(0);
+    expect(history.holds()).toEqual([]);
   });
 });
 

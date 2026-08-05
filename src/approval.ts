@@ -1,8 +1,24 @@
 import { readFileSync } from "node:fs";
 import { canonicalPath, tryGit } from "./git";
-import { approvalTimestamp, governanceHoldLine } from "./render";
 import { GOVERNANCE_SCOPE, type HeldGovernance } from "./staging";
 import type { NotifyLevel } from "./surface";
+
+/**
+ * The explicit approval action (hardening plan, Phase 3) and everything a surface says
+ * about a held governance change.
+ *
+ * Phase 2 made a governance change something no delegation can land. This module is the
+ * one place that lands one, and it lands it only when the user asks: {@link applyHeldPatch}
+ * is private here and {@link runApprovalAction} is its only caller, so "approval is the
+ * only runtime path that applies a held patch" is a fact about the module graph rather
+ * than a convention to remember.
+ *
+ * It owns the WORDING as well as the decision, and `render.ts` reads it from here rather
+ * than the other way around. Presentation depending on the domain keeps the dependency
+ * one-way, and it keeps one implementation of "how a hold is described" that the promotion
+ * detail, the `/orca` pending list, and this action's own report all share — which is the
+ * same reason promotion rendering lives in one renderer.
+ */
 
 /**
  * How one approval attempt ended.
@@ -49,17 +65,59 @@ export interface GovernanceHold {
   approval?: GovernanceApproval;
 }
 
+/** What one invocation of `/orca approve` is asked to do. */
 export interface ApprovalActionInput {
+  /** Any directory inside the user's repository; the patch is applied at its root. */
   cwd: string;
+  /** The raw argument the user typed, if any (see {@link runApprovalAction}). */
   selector?: string;
+  /** Every hold the delegation history knows about, NEWEST FIRST. */
   holds: readonly GovernanceHold[];
+  /** The wall clock, passed in so an approval's recorded time is the caller's fact. */
   now: number;
 }
 
+/** What one invocation of `/orca approve` did. */
 export interface ApprovalActionResult {
+  /**
+   * The attempt to persist, present exactly when a patch was OFFERED to git — so a
+   * refused attempt is recorded too, and a selector that matched nothing is not.
+   */
   approval?: GovernanceApproval;
+  /** What the human is told. */
   lines: string[];
+  /** `info` when the change is in the checkout, `warning` when nothing was approved. */
   level: NotifyLevel;
+}
+
+/** When an approval happened, in a form that reads the same in every timezone. */
+export function approvalTimestamp(approval: GovernanceApproval): string {
+  return new Date(approval.at).toISOString();
+}
+
+/**
+ * One held governance change as every surface lists it: the `/orca` pending-approval
+ * section and this action's own listing when it needs the user to say which hold they
+ * meant.
+ *
+ * `position` is the selector `/orca approve <n>` takes, so the list a user reads and the
+ * list the selector counts through are the same list. A settled hold has no position
+ * because there is nothing left to approve about it.
+ */
+export function governanceHoldLine(hold: GovernanceHold, position?: number): string {
+  const marker = position === undefined ? "  -" : `  ${position}.`;
+  const state = hold.approval ? ` — ${approvalStateOf(hold.approval)}` : "";
+  return `${marker} ${hold.held.paths.join(", ")} — "${hold.task}"${state} — patch: ${hold.held.patchPath}`;
+}
+
+/** One approval attempt in a few words: what it did, and when. */
+export function approvalStateOf(approval: GovernanceApproval): string {
+  const verb = isSettled(approval)
+    ? approval.outcome === "applied"
+      ? "APPROVED and applied"
+      : "APPROVED — already in your checkout"
+    : `an approval attempt did not land (${approval.outcome})`;
+  return `${verb} at ${approvalTimestamp(approval)}`;
 }
 
 /** The user's repository root, from any directory inside it. */

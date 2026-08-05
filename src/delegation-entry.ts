@@ -25,6 +25,7 @@ import type {
   ValidatorStatus,
 } from "./staging";
 import { promotionDetailLines, promotionHeadline } from "./render";
+import { governanceHoldLine, isSettled, type GovernanceApproval, type GovernanceHold } from "./approval";
 
 /**
  * The persistent, versioned delegation record and the in-memory history rebuilt
@@ -48,6 +49,58 @@ import { promotionDetailLines, promotionHeadline } from "./render";
 
 /** The custom-entry `customType` for a persisted delegation sequence. */
 export const DELEGATION_ENTRY_TYPE = "orca-delegation";
+
+/**
+ * The custom-entry `customType` for one governance approval attempt (hardening plan,
+ * Phase 3).
+ *
+ * A SECOND entry type rather than a rewrite of the delegation entry, because entries are
+ * append-only and the decision happens after the delegation is already written down —
+ * possibly in a later session, possibly more than once. The rebuild replays both kinds in
+ * branch order, so the history a resumed session shows is the delegation as it happened
+ * plus whatever the user has since decided about its hold, and the last word wins.
+ */
+export const APPROVAL_ENTRY_TYPE = "orca-governance-approval";
+
+/** The approval-entry schema version; bump on any breaking shape change. */
+export const APPROVAL_ENTRY_VERSION = 1;
+
+/** One approval attempt, flattened for the durable record ({@link GovernanceApproval}). */
+export interface PersistedGovernanceApproval extends GovernanceApproval {
+  v: number;
+}
+
+/** Stamp an approval with its schema version for `appendEntry`. */
+export function toPersistedApproval(approval: GovernanceApproval): PersistedGovernanceApproval {
+  return {
+    v: APPROVAL_ENTRY_VERSION,
+    patchPath: approval.patchPath,
+    paths: [...approval.paths],
+    outcome: approval.outcome,
+    at: approval.at,
+    detail: approval.detail,
+  };
+}
+
+/**
+ * Parse a session entry into an approval, or null when it is not one of ours. As
+ * defensive as {@link parseDelegationEntry}, and for the same reason: rebuild runs over an
+ * arbitrary branch, and an entry from another extension, another version, or a corrupted
+ * write must be ignored rather than trusted.
+ */
+export function parseApprovalEntry(entry: unknown): PersistedGovernanceApproval | null {
+  if (!entry || typeof entry !== "object") return null;
+  const candidate = entry as { type?: unknown; customType?: unknown; data?: unknown };
+  if (candidate.type !== "custom" || candidate.customType !== APPROVAL_ENTRY_TYPE) return null;
+
+  const data = candidate.data;
+  if (!data || typeof data !== "object") return null;
+  const approval = data as Partial<PersistedGovernanceApproval>;
+  if (approval.v !== APPROVAL_ENTRY_VERSION) return null;
+  if (typeof approval.patchPath !== "string" || typeof approval.at !== "number") return null;
+  if (typeof approval.outcome !== "string" || !Array.isArray(approval.paths)) return null;
+  return approval as PersistedGovernanceApproval;
+}
 
 /** The record schema version; bump on any breaking shape change. */
 export const LEGACY_DELEGATION_ENTRY_VERSION = 1;
@@ -348,14 +401,22 @@ export function formatUsage(usage: DelegationUsage): string {
   return `${usage.totalTokens} tokens, $${usage.costUsd.toFixed(4)}`;
 }
 
-/** One compact history line summarising a whole sequence for `/orca`. */
-export function recordSummaryLine(record: PersistedDelegationRecord): string {
+/**
+ * One compact history line summarising a whole sequence for `/orca`. `approval` is what
+ * the user has since decided about the sequence's held governance change, when anything.
+ */
+export function recordSummaryLine(
+  record: PersistedDelegationRecord,
+  approval?: GovernanceApproval,
+): string {
   const statuses = record.steps.map((step) => `${step.owner}=${step.status}`).join(", ");
   const changed = record.steps.reduce((sum, step) => sum + step.changedPaths.length, 0);
   // The promotion belongs on the compact line too: every owner can read `completed`
   // while nothing at all reached the user's files, and a one-line history that omits
-  // that reads as a success it was not.
-  const promotion = record.promotion ? `promotion: ${record.promotion.status}; ` : "";
+  // that reads as a success it was not. A `held` line that has since been approved says
+  // so for the same reason — the status alone would keep it looking outstanding.
+  const settled = isSettled(approval) ? " (governance approved)" : "";
+  const promotion = record.promotion ? `promotion: ${record.promotion.status}${settled}; ` : "";
   return (
     `  - "${truncate(record.task)}" — ${statuses} ` +
     `(${changed} changed; ${promotion}${formatUsage(record.usage)})`
@@ -369,7 +430,10 @@ export function recordSummaryLine(record: PersistedDelegationRecord): string {
  * sequence usage. Shared by the transcript entry renderer and the `/orca`
  * last-delegation detail so both read identically.
  */
-export function renderRecordLines(record: PersistedDelegationRecord): string[] {
+export function renderRecordLines(
+  record: PersistedDelegationRecord,
+  approval?: GovernanceApproval,
+): string[] {
   const lines = [
     `Orca delegation — "${truncate(record.task, 100)}"`,
     `Owners (${record.owners.length}): ${record.owners.join(", ")}`,
@@ -383,8 +447,11 @@ export function renderRecordLines(record: PersistedDelegationRecord): string[] {
   // the delegate tool's own output (`render.ts`), so the live report a steward reads
   // when a delegation ends and the history they read afterwards cannot disagree.
   if (record.promotion) {
-    lines.push(promotionHeadline(record.promotion));
-    lines.push(...promotionDetailLines(record.promotion));
+    // The approval is layered onto the persisted promotion here rather than stored in it:
+    // the record is append-only and was written before the user decided.
+    const promotion = { ...record.promotion, governanceApproval: approval };
+    lines.push(promotionHeadline(promotion));
+    lines.push(...promotionDetailLines(promotion));
     for (const run of record.promotion.validations) {
       lines.push(
         `  Validator (${run.agent}): ${[run.program, ...run.args].join(" ")} — ${run.status}` +
@@ -516,6 +583,13 @@ export function renderRecordLines(record: PersistedDelegationRecord): string[] {
 export class DelegationHistory {
   private records: PersistedDelegationRecord[] = [];
 
+  /**
+   * The last approval attempt per held patch, keyed by the patch's absolute path — the
+   * one identity a hold and its approval share, and the one both sides of a resumed
+   * session can still agree on. A `Map` because the key is a filesystem path.
+   */
+  private approvals = new Map<string, GovernanceApproval>();
+
   constructor(private readonly capacity = 50) {}
 
   /** Append a freshly-completed record, evicting the oldest beyond capacity. */
@@ -526,6 +600,58 @@ export class DelegationHistory {
     }
   }
 
+  /** Remember one approval attempt; a later attempt on the same patch supersedes it. */
+  recordApproval(approval: GovernanceApproval): void {
+    this.approvals.set(approval.patchPath, approval);
+  }
+
+  /** What the user last decided about a record's held governance change, if anything. */
+  approvalFor(record: PersistedDelegationRecord): GovernanceApproval | undefined {
+    const patchPath = record.promotion?.heldGovernance?.patchPath;
+    return patchPath === undefined ? undefined : this.approvals.get(patchPath);
+  }
+
+  /**
+   * Every governance change a delegation in this history proposed, NEWEST FIRST, each
+   * carrying whatever the user has decided about it. This is the list `/orca approve`
+   * selects from, so the ordering is part of the command's contract: position 1 is the
+   * newest, which is the hold a user almost always means.
+   */
+  holds(): GovernanceHold[] {
+    const holds: GovernanceHold[] = [];
+    for (let index = this.records.length - 1; index >= 0; index -= 1) {
+      const record = this.records[index];
+      const held = record.promotion?.heldGovernance;
+      if (!held) continue;
+      holds.push({
+        held,
+        task: record.task,
+        sequenceId: record.sequenceId,
+        approval: this.approvals.get(held.patchPath),
+      });
+    }
+    return holds;
+  }
+
+  /** The holds still awaiting a decision, in the order the selector counts them. */
+  pendingHolds(): GovernanceHold[] {
+    return this.holds().filter((hold) => !isSettled(hold.approval));
+  }
+
+  /**
+   * The `/orca` pending-approval section, or empty when nothing is held. It leads the
+   * numbered list with the command that acts on it, because a hold is the one thing in
+   * the status surface that is waiting on the user.
+   */
+  pendingHoldLines(): string[] {
+    const pending = this.pendingHolds();
+    if (pending.length === 0) return [];
+    return [
+      `Governance changes awaiting your approval (${pending.length}) — \`/orca approve [n]\`:`,
+      ...pending.map((hold, index) => governanceHoldLine(hold, index + 1)),
+    ];
+  }
+
   /**
    * Rebuild the history from session entries ALONE (session_start for every
    * reason). Clears first, then extracts every valid delegation entry in branch
@@ -534,9 +660,17 @@ export class DelegationHistory {
    */
   rebuildFrom(entries: readonly unknown[]): void {
     this.records = [];
+    this.approvals = new Map();
     for (const entry of entries) {
       const record = parseDelegationEntry(entry);
-      if (record) this.add(record);
+      if (record) {
+        this.add(record);
+        continue;
+      }
+      // Approvals replay in branch order too, so the last decision about a patch is the
+      // one a resumed session shows — including a refused attempt after an earlier one.
+      const approval = parseApprovalEntry(entry);
+      if (approval) this.recordApproval(approval);
     }
   }
 
@@ -556,7 +690,9 @@ export class DelegationHistory {
   statusLines(): string[] {
     if (this.records.length === 0) return [];
     const lines = [`Delegation history (${this.records.length}):`];
-    for (const record of this.records) lines.push(recordSummaryLine(record));
+    for (const record of this.records) {
+      lines.push(recordSummaryLine(record, this.approvalFor(record)));
+    }
     return lines;
   }
 
@@ -564,6 +700,6 @@ export class DelegationHistory {
   lastDetailLines(): string[] {
     const latest = this.latest();
     if (!latest) return [];
-    return ["Last delegation:", ...renderRecordLines(latest)];
+    return ["Last delegation:", ...renderRecordLines(latest, this.approvalFor(latest))];
   }
 }

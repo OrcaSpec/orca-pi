@@ -231,7 +231,10 @@ describe("DelegationHistory rebuild from entries alone", () => {
     const history = new DelegationHistory();
     history.rebuildFrom(branch);
     expect(history.count()).toBe(2);
-    expect(history.all().map(recordSummaryLine)).toEqual([recordSummaryLine(a), recordSummaryLine(b)]);
+    expect(history.all().map((entry) => recordSummaryLine(entry))).toEqual([
+      recordSummaryLine(a),
+      recordSummaryLine(b),
+    ]);
   });
 
   it("a resumed session displays prior history from entries ONLY (fresh in-memory state)", async () => {
