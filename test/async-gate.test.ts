@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { stringify } from "yaml";
@@ -11,7 +11,7 @@ import {
   type DelegationSession,
   type DelegationSessionConfig,
 } from "../src/delegation";
-import { git, makeGitRepo, makeStateRoot } from "./git-fixture";
+import { git, makeGitRepo, makeStateRoot, snapshotTree } from "./git-fixture";
 
 /**
  * The acceptance gate runs WITHOUT holding the event loop (staged-promotion
@@ -126,6 +126,48 @@ function nodeValidator(
   return { program: process.execPath, args: ["-e", script], timeout_seconds: 10, ...extra };
 }
 
+/**
+ * Wait for a marker a child process writes, so the test can act at a moment it knows
+ * is INSIDE the gate. Polling a real file rather than sleeping is what keeps the
+ * cancellation tests deterministic: nothing is asserted about how long staging, the
+ * scripted session, or process startup take.
+ */
+async function waitForFile(path: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() > deadline) throw new Error(`marker never appeared: ${path}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Whether a process still exists; signal 0 tests for it without touching it. */
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A validator that announces its own pid and would take five seconds to finish.
+ * Both halves matter to a cancellation test: the pid is how the test asserts the
+ * child was really killed, and the long tail is what a cancellation has to cut.
+ */
+function longValidator(startedAt: string, finishedAt: string): Record<string, unknown> {
+  return nodeValidator(
+    "const fs = require('fs');" +
+      `fs.writeFileSync(${JSON.stringify(startedAt)}, String(process.pid));` +
+      `setTimeout(() => fs.writeFileSync(${JSON.stringify(finishedAt)}, 'finished'), 5000);`,
+    { timeout_seconds: 30 },
+  );
+}
+
 describe("a validator no longer holds the event loop", () => {
   it("lets other work progress while a validator sleeps", async () => {
     const repo = repoWithApp();
@@ -170,6 +212,99 @@ describe("a validator no longer holds the event loop", () => {
       const ended = Number(readFileSync(endedAt, "utf8"));
       expect(ended).toBeGreaterThan(started);
       expect(ticks.filter((tick) => tick > started && tick < ended).length).toBeGreaterThan(0);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("cancelling a delegation while a validator runs", () => {
+  it("kills the child, refuses the promotion, and records the run that was cut", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    const startedAt = join(stateRoot, "validator-started");
+    const finishedAt = join(stateRoot, "validator-finished");
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: { web: [longValidator(startedAt, finishedAt)] },
+      });
+      const before = snapshotTree(repo);
+      const { createSession } = sessions(writeAndComplete);
+      const controller = new AbortController();
+
+      const running = runDelegation(inputsFor(repo), {
+        createSession,
+        stateRoot,
+        signal: controller.signal,
+      });
+      // Cancel at a moment that is certainly inside the gate: the validator itself
+      // said it had started.
+      await waitForFile(startedAt);
+      const pid = Number(readFileSync(startedAt, "utf8"));
+      controller.abort();
+      const result = await running;
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const promotion = result.outcome.promotion;
+      // The child is gone, long before the five seconds it wanted.
+      expect(alive(pid)).toBe(false);
+      await sleep(100);
+      expect(existsSync(finishedAt)).toBe(false);
+      // The promotion is refused through the ordinary gate path, and the run that was
+      // cut is on the record rather than missing from it.
+      expect(promotion.status).toBe("rejected");
+      expect(promotion.validations.map((run) => run.status)).toEqual(["cancelled"]);
+      expect(promotion.diagnostics.join("\n")).toMatch(/cancelled/i);
+      expect(readFileSync(promotion.validatorOutputPath!, "utf8")).toContain("CANCELLED");
+      // Nothing reached the user's files, and the work survives as evidence.
+      expect(snapshotTree(repo)).toEqual(before);
+      expect(readFileSync(promotion.patchPath!, "utf8")).toContain("reviewed");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does not start the validators that would have run after it", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    const startedAt = join(stateRoot, "validator-started");
+    const finishedAt = join(stateRoot, "validator-finished");
+    const trail = join(stateRoot, "trail.txt");
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: {
+          web: [
+            longValidator(startedAt, finishedAt),
+            nodeValidator(`require('fs').appendFileSync(${JSON.stringify(trail)}, 'second\\n');`),
+          ],
+        },
+      });
+      const { createSession } = sessions(writeAndComplete);
+      const controller = new AbortController();
+
+      const running = runDelegation(inputsFor(repo), {
+        createSession,
+        stateRoot,
+        signal: controller.signal,
+      });
+      await waitForFile(startedAt);
+      controller.abort();
+      const result = await running;
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      // A cancellation is one more way not to pass, so it stops the run of the
+      // sequence exactly where a failing validator would have.
+      expect(existsSync(trail)).toBe(false);
+      expect(result.outcome.promotion.validations.map((run) => run.status)).toEqual(["cancelled"]);
+      expect(result.outcome.promotion.diagnostics.join("\n")).toContain(
+        "1 later validator(s) were not run",
+      );
     } finally {
       rmSync(repo, { recursive: true, force: true });
       rmSync(stateRoot, { recursive: true, force: true });
