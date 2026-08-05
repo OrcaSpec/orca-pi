@@ -320,6 +320,19 @@ function commitDiff(dir: string, from: string, to: string): StagedDiff {
   return { patch, paths: names.split("\0").filter(Boolean).sort() };
 }
 
+/** {@link commitDiff} where a git failure is an outcome the gate reports, not a throw. */
+function tryCommitDiff(
+  dir: string,
+  from: string,
+  to: string,
+): { ok: true; diff: StagedDiff } | { ok: false; reason: string } {
+  try {
+    return { ok: true, diff: commitDiff(dir, from, to) };
+  } catch (error) {
+    return { ok: false, reason: gitFailure(error) };
+  }
+}
+
 /**
  * The cumulative diff of the isolated checkout's working tree against its
  * synthetic baseline: everything the delegation left behind, authorized or not.
@@ -368,6 +381,24 @@ function refused(
       patchPath
         ? `Nothing was applied; your checkout is unchanged. The staged patch is preserved at ${patchPath}.`
         : "Nothing was applied; the delegation produced no change to preserve.",
+    ],
+  };
+}
+
+/**
+ * The refusal for a staged change git can no longer read. Nothing is applied, and
+ * nothing is preserved either — the patch is exactly what could not be computed.
+ */
+function unreadableStagedChange(reason: string, acceptance?: AcceptanceResult): PromotionRecord {
+  return {
+    status: "rejected",
+    appliedPaths: [],
+    rejectedPaths: [],
+    validations: acceptance?.validations ?? [],
+    validatorOutputPath: acceptance?.validatorOutputPath,
+    diagnostics: [
+      `Orca could not compute the staged change for promotion (${reason}). ` +
+        "Nothing was applied; your checkout is unchanged.",
     ],
   };
 }
@@ -517,27 +548,23 @@ export function promoteStagedCommits(
     );
   }
 
-  let diff: StagedDiff;
-  try {
-    const head = gitText(workspace.dir, ["rev-parse", "HEAD"]).trim();
-    diff = commitDiff(workspace.dir, workspace.baselineCommit, head);
-  } catch (error) {
-    return {
-      status: "rejected",
-      appliedPaths: [],
-      rejectedPaths: [],
-      validations: [],
-      diagnostics: [
-        `Orca could not compute the staged change for promotion (${gitFailure(error)}). ` +
-          "Nothing was applied; your checkout is unchanged.",
-      ],
-    };
-  }
+  // The staged tip is PINNED here, before anything else runs, and every patch below
+  // is the baseline→tip diff of that one commit. Both halves matter once an
+  // acceptance gate exists: taking COMMITS excludes whatever the gate writes into
+  // the working tree, and pinning the tip excludes a gate that commits in the
+  // checkout itself — a validator is arbitrary code with the checkout as its `cwd`,
+  // so "the current HEAD" would be something it could move.
+  const tip = tryGit(workspace.dir, ["rev-parse", "HEAD"]);
+  if (!tip.ok) return unreadableStagedChange(tip.reason);
+  const stagedTip = tip.out.toString("utf8").trim();
+
+  const beforeGate = tryCommitDiff(workspace.dir, workspace.baselineCommit, stagedTip);
+  if (!beforeGate.ok) return unreadableStagedChange(beforeGate.reason);
 
   const head = tryGit(workspace.repoRoot, ["rev-parse", "HEAD"]);
   const currentHead = head.ok ? head.out.toString("utf8").trim() : undefined;
   if (currentHead !== workspace.baseCommit) {
-    return refused(workspace, "conflict", diff, [], [
+    return refused(workspace, "conflict", beforeGate.diff, [], [
       "Orca refused to promote this delegation: HEAD moved while it was running " +
         `(staged from ${workspace.baseCommit}, now ${currentHead ?? "unreadable"}), so the staged ` +
         "change is no longer based on your current commit.",
@@ -545,6 +572,16 @@ export function promoteStagedCommits(
   }
 
   const gate = acceptance?.(workspace);
+
+  // Re-diff AFTER the gate: what is offered to the user's files is computed once the
+  // validators have finished doing whatever they do, and it is still only the pinned
+  // committed work. A validator cannot smuggle a change into a promotion it cleared,
+  // and the patch preserved from a refusal is the delegation's work rather than the
+  // delegation's work plus a formatter's opinion of it.
+  const afterGate = tryCommitDiff(workspace.dir, workspace.baselineCommit, stagedTip);
+  if (!afterGate.ok) return unreadableStagedChange(afterGate.reason, gate);
+  const diff = afterGate.diff;
+
   if (gate && !gate.ok) {
     return refused(
       workspace,

@@ -47,6 +47,21 @@ export interface AssertionChange {
   description: string;
 }
 
+/**
+ * The agent's own account of what it verified: ADVISORY METADATA.
+ *
+ * It is evidence for a human — it is rendered for the steward, it feeds the
+ * integration record's validation audit, and it makes a "completed but unverified"
+ * delegation visible instead of silent — but it decides nothing about what reaches
+ * the user's files. It cannot: it is self-reported, and a session that wants to
+ * claim a green suite can simply claim one.
+ *
+ * What gates a promotion is the acceptance gate in `staging.ts`: the programs
+ * `.orca/runtime.yaml` declares, executed by the runtime itself and observed as
+ * `ValidatorRun`s (staged-promotion plan, Phase 4). The two are deliberately
+ * separate vocabularies — a claim and a measurement — and only the measurement has
+ * authority over a promotion.
+ */
 export interface ValidationEvidence {
   status: ValidationStatus;
   activities: ValidationActivity[];

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { stringify } from "yaml";
@@ -199,6 +199,592 @@ describe("declared validators gate the promotion", () => {
       expect(promotion.validations[0].stderr).toContain("2 tests failed");
       expect(readFileSync(promotion.validatorOutputPath!, "utf8")).toContain("2 tests failed");
       expect(promotion.diagnostics.join("\n")).toMatch(/validator/i);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("kills and refuses a validator that outlives its declared timeout", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: {
+          // A validator that would never return on its own; the declared budget is
+          // what ends it, so the promotion cannot hang on a wedged check.
+          web: [nodeValidator("setTimeout(() => {}, 600000);", { timeout_seconds: 0.25 })],
+        },
+      });
+      const before = snapshotTree(repo);
+      const { createSession } = sessions(writeAndComplete);
+
+      const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const promotion = result.outcome.promotion;
+      expect(promotion.validations[0].status).toBe("timed_out");
+      expect(promotion.status).toBe("rejected");
+      expect(promotion.diagnostics.join("\n")).toContain("TIMED OUT after 0.25s");
+      expect(snapshotTree(repo)).toEqual(before);
+      expect(readFileSync(promotion.patchPath!, "utf8")).toContain("reviewed");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when a declared validator cannot be run at all", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: {
+          web: [{ program: "orca-no-such-validator-program", timeout_seconds: 5 }],
+        },
+      });
+      const { createSession } = sessions(writeAndComplete);
+
+      const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      // A declared check that could not run is not a check that passed.
+      expect(result.outcome.promotion.validations[0].status).toBe("unavailable");
+      expect(result.outcome.promotion.status).toBe("rejected");
+      expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("committed\n");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("stops at the first validator that fails and reports the ones it never ran", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    const trail = join(stateRoot, "trail.txt");
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: {
+          web: [
+            nodeValidator(`require('fs').appendFileSync(${JSON.stringify(trail)}, 'first\\n');`),
+            nodeValidator(
+              `require('fs').appendFileSync(${JSON.stringify(trail)}, 'second\\n');` +
+                "process.exit(1);",
+            ),
+            nodeValidator(`require('fs').appendFileSync(${JSON.stringify(trail)}, 'third\\n');`),
+          ],
+        },
+      });
+      const { createSession } = sessions(writeAndComplete);
+
+      const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      // Declaration order, and nothing after the refusal.
+      expect(readFileSync(trail, "utf8")).toBe("first\nsecond\n");
+      expect(result.outcome.promotion.validations.map((run) => run.status)).toEqual([
+        "passed",
+        "failed",
+      ]);
+      expect(result.outcome.promotion.diagnostics.join("\n")).toContain(
+        "1 later validator(s) were not run",
+      );
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("a validator cannot smuggle changes into the promotion", () => {
+  it("promotes the committed work, never what the validator wrote afterwards", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: {
+          web: [
+            // A "validator" that rewrites the owner's own file (a formatter would),
+            // adds a file of its own, and deletes a committed one — all inside its
+            // grant's paths, all after the authorized change was committed.
+            nodeValidator(
+              "const fs = require('fs');" +
+                "fs.writeFileSync('apps/web/app.tsx', 'rewritten by the validator\\n');" +
+                "fs.writeFileSync('apps/web/validator-artifact.txt', 'dropped in\\n');",
+            ),
+          ],
+        },
+      });
+      const { createSession } = sessions(writeAndComplete);
+
+      const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.outcome.promotion.status).toBe("promoted");
+      // Only the committed path is promoted, with the content the AGENT committed.
+      expect(result.outcome.promotion.appliedPaths).toEqual(["apps/web/app.tsx"]);
+      expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("reviewed\n");
+      expect(existsSync(join(repo, "apps", "web", "validator-artifact.txt"))).toBe(false);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("promotes nothing a validator committed for itself in the staged checkout", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: {
+          web: [
+            // A validator is arbitrary code running in a real git working tree, so it
+            // can make a commit of its own. The promoted patch is pinned to the tip
+            // that existed before the gate ran, so this one is not in it.
+            nodeValidator(
+              "const cp = require('child_process');" +
+                "require('fs').writeFileSync('apps/web/app.tsx', 'committed by the validator\\n');" +
+                "cp.execFileSync('git', ['add', '-A']);" +
+                "cp.execFileSync('git', ['-c', 'user.name=V', '-c', 'user.email=v@localhost'," +
+                " 'commit', '-q', '-m', 'validator commit']);",
+            ),
+          ],
+        },
+      });
+      const { createSession } = sessions(writeAndComplete);
+
+      const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.outcome.promotion.status).toBe("promoted");
+      expect(result.outcome.promotion.appliedPaths).toEqual(["apps/web/app.tsx"]);
+      expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("reviewed\n");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the delegation's own work, not the validator's, when the gate refuses", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: {
+          web: [
+            nodeValidator(
+              "const fs = require('fs');" +
+                "fs.writeFileSync('apps/web/app.tsx', 'reformatted by the validator\\n');" +
+                "fs.writeFileSync('validator-scratch.txt', 'noise\\n');" +
+                "process.exit(1);",
+            ),
+          ],
+        },
+      });
+      const { createSession } = sessions(writeAndComplete);
+
+      const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.outcome.promotion.status).toBe("rejected");
+      // The evidence a user would re-apply is the delegation's work, with none of
+      // the validator's leftovers mixed into it.
+      const patch = readFileSync(result.outcome.promotion.patchPath!, "utf8");
+      expect(patch).toContain("reviewed");
+      expect(patch).not.toContain("reformatted by the validator");
+      expect(patch).not.toContain("validator-scratch.txt");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("validator arguments are data, never a command line", () => {
+  it("passes shell metacharacters through verbatim as inert argv elements", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    const dumped = join(stateRoot, "argv.json");
+    const hostile = [
+      "; rm -rf /",
+      "$(touch pwned)",
+      "`touch pwned2`",
+      "&& echo chained",
+      "| tee /dev/null",
+      "one two",
+      "'quoted'",
+      '"double"',
+      "new\nline",
+      "*",
+    ];
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: {
+          web: [
+            {
+              program: process.execPath,
+              args: [
+                "-e",
+                `require('fs').writeFileSync(${JSON.stringify(dumped)}, JSON.stringify(process.argv.slice(1)));`,
+                ...hostile,
+              ],
+              timeout_seconds: 10,
+            },
+          ],
+        },
+      });
+      const { createSession } = sessions(writeAndComplete);
+
+      const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      // The program received exactly the declared strings: nothing was expanded,
+      // split on whitespace, glob-matched, or chained into a second command.
+      expect(JSON.parse(readFileSync(dumped, "utf8"))).toEqual(hostile);
+      expect(result.outcome.promotion.status).toBe("promoted");
+      expect(result.outcome.promotion.validations[0].args.slice(2)).toEqual(hostile);
+      // ...and no side effect a shell would have produced exists anywhere.
+      expect(existsSync(join(repo, "pwned"))).toBe(false);
+      expect(existsSync(join(repo, "pwned2"))).toBe(false);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("a malformed overlay blocks the delegation instead of skipping the checks", () => {
+  /** Every shape of breakage refuses the same way: before anything runs. */
+  const broken: Array<{ name: string; source: string; expect: RegExp }> = [
+    {
+      name: "an unknown field",
+      source: "schema_version: 1\nvalidation: {}\n",
+      expect: /overlay\.unknown_field/,
+    },
+    {
+      name: "an agent id the document does not declare",
+      source: "schema_version: 1\nvalidations:\n  mobile:\n    - program: t\n      timeout_seconds: 5\n",
+      expect: /overlay\.unknown_agent/,
+    },
+    {
+      name: "a field of the wrong type",
+      source: 'schema_version: 1\nvalidations:\n  web:\n    - program: t\n      timeout_seconds: "5"\n',
+      expect: /overlay\.invalid_type/,
+    },
+    {
+      name: "an unsupported schema version",
+      source: "schema_version: 9\n",
+      expect: /overlay\.unsupported_schema_version/,
+    },
+  ];
+
+  for (const { name, source, expect: pattern } of broken) {
+    it(`refuses to start a delegation whose overlay has ${name}`, async () => {
+      const repo = repoWithApp();
+      const stateRoot = makeStateRoot();
+      try {
+        mkdirSync(join(repo, ".orca"), { recursive: true });
+        writeFileSync(join(repo, ".orca", "runtime.yaml"), source);
+        const before = snapshotTree(repo);
+        const { createSession, captured } = sessions(writeAndComplete);
+
+        const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
+
+        expect(result.ok).toBe(false);
+        if (result.ok) return;
+        expect(result.kind).toBe("invalid_runtime_overlay");
+        expect(result.diagnostics.join("\n")).toMatch(pattern);
+        expect(result.diagnostics.join("\n")).toContain(join(repo, ".orca", "runtime.yaml"));
+        // Blocked, not unvalidated: no child ran, no checkout was staged, and the
+        // user's files are exactly as they were.
+        expect(captured).toHaveLength(0);
+        expect(existsSync(join(stateRoot, "worktrees"))).toBe(false);
+        expect(snapshotTree(repo)).toEqual(before);
+      } finally {
+        rmSync(repo, { recursive: true, force: true });
+        rmSync(stateRoot, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe("an overlay configures validation and nothing else", () => {
+  it("cannot make an unauthorized path promotable, however happily its validators pass", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: { web: [nodeValidator("process.exit(0);")] },
+      });
+      const before = snapshotTree(repo);
+      const { createSession } = sessions(async (config) => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "mine\n" });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+        // Straight into the checkout after the checkpoint's reconciliation, the way
+        // the Phase 3 gate test does it: what has to hold is the gate, not the layer
+        // above it.
+        writeFileSync(join(config.cwd, "outside.md"), "not mine\n");
+      });
+
+      const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      // A passing acceptance gate is not authority: the unauthorized path still
+      // fails the whole promotion.
+      expect(result.outcome.promotion.status).toBe("rejected");
+      expect(result.outcome.promotion.rejectedPaths).toEqual(["outside.md"]);
+      expect(snapshotTree(repo)).toEqual(before);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves the compiled tool set and its refusals identical to a repository with no overlay", async () => {
+    const stateRoot = makeStateRoot();
+    const plain = repoWithApp();
+    const overlaid = repoWithApp();
+    try {
+      writeOverlay(overlaid, {
+        schema_version: 1,
+        validations: { web: [nodeValidator("process.exit(0);")] },
+      });
+      const refusals: Record<string, string> = {};
+      const observe = (label: string) => async (config: DelegationSessionConfig) => {
+        try {
+          await callTool(config, "write", { path: "services/billing/x.rb", content: "not mine\n" });
+          refusals[label] = "allowed";
+        } catch (error) {
+          refusals[label] = error instanceof Error ? error.message : String(error);
+        }
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      };
+
+      const withoutOverlay = sessions(observe("plain"));
+      await runDelegation(inputsFor(plain), {
+        createSession: withoutOverlay.createSession,
+        stateRoot,
+      });
+      const withOverlay = sessions(observe("overlaid"));
+      await runDelegation(inputsFor(overlaid), {
+        createSession: withOverlay.createSession,
+        stateRoot,
+      });
+
+      // Same tools, same grant, same refusal: the overlay is not in that path at all.
+      expect(withOverlay.captured[0].toolNames).toEqual(withoutOverlay.captured[0].toolNames);
+      expect(refusals.overlaid).toBe(refusals.plain);
+      expect(refusals.overlaid).toMatch(/services\/billing\/x\.rb/);
+    } finally {
+      rmSync(plain, { recursive: true, force: true });
+      rmSync(overlaid, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores an overlay a delegated session writes into the staged checkout", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    try {
+      // The user's overlay declares a validator that refuses this work.
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: {
+          web: [nodeValidator("process.stderr.write('policy says no');process.exit(1);")],
+        },
+      });
+      const { createSession } = sessions(async (config) => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "reviewed\n" });
+        // The child replaces the overlay inside its own checkout with one that would
+        // wave its work through.
+        mkdirSync(join(config.cwd, ".orca"), { recursive: true });
+        writeFileSync(
+          join(config.cwd, ".orca", "runtime.yaml"),
+          "schema_version: 1\nvalidations: {}\n",
+        );
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      });
+
+      const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      // The overlay that gates a delegation is the user's, read before it started.
+      expect(result.outcome.promotion.status).toBe("rejected");
+      expect(result.outcome.promotion.validations[0].stderr).toContain("policy says no");
+      expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("committed\n");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the agent's own validation report is advisory, the declared validators are not", () => {
+  it("promotes work whose checkpoint reports failed validation when nothing is declared", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    try {
+      const { createSession } = sessions(async (config) => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "reviewed\n" });
+        await callTool(config, "orca_checkpoint", {
+          status: "completed",
+          summary: "done, but my own test run was red",
+          validation_activities: [
+            { kind: "test", name: "unit", command: "npm test", status: "failed" },
+          ],
+        });
+      });
+
+      const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      // The agent's account is METADATA: it is recorded, surfaced to the steward,
+      // and gates nothing. Only a program Orca ran itself can refuse a promotion.
+      expect(result.outcome.checkpoint.validation.status).toBe("failed");
+      expect(result.outcome.appendEntry.validation.status).toBe("failed");
+      expect(result.outcome.promotion.status).toBe("promoted");
+      expect(result.outcome.promotion.validations).toEqual([]);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses work whose checkpoint claims passing validation when a declared validator disagrees", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: { web: [nodeValidator("process.exit(1);")] },
+      });
+      const { createSession } = sessions(async (config) => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "reviewed\n" });
+        await callTool(config, "orca_checkpoint", {
+          status: "completed",
+          summary: "all green, promise",
+          validation_activities: [
+            { kind: "test", name: "unit", command: "npm test", status: "passed" },
+          ],
+        });
+      });
+
+      const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.outcome.checkpoint.validation.status).toBe("passed");
+      expect(result.outcome.promotion.status).toBe("rejected");
+      expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("committed\n");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("a validator sees the sequence's complete, committed work", () => {
+  it("runs against the content the owner committed, so it can accept or refuse it", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: {
+          web: [
+            // The validator is the assertion: it exits non-zero unless the file it
+            // reads holds exactly what the agent wrote.
+            nodeValidator(
+              "const seen = require('fs').readFileSync('apps/web/app.tsx', 'utf8');" +
+                "process.stdout.write(seen);" +
+                "process.exit(seen === 'reviewed\\n' ? 0 : 9);",
+            ),
+          ],
+        },
+      });
+      const { createSession } = sessions(writeAndComplete);
+
+      const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.outcome.promotion.validations[0].stdout).toBe("reviewed\n");
+      expect(result.outcome.promotion.status).toBe("promoted");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("a validator runs where the overlay says", () => {
+  it("runs in the declared repository-relative directory inside the staged checkout", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    const observed = join(stateRoot, "where.txt");
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: {
+          web: [
+            nodeValidator(
+              `require('fs').writeFileSync(${JSON.stringify(observed)}, process.cwd());`,
+              { cwd: "apps/web" },
+            ),
+          ],
+        },
+      });
+      const { createSession, captured } = sessions(writeAndComplete);
+
+      const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.outcome.promotion.status).toBe("promoted");
+      expect(readFileSync(observed, "utf8")).toBe(join(captured[0].cwd, "apps", "web"));
+      expect(result.outcome.promotion.validations[0].cwd).toBe("apps/web");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when the declared directory does not exist in the checkout", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: {
+          web: [nodeValidator("process.exit(0);", { cwd: "packages/nowhere" })],
+        },
+      });
+      const { createSession } = sessions(writeAndComplete);
+
+      const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.outcome.promotion.validations[0].status).toBe("unavailable");
+      expect(result.outcome.promotion.status).toBe("rejected");
     } finally {
       rmSync(repo, { recursive: true, force: true });
       rmSync(stateRoot, { recursive: true, force: true });
