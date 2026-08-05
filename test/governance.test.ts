@@ -281,6 +281,18 @@ describe("classifyBrokenSpec with salvaged read protections", () => {
     }
   });
 
+  it("enforces a salvaged set on an unsupported_spec_version document through the same path", () => {
+    // These documents are usually structurally perfect and merely too new; they take
+    // the same salvage path as invalid_spec, not a weaker one.
+    const state = brokenStateFor(orcaspec.loadFixtureSource("multi-owner").replace('"0.1"', '"0.2"'));
+    expect(state.kind).toBe("unsupported_spec_version");
+    expect(state.protections.kind).toBe("enforcing");
+    for (const mode of BOTH_MODES) {
+      const decision = classifyBrokenSpec(state, "read", { path: "secrets/aws.json", symlink: false });
+      expect(decision.verdict, `${mode}: refused`).toBe("block");
+    }
+  });
+
   it("still lets every other discovery read through, so the document can be diagnosed", () => {
     const state = brokenStateFor(brokenElsewhere());
     for (const tool of DISCOVERY) {

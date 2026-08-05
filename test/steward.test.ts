@@ -31,6 +31,16 @@ function activeStateFor(dir: string, fixture: string, requested: "advisory" | "e
 
 function brokenStateFor(dir: string, fixture: string): BrokenSpecState {
   writeSpec(dir, fixture);
+  return brokenState(dir);
+}
+
+/** A hand-broken document, for damage no fixture carries. */
+function writeSpecSource(dir: string, source: string): void {
+  mkdirSync(join(dir, ORCA_DIR), { recursive: true });
+  writeFileSync(join(dir, ORCA_DIR, ORCA_SPEC_FILE), source);
+}
+
+function brokenState(dir: string): BrokenSpecState {
   const state = detectRepositoryState(dir);
   if (state.kind !== "invalid_spec" && state.kind !== "unsupported_spec_version") {
     throw new Error(`expected a broken state, got ${state.kind}`);
@@ -126,6 +136,25 @@ describe("composeBrokenSpecNote", () => {
     expect(note).toContain("unsupported_spec_version");
     expect(note).toContain(`declares spec_version '${state.foundVersion}'`);
     expect(note).toContain(`supports '${state.supportedVersion}'`);
+  });
+
+  it("tells the session which read-protection regime is in force, and not to read around it", () => {
+    // The session is told reads still work; if a salvaged set narrows them, the same
+    // note must say so, or the session will read into a refusal it was not warned about.
+    const base = orcaspec.loadFixtureSource("multi-owner"); // protected read: secrets/**
+    writeSpecSource(dir, `${base}\nnot_a_section:\n  anything: true\n`);
+    const enforcing = composeBrokenSpecNote(brokenState(dir));
+    expect(enforcing).toContain("ENFORCING 1");
+    expect(enforcing).toContain("secrets/**");
+    expect(enforcing, "warns against working around it").toContain("Do not try to read around them");
+    expect(enforcing, "and no longer promises unscoped reads").not.toContain("unscoped");
+
+    writeSpecSource(dir, base.replace("protected_denies:\n  read:\n    - secrets/**", "protected_denies: 3\n#"));
+    const lapsed = composeBrokenSpecNote(brokenState(dir));
+    expect(lapsed).toContain("LAPSED");
+    expect(lapsed, "a lapse is not something to warn the session against").not.toContain(
+      "Do not try to read around them",
+    );
   });
 
   it("claims none of the active-governance sections, which cannot be stated truthfully", () => {
