@@ -1199,9 +1199,12 @@ export function abandonStagedWork(workspace: StagedWorkspace, reason: string): P
  * is not claimed. On any refusal every owner reports the same refusal, because
  * that is what happened to all of them: nothing was applied.
  *
- * The validator runs are carried through unnarrowed: the acceptance gate ran over
- * the whole sequence's work, so every owner's entry answers the same question with
- * the same evidence — which declared checks decided this promotion.
+ * The validator runs and any held governance change are carried through unnarrowed,
+ * for the same reason: the acceptance gate ran over the whole sequence's work and the
+ * hold is one decision about the sequence's one promotion, so every owner's entry
+ * answers those questions with the same evidence. The hold in particular must not be
+ * narrowed away — a single-owner delegation reports through this projection, and
+ * "promoted" with the hold dropped would tell a steward everything landed.
  */
 export function stepPromotion(
   sequence: PromotionRecord,
@@ -1214,6 +1217,7 @@ export function stepPromotion(
     appliedPaths: applied,
     rejectedPaths: [],
     driftedPaths: [],
+    heldGovernance: sequence.heldGovernance,
     validations: sequence.validations,
     validatorOutputPath: sequence.validatorOutputPath,
     diagnostics: [
