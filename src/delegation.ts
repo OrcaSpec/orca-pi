@@ -18,6 +18,14 @@ import {
 import { capabilitySummaryFor, type CapabilitySummary } from "./enforcement";
 import { createDelegationTools } from "./delegation-tools";
 import {
+  abandonStagedWork,
+  promoteStagedWork,
+  type PromotionRecord,
+  type StagedWorkspace,
+  type StagingProvider,
+} from "./staging";
+import { gitWorktreeStaging } from "./staging-worktree";
+import {
   CONTEXT_BUDGET_BYTES,
   resolveSources,
   type InjectionWarning,
@@ -147,12 +155,23 @@ export interface DelegationSessionConfig {
   childSessionId?: string;
 }
 
+/** Why assembly failed before anything could spawn. */
+export type BuildFailureKind = "unknown_owner" | "required_missing" | "oversized";
+
+/**
+ * Why a delegation never reached a child session. Assembly failures plus
+ * `staging_unavailable`, which covers a repository that cannot be staged at all
+ * (see `staging.ts`) — the delegation is refused rather than degraded to an
+ * ungoverned in-place edit.
+ */
+export type RunFailureKind = BuildFailureKind | "staging_unavailable";
+
 /** Assembly outcome: a spawnable config, or a pre-spawn failure with diagnostics. */
 export type BuildResult =
   | { ok: true; config: DelegationSessionConfig }
   | {
       ok: false;
-      kind: "unknown_owner" | "required_missing" | "oversized";
+      kind: BuildFailureKind;
       diagnostics: string[];
       warnings: InjectionWarning[];
     };
@@ -549,6 +568,18 @@ export interface RunDeps {
   onActivity?: (note: string) => void;
   /** Sink for structured progress events; the sequence loop drives the ordering. */
   onProgress?: (progress: DelegationProgress) => void;
+  /**
+   * Root of the runtime state directory holding staged checkouts and preserved
+   * patches. Defaults to pi's agent directory (see `staging.ts`); tests and
+   * embeddings point it at their own directory.
+   */
+  stateRoot?: string;
+  /**
+   * How a delegation's work is isolated from the user's checkout. Defaults to the
+   * `git worktree` provider; any {@link StagingProvider} satisfying the
+   * `StagedWorkspace` contract works, because promotion is provider-independent.
+   */
+  staging?: StagingProvider;
 }
 
 /** A session-entry record for one delegation (Phase 8 renders/persists it). */
@@ -578,6 +609,8 @@ export interface DelegationEntry {
   grantId?: string;
   mutationViolations: NonNullable<CheckpointResult["mutationViolations"]>;
   validation: CheckpointResult["validation"];
+  /** What the promotion gate did with this delegation's staged change. */
+  promotion: PromotionRecord;
   sequenceId?: string;
   stepId?: string;
   delegationId?: string;
@@ -594,14 +627,16 @@ export interface DelegationOutcome {
   appendEntry: DelegationEntry;
   assignment: OwnerAssignment;
   upstreamHandoffs: UpstreamHandoff[];
+  /** Whether the staged change reached the user's checkout, and why (or why not). */
+  promotion: PromotionRecord;
 }
 
-/** Run result: a completed delegation outcome, or a pre-spawn build failure. */
+/** Run result: a completed delegation outcome, or a pre-spawn failure. */
 export type RunResult =
   | { ok: true; outcome: DelegationOutcome }
   | {
       ok: false;
-      kind: "unknown_owner" | "required_missing" | "oversized";
+      kind: RunFailureKind;
       diagnostics: string[];
       warnings: InjectionWarning[];
     };
@@ -610,6 +645,7 @@ function toEntry(
   config: DelegationSessionConfig,
   checkpoint: CheckpointResult,
   usage: DelegationUsage,
+  promotion: PromotionRecord,
 ): DelegationEntry {
   return {
     kind: "orca_delegation",
@@ -635,6 +671,7 @@ function toEntry(
     grantId: config.grantId,
     mutationViolations: checkpoint.mutationViolations ?? [],
     validation: checkpoint.validation,
+    promotion,
     sequenceId: config.sequenceId,
     stepId: config.stepId,
     delegationId: config.delegationId,
@@ -643,16 +680,67 @@ function toEntry(
 }
 
 /**
- * Assemble and run one single-owner delegation end-to-end. Builds the config
- * (returning a pre-spawn failure if a required source is missing or the bundle
- * is oversized), spawns via `deps.createSession`, wires parent cancellation to
- * `session.abort()`, and prompts. The terminal checkpoint is whatever the agent
- * called; a session that ends without one gets a synthesized `failed` checkpoint
- * (ADR 0083). The manifest attached to the outcome is always the observed set
- * from the record — never anything the agent reported.
+ * A stable staging directory name for a delegation that carries no identity.
+ * Only legacy single-step callers reach this; deriving it from the delegation's
+ * own shape keeps the directory deterministic (so a repeat run reclaims its own
+ * leftovers) without inventing an identity the record would have to explain.
+ */
+function stagingIdFor(inputs: DelegationInputs): string {
+  if (inputs.delegationId) return inputs.delegationId;
+  const digest = createHash("sha256")
+    .update(JSON.stringify({ owner: inputs.owner, targets: inputs.targets, cwd: inputs.cwd }))
+    .digest("hex")
+    .slice(0, 16);
+  return `legacy_${digest}`;
+}
+
+/**
+ * Assemble and run one single-owner delegation end-to-end IN STAGING.
+ *
+ * Before anything is assembled, the delegation gets its own `git worktree`
+ * outside the repository (`staging.ts`): `HEAD` plus the user's materialized
+ * dirty overlay, capped with a synthetic baseline commit. The session is then
+ * built with that worktree as its `cwd`, so every grant-checked file tool and
+ * every reconciled shell effect lands in staging and the user's checkout is
+ * never written while a child is running. A repository that cannot be staged
+ * refuses the delegation (`staging_unavailable`) instead of falling back to an
+ * in-place edit.
+ *
+ * Once the child stops, the terminal checkpoint is whatever the agent called (a
+ * session that ends without one gets a synthesized `failed` checkpoint, ADR
+ * 0083) and the manifest is always the observed set from the record. A
+ * `completed` delegation then goes through the promotion gate; any other status
+ * promotes nothing. Either way the worktree is removed on the way out.
  */
 export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Promise<RunResult> {
-  const built = buildDelegationSession(inputs);
+  const staging = deps.staging ?? gitWorktreeStaging;
+  const staged = staging.open({
+    cwd: inputs.cwd,
+    delegationId: stagingIdFor(inputs),
+    stateRoot: deps.stateRoot,
+  });
+  if (!staged.ok) {
+    return {
+      ok: false,
+      kind: "staging_unavailable",
+      diagnostics: staged.diagnostics,
+      warnings: [],
+    };
+  }
+
+  try {
+    return await runInStaging(inputs, deps, staged.workspace);
+  } finally {
+    staging.close(staged.workspace);
+  }
+}
+
+async function runInStaging(
+  inputs: DelegationInputs,
+  deps: RunDeps,
+  workspace: StagedWorkspace,
+): Promise<RunResult> {
+  const built = buildDelegationSession({ ...inputs, cwd: workspace.dir });
   if (!built.ok) {
     return { ok: false, kind: built.kind, diagnostics: built.diagnostics, warnings: built.warnings };
   }
@@ -692,6 +780,19 @@ export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Pr
     synthesizeFailedFromRecord(config.record, "No checkpoint was recorded.");
 
   const usage = session.usage ? session.usage() : emptyUsage();
+
+  // The promotion gate runs before the child runtime is finalized: `finish` can
+  // throw (it aggregates disposal errors), and a disposal failure must not cost
+  // the user a delegation whose work was already authorized and applicable.
+  const promotion =
+    checkpoint.status === "completed"
+      ? promoteStagedWork(workspace, inputs.grant)
+      : abandonStagedWork(
+          workspace,
+          `Promotion was not attempted: the delegation ended '${checkpoint.status}', and only a ` +
+            "completed delegation promotes its staged change.",
+        );
+
   await session.finish?.({
     status: completionStatus,
     checkpointStatus: checkpoint.status,
@@ -708,9 +809,10 @@ export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Pr
       checkpoint,
       warnings: config.warnings,
       usage,
-      appendEntry: toEntry(config, checkpoint, usage),
+      appendEntry: toEntry(config, checkpoint, usage, promotion),
       assignment: config.assignment,
       upstreamHandoffs: config.upstreamHandoffs,
+      promotion,
     },
   };
 }
@@ -731,7 +833,7 @@ export type SequenceStep =
       owner: string;
       targets: string[];
       assignment: OwnerAssignment;
-      failureKind: "unknown_owner" | "required_missing" | "oversized";
+      failureKind: RunFailureKind;
       diagnostics: string[];
       warnings: InjectionWarning[];
     }
@@ -751,15 +853,21 @@ export type SequenceStep =
 
 /**
  * The aggregate outcome of a multi-owner delegation sequence. A route plan is
- * intended to succeed as a whole (ADR 0009), but the pi MVP edits in place with
- * no transactional promotion or rollback (ADR 0077) — git is the safety net. So
- * the honest degradation is stop-on-first-non-completed: {@link stepCompleted}
- * gates each owner, and the moment one is not `completed` (a `needs_scope`
- * that must return to the steward for re-resolution per ADR 0008, a `blocked`,
- * a `failed`, a synthesized failure, or a pre-spawn build failure) the remaining
- * owners are left `not_run` rather than applying more in-place edits behind a
- * plan already known to be failing. This minimizes blast radius while keeping
- * the completed owners' work (already written in place) reported and intact.
+ * intended to succeed as a whole (ADR 0009), but promotion is still PER OWNER:
+ * each owner stages and promotes its own authorized change, so a sequence has no
+ * all-or-nothing transaction yet (that is the next phase of the staged-promotion
+ * plan, which gives a sequence one shared worktree and a single cumulative
+ * promotion).
+ *
+ * So the honest degradation remains stop-on-first-non-completed:
+ * {@link stepCompleted} gates each owner, and the moment one is not `completed`
+ * (a `needs_scope` that must return to the steward for re-resolution per ADR
+ * 0008, a `blocked`, a `failed`, a synthesized failure, or a pre-spawn build
+ * failure) the remaining owners are left `not_run` rather than promoting more
+ * work behind a plan already known to be failing. This minimizes blast radius
+ * while keeping the completed owners' promoted work reported and intact. An
+ * owner that did not complete promotes nothing at all, so a failing sequence
+ * leaves strictly less behind than it used to.
  */
 export interface SequenceOutcome {
   /** Per-owner results in deterministic dependency order, then owner id. */
@@ -990,6 +1098,11 @@ export function stepCompleted(step: SequenceStep): boolean {
  * (ADR 0083). Each delegation compiles and runs under its OWN grant carried on
  * its {@link DelegationInputs}; this function never merges or mutates grants, so
  * one owner's authority cannot leak into another's.
+ *
+ * Each owner also stages and promotes independently ({@link runDelegation}), so a
+ * later owner reads the earlier owners' promoted work as part of the checkout's
+ * dirty overlay — dependency ordering still means what it says — while an owner
+ * that fails contributes nothing.
  */
 export async function runDelegationSequence(
   ordered: DelegationInputs[],

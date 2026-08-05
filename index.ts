@@ -110,6 +110,12 @@ import { linesComponent } from "./src/tui";
  */
 export interface OrcaOverrides {
   createSession?: (config: DelegationSessionConfig) => Promise<DelegationSession>;
+  /**
+   * Root of the runtime state directory for delegation staging worktrees and
+   * preserved patches. Defaults to pi's agent directory (`staging.ts`); the
+   * offline suite points it at a temp directory so a test never writes there.
+   */
+  stateRoot?: string;
 }
 
 export default function orcaPi(pi: ExtensionAPI): void {
@@ -185,7 +191,11 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
    */
   const composeStatusLines = (state: RepositoryState): string[] => {
     const lines = [...formatStatusLines(state)];
-    if (state.kind === "active") lines.push("", ...formatEnforcementSummary());
+    // Profile 1.1: the delegated bash tool reconciles retained effects and every
+    // staged change passes the promotion gate, so 1.1 is what this runtime
+    // actually enforces. Rendering the historical 1.0 profile would claim
+    // promotion gating is "not applicable" while it is gating every delegation.
+    if (state.kind === "active") lines.push("", ...formatEnforcementSummary("1.1"));
     const sections = [
       routeLog.statusLines(),
       violations.statusLines(),
@@ -461,6 +471,7 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
       ...toolDeps,
       getThinkingLevel: () => parentThinkingLevel,
       createSession,
+      stateRoot: overrides.stateRoot,
       onDelegation: (entry) =>
         routeLog.record(
           `delegated ${entry.owner}: ${entry.status}, ${entry.changedPaths.length} changed path(s)`,

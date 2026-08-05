@@ -1,10 +1,9 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { rmSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as orcaspec from "orcaspec";
 import type { Model } from "@earendil-works/pi-ai";
 import { resolve } from "../src/resolver";
+import { makeGitRepo, makeStateRoot } from "./git-fixture";
 import {
   buildIntegrationRecord,
   runDelegationSequence,
@@ -81,16 +80,19 @@ function orderedFor(cwd: string, paths: string[]): DelegationInputs[] {
 
 describe("delegation record: build, digest, round-trip", () => {
   let dir: string;
+  let stateRoot: string;
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "orca-pi-entry-"));
+    dir = makeGitRepo("orca-pi-entry-");
+    stateRoot = makeStateRoot();
   });
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
   });
 
   async function buildRecord(paths: string[], usage: Record<string, DelegationUsage> = {}) {
     const ordered = orderedFor(dir, paths);
-    const sequence = await runDelegationSequence(ordered, { createSession: completingSessions(usage) });
+    const sequence = await runDelegationSequence(ordered, { createSession: completingSessions(usage), stateRoot });
     return buildDelegationRecord({
       task: "align the buttons and bill for it",
       targets: paths,
@@ -186,16 +188,19 @@ describe("delegation record: build, digest, round-trip", () => {
 
 describe("DelegationHistory rebuild from entries alone", () => {
   let dir: string;
+  let stateRoot: string;
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "orca-pi-hist-"));
+    dir = makeGitRepo("orca-pi-hist-");
+    stateRoot = makeStateRoot();
   });
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
   });
 
   async function record(paths: string[]): Promise<PersistedDelegationRecord> {
     const ordered = orderedFor(dir, paths);
-    const sequence = await runDelegationSequence(ordered, { createSession: completingSessions() });
+    const sequence = await runDelegationSequence(ordered, { createSession: completingSessions(), stateRoot });
     return buildDelegationRecord({
       task: `task for ${paths.join("+")}`,
       targets: paths,
@@ -251,17 +256,21 @@ describe("DelegationHistory rebuild from entries alone", () => {
 
 describe("renderRecordLines (transcript + last-delegation detail)", () => {
   let dir: string;
+  let stateRoot: string;
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "orca-pi-render-"));
+    dir = makeGitRepo("orca-pi-render-");
+    stateRoot = makeStateRoot();
   });
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
   });
 
   it("renders checkpoint outcome, capability summary, bash activity (labelled), and usage", async () => {
     const ordered = orderedFor(dir, ["apps/web/app.tsx"]);
     const sequence = await runDelegationSequence(ordered, {
       createSession: completingSessions({ web: usageOf(1234, 0.0456) }),
+      stateRoot,
     });
     const record = buildDelegationRecord({
       task: "restyle the primary button",
@@ -297,6 +306,7 @@ describe("renderRecordLines (transcript + last-delegation detail)", () => {
         },
         abort: () => {},
       }),
+      stateRoot,
     });
     const integration = buildIntegrationRecord(sequence, dir, {
       status: "stopped",

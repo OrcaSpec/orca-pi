@@ -28,8 +28,10 @@ import {
   type DelegationSessionConfig,
   type SequenceOutcome,
   type OwnerAssignment,
+  type RunFailureKind,
   type StewardDecisionRequest,
 } from "./delegation";
+import type { PromotionRecord } from "./staging";
 import {
   buildDelegationRecord,
   digestGrants,
@@ -67,7 +69,7 @@ const paramsSchema = Type.Object(
 type ToolParams = Static<typeof paramsSchema>;
 
 /** Pre-spawn delegation failure kinds surfaced to the steward. */
-export type DelegationFailureKind = "unknown_owner" | "required_missing" | "oversized";
+export type DelegationFailureKind = RunFailureKind;
 
 /** Structured details attached to a tool result for logs / UI. */
 export type ResolveToolDetails =
@@ -336,6 +338,11 @@ export interface DelegateDeps extends ToolDeps {
    * is ALSO streamed into the tool's `onUpdate` for the TUI regardless of this.
    */
   onProgress?: (progress: DelegationProgress, ctx: ExtensionContext) => void;
+  /**
+   * Root of the runtime state directory holding each delegation's staging
+   * worktree and any preserved patch. Defaults to pi's agent directory.
+   */
+  stateRoot?: string;
 }
 
 /** The observed-manifest line shared by every checkpoint rendering. */
@@ -345,6 +352,26 @@ function manifestLine(paths: string[]): string {
     : "Observed changed paths: (none).";
 }
 
+/**
+ * What actually reached the user's files. The delegation ran in a staging
+ * worktree, so "the agent changed X" and "X changed in your checkout" are
+ * different claims: this line is the second one, and it names the preserved patch
+ * whenever the staged change did not land, so nothing is quietly lost.
+ */
+function promotionLines(promotion: PromotionRecord): string[] {
+  const headline: Record<PromotionRecord["status"], string> = {
+    promoted: `Promotion: promoted — ${promotion.appliedPaths.length} path(s) applied to your checkout.`,
+    rejected: "Promotion: REJECTED — nothing was applied; your checkout is unchanged.",
+    conflict: "Promotion: CONFLICT — nothing was applied; your checkout is unchanged.",
+    not_attempted: "Promotion: not attempted — nothing was applied; your checkout is unchanged.",
+  };
+  const lines = [headline[promotion.status]];
+  for (const diagnostic of promotion.diagnostics) lines.push(`  ${diagnostic}`);
+  if (promotion.rejectedPaths.length > 0) {
+    lines.push(`  Unauthorized paths in the staged change: ${promotion.rejectedPaths.join(", ")}`);
+  }
+  return lines;
+}
 
 /**
  * Render how the steward re-delegates after a `needs_scope` outcome (ADR 0008).
@@ -390,6 +417,7 @@ function checkpointBody(outcome: DelegationOutcome): string[] {
     failed: `Status: failed${synth}.`,
   };
   const lines = [headline[cp.status], `Summary: ${cp.summary}`, manifestLine(cp.changedPaths)];
+  lines.push(...promotionLines(outcome.promotion));
   lines.push(
     `Validation: ${cp.validation.status}${
       cp.status === "completed" && cp.validation.status !== "passed"
@@ -533,7 +561,8 @@ function delegationSequenceResult(
     lines.push(
       `Outcome: stopped at '${sequence.stoppedAt}' — ${completed} completed, ${notRun} not run. ` +
         "Later owners were not started: the plan stops on the first non-completed status because " +
-        "in-place editing has no transactional rollback (ADR 0009/0077).",
+        "each owner promotes its own change and a sequence is not yet one transaction (ADR 0009). " +
+        "The owner that stopped promoted nothing; owners that completed before it did.",
     );
   }
 
@@ -799,6 +828,7 @@ export function createDelegateTool(
             createSession: deps.createSession,
             signal,
             onProgress,
+            stateRoot: deps.stateRoot,
           });
           const endedAt = Date.now();
           for (const step of sequence.steps) {

@@ -14,6 +14,7 @@ import {
   type DelegationSessionConfig,
 } from "../src/delegation";
 import { CONTEXT_BUDGET_BYTES } from "../src/context-injection";
+import { makeGitRepo, makeStateRoot } from "./git-fixture";
 
 /**
  * Delegated-session assembly (no prompting) and a scripted end-to-end run driven
@@ -216,13 +217,18 @@ async function callTool(
 }
 
 describe("runDelegation end-to-end (scripted, offline)", () => {
+  // A real git repository: the delegation runs in a staging worktree and its
+  // authorized change is promoted back, so these runs need a stageable checkout.
   let dir: string;
+  let stateRoot: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "orca-pi-run-"));
+    dir = makeGitRepo("orca-pi-run-");
+    stateRoot = makeStateRoot();
   });
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
   });
 
   it("writes within the grant and completes with an observed manifest", async () => {
@@ -231,11 +237,12 @@ describe("runDelegation end-to-end (scripted, offline)", () => {
       await callTool(config, "orca_checkpoint", { status: "completed", summary: "restyled" });
     });
 
-    const result = await runDelegation(inputsFor(dir, webAgent()), { createSession });
+    const result = await runDelegation(inputsFor(dir, webAgent()), { createSession, stateRoot });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
-    // Edited the working tree in place (ADR 0077).
+    // The child wrote in staging; the completed delegation promoted it here.
+    expect(result.outcome.promotion.status).toBe("promoted");
     expect(readFileSync(join(dir, "apps", "web", "app.tsx"), "utf8")).toContain("<button>ok</button>");
 
     const cp = result.outcome.checkpoint;
@@ -263,7 +270,7 @@ describe("runDelegation end-to-end (scripted, offline)", () => {
       finish,
     });
 
-    const result = await runDelegation(inputsFor(dir, webAgent()), { createSession });
+    const result = await runDelegation(inputsFor(dir, webAgent()), { createSession, stateRoot });
 
     expect(result.ok).toBe(true);
     expect(finish).toHaveBeenCalledWith({
@@ -281,7 +288,7 @@ describe("runDelegation end-to-end (scripted, offline)", () => {
       // No orca_checkpoint call — the session just ends.
     });
 
-    const result = await runDelegation(inputsFor(dir, webAgent()), { createSession });
+    const result = await runDelegation(inputsFor(dir, webAgent()), { createSession, stateRoot });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.outcome.checkpoint.status).toBe("failed");
@@ -297,7 +304,7 @@ describe("runDelegation end-to-end (scripted, offline)", () => {
         summary: "changed apps/web/app.tsx and apps/web/theme.ts",
       });
     });
-    const result = await runDelegation(inputsFor(dir, webAgent()), { createSession });
+    const result = await runDelegation(inputsFor(dir, webAgent()), { createSession, stateRoot });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.outcome.checkpoint.changedPaths).toEqual([]);
@@ -310,6 +317,7 @@ describe("runDelegation end-to-end (scripted, offline)", () => {
     });
     const result = await runDelegation(inputsFor(dir, webAgent()), {
       createSession,
+      stateRoot,
       signal: controller.signal,
     });
     expect(abort).toHaveBeenCalled();
@@ -329,6 +337,7 @@ describe("runDelegation end-to-end (scripted, offline)", () => {
     });
     const result = await runDelegation(inputsFor(dir, webAgent()), {
       createSession,
+      stateRoot,
       signal: AbortSignal.abort(),
     });
     expect(abort).toHaveBeenCalled();
@@ -341,7 +350,7 @@ describe("runDelegation end-to-end (scripted, offline)", () => {
   it("does not spawn a session when a required source is missing (pre-spawn failure)", async () => {
     const spawn = vi.fn(async (): Promise<DelegationSession> => ({ prompt: async () => {}, abort: vi.fn() }));
     const agent = webAgent({ instructions: { required: [".orca/web/missing.md"], optional: [] } });
-    const result = await runDelegation(inputsFor(dir, agent), { createSession: spawn });
+    const result = await runDelegation(inputsFor(dir, agent), { createSession: spawn, stateRoot });
     expect(spawn).not.toHaveBeenCalled();
     expect(result.ok).toBe(false);
     if (result.ok) return;

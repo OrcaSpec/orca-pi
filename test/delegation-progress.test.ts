@@ -1,5 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as orcaspec from "orcaspec";
@@ -15,6 +14,7 @@ import {
 } from "../src/delegation";
 import { createDelegateTool, type DelegateDeps, type ResolveToolDetails } from "../src/tools";
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
+import { makeGitRepo, makeStateRoot } from "./git-fixture";
 
 /**
  * Live delegation progress (PRD "User Surface"): the sequence runner emits an
@@ -63,11 +63,14 @@ function orderedFor(cwd: string, paths: string[]): DelegationInputs[] {
 
 describe("runDelegationSequence progress stream", () => {
   let dir: string;
+  let stateRoot: string;
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "orca-pi-prog-"));
+    dir = makeGitRepo("orca-pi-prog-");
+    stateRoot = makeStateRoot();
   });
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
   });
 
   it("emits sequence_start, per-step start/activity/end, then sequence_end (single owner)", async () => {
@@ -75,6 +78,7 @@ describe("runDelegationSequence progress stream", () => {
     await runDelegationSequence(orderedFor(dir, ["apps/web/app.tsx"]), {
       createSession: activeSessions(),
       onProgress: (p) => progress.push(p),
+      stateRoot,
     });
     expect(progress.map((p) => p.kind)).toEqual([
       "sequence_start",
@@ -92,6 +96,7 @@ describe("runDelegationSequence progress stream", () => {
     await runDelegationSequence(orderedFor(dir, ["apps/web/app.tsx", "services/billing/x.rb"]), {
       createSession: activeSessions(),
       onProgress: (p) => progress.push(p),
+      stateRoot,
     });
     // billing (owner id ascending) runs fully before web starts.
     const trace = progress.map((p) =>
@@ -112,13 +117,16 @@ describe("runDelegationSequence progress stream", () => {
 
 describe("orca_delegate streams progress into onUpdate", () => {
   let dir: string;
+  let stateRoot: string;
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "orca-pi-prog-tool-"));
+    dir = makeGitRepo("orca-pi-prog-tool-");
+    stateRoot = makeStateRoot();
     mkdirSync(join(dir, ORCA_DIR), { recursive: true });
     writeFileSync(join(dir, ORCA_DIR, ORCA_SPEC_FILE), orcaspec.loadFixtureSource("multi-owner"));
   });
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
   });
 
   it("forwards each progress event to onUpdate in order, and reports progress to onProgress", async () => {
@@ -129,6 +137,7 @@ describe("orca_delegate streams progress into onUpdate", () => {
       getThinkingLevel: () => "medium",
       createSession: activeSessions(),
       onProgress: (p) => progressSeen.push(p),
+      stateRoot,
     };
     const onUpdate = (update: AgentToolResult<ResolveToolDetails>): void => {
       const text = update.content.map((b) => (b.type === "text" ? b.text : "")).join("");

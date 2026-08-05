@@ -107,8 +107,9 @@ function throwLifecycleErrors(errors: unknown[], message: string): void {
  *   tools are exactly the grant-compiled `customTools` (grant-checked
  *   read/write/edit, unmodified bash, and orca_checkpoint). The system prompt and
  *   untrusted context come from the loader overrides; the session is in-memory so
- *   delegations never pollute the session store, and edits land in the working
- *   tree in place (ADR 0077).
+ *   delegations never pollute the session store. `config.cwd` is the delegation's
+ *   staging worktree, not the user's checkout (`staging.ts`), so edits land in
+ *   staging and reach the user only through the promotion gate.
  *
  * This path requires a live model and is exercised by the flagged live-model
  * smoke test, not the offline conformance suite.

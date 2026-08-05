@@ -14,6 +14,7 @@ import {
 } from "../src/tools";
 import type { DelegationSession, DelegationSessionConfig } from "../src/delegation";
 import type { OperatingMode } from "../src/mode";
+import { makeGitRepo, makeStateRoot } from "./git-fixture";
 
 /**
  * The full delegation lifecycle through `orca_delegate` (Phase 7): the four
@@ -80,13 +81,18 @@ function sessions(scripts: Record<string, Script> = {}, fallback: Script = compl
 }
 
 describe("orca_delegate full lifecycle", () => {
+  // A real git repository: every delegation runs in a staging worktree and a
+  // completed one promotes its authorized change back into this checkout.
   let dir: string;
+  let stateRoot: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "orca-pi-deleg7-"));
+    dir = makeGitRepo("orca-pi-deleg7-");
+    stateRoot = makeStateRoot();
   });
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
   });
 
   function writeSpec(fixture: string): void {
@@ -113,6 +119,7 @@ describe("orca_delegate full lifecycle", () => {
       createSession,
       onDelegation: opts.onDelegation,
       onUnowned: opts.onUnowned,
+      stateRoot,
     };
     const ownerFor = (path: string): string | undefined => {
       if (path.startsWith("apps/web/components/")) return "design-system";
@@ -168,6 +175,75 @@ describe("orca_delegate full lifecycle", () => {
     expect(result.details.outcome.checkpoint.status).toBe("completed");
     expect(result.details.outcome.checkpoint.changedPaths).toEqual(["apps/web/app.tsx"]);
     expect(onDelegation).toHaveBeenCalledTimes(1);
+  });
+
+  it("tells the steward what actually reached the checkout, not just what the agent changed", async () => {
+    writeSpec("multi-owner");
+    const { createSession } = sessions();
+    const result = await run(["apps/web/app.tsx"], createSession);
+
+    const body = textOf(result);
+    expect(body).toContain("Promotion: promoted");
+    expect(body).toContain("1 path(s) applied to your checkout");
+    if (result.details?.kind !== "delegation") return;
+    expect(result.details.outcome.promotion.appliedPaths).toEqual(["apps/web/app.tsx"]);
+  });
+
+  it("reports that nothing was promoted when the delegation does not complete", async () => {
+    writeSpec("multi-owner");
+    const { createSession } = sessions({
+      web: async (config) => {
+        await callTool(config, "write", { path: OWNED.web, content: "partial" });
+        await callTool(config, "orca_checkpoint", { status: "blocked", summary: "stuck" });
+      },
+    });
+    const result = await run(["apps/web/app.tsx"], createSession);
+
+    const body = textOf(result);
+    expect(body).toContain("Promotion: not attempted");
+    expect(body).toContain("your checkout is unchanged");
+    // The observed manifest still names what the agent changed in staging, so the
+    // two claims stay distinguishable.
+    expect(body).toContain("Observed changed paths (1): apps/web/app.tsx");
+    expect(existsSync(join(dir, "apps", "web", "app.tsx"))).toBe(false);
+  });
+
+  it("refuses to delegate in a repository it cannot stage, before spawning anything", async () => {
+    const plain = mkdtempSync(join(tmpdir(), "orca-pi-nogit-"));
+    try {
+      mkdirSync(join(plain, ORCA_DIR), { recursive: true });
+      writeFileSync(
+        join(plain, ORCA_DIR, ORCA_SPEC_FILE),
+        orcaspec.loadFixtureSource("multi-owner"),
+      );
+      const { createSession, captured } = sessions();
+      const deps: DelegateDeps = {
+        getState: (cwd) => detectRepositoryState(cwd, "enforce"),
+        getThinkingLevel: () => "medium",
+        createSession,
+        stateRoot,
+      };
+
+      const result = await createDelegateTool(deps).execute(
+        "d1",
+        { task: "do the work", paths: ["apps/web/app.tsx"] },
+        undefined,
+        undefined,
+        { cwd: plain, model: fakeModel } as never,
+      );
+
+      expect(captured).toHaveLength(0);
+      expect(result.details?.kind).toBe("delegation_failed");
+      if (result.details?.kind !== "delegation_failed") return;
+      expect(result.details.failureKind).toBe("staging_unavailable");
+      const body = textOf(result);
+      expect(body).toContain("not inside a git working tree");
+      expect(body).toContain("git init");
+      // Explicit degradation: nothing was written in place instead.
+      expect(existsSync(join(plain, "apps", "web", "app.tsx"))).toBe(false);
+    } finally {
+      rmSync(plain, { recursive: true, force: true });
+    }
   });
 
   it("persists an explicit ready steward decision only after all integration audits pass", async () => {

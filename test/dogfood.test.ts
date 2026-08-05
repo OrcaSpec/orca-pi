@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import orcaPi, { installOrca } from "../index";
 import { materializeFixtureRepo } from "./materialize-repo";
+import { makeStateRoot } from "./git-fixture";
 import {
   detectRepositoryState,
   ORCA_DIR,
@@ -133,11 +134,16 @@ function scriptedSessions(overrides: Record<string, Script> = {}) {
 // --- Fixtures ----------------------------------------------------------------
 
 let repo: string;
+// Delegations stage into their own worktrees under this root, so the suite never
+// writes into pi's real agent directory.
+let stateRoot: string;
 beforeEach(() => {
   repo = materializeFixtureRepo();
+  stateRoot = makeStateRoot();
 });
 afterEach(() => {
   rmSync(repo, { recursive: true, force: true });
+  rmSync(stateRoot, { recursive: true, force: true });
 });
 
 function activeDoc(mode: OperatingMode = "advisory"): { state: ActiveState; document: OrcaSpecDocument } {
@@ -422,7 +428,7 @@ describe("dogfood repo: delegation lifecycle (scripted sessions)", () => {
   function install(overrides: Record<string, Script> = {}) {
     const { pi, registered } = makeApi();
     const { createSession, captured } = scriptedSessions(overrides);
-    installOrca(pi as never, { createSession });
+    installOrca(pi as never, { createSession, stateRoot });
     return { registered, captured };
   }
 

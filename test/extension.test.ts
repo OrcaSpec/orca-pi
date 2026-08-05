@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as orcaspec from "orcaspec";
 import orcaPi, { installOrca } from "../index";
+import { makeGitRepo, makeStateRoot } from "./git-fixture";
 import { DELEGATION_ENTRY_TYPE } from "../src/delegation-entry";
 import type { DelegationSession, DelegationSessionConfig } from "../src/delegation";
 
@@ -99,14 +100,19 @@ function scriptedCreateSession() {
 }
 
 describe("orca-pi extension entry", () => {
+  // A real git repository plus its own state root: delegations run in staging
+  // worktrees, so the suite never writes into pi's real agent directory.
   let dir: string;
+  let stateRoot: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "orca-pi-ext-"));
+    dir = makeGitRepo("orca-pi-ext-");
+    stateRoot = makeStateRoot();
   });
 
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
   });
 
   it("registers the /orca command and a session_start handler", () => {
@@ -228,9 +234,16 @@ describe("orca-pi extension entry", () => {
     const ctx = makeCtx(dir, true);
     await registered.commands.get("orca")!.handler("", ctx);
     const text = orcaText(ctx);
-    expect(text).toContain("Enforcement profile (dimensioned");
-    expect(text).toContain("Subprocess filesystem effects (bash): Advisory, disclosed");
-    expect(text).toContain("partially_enforced");
+    // The 1.1 profile is what this runtime enforces: reconciled bash effects and a
+    // real promotion gate. Claiming the historical 1.0 row ("Promotion gating: not
+    // applicable — in-place editing") would contradict staged promotion.
+    expect(text).toContain("Enforcement profile 1.1 (dimensioned");
+    expect(text).toContain(
+      "Subprocess filesystem effects (bash): Post-command and post-session reconciled",
+    );
+    expect(text).toContain("Promotion gating: Staged in a git worktree");
+    expect(text).not.toContain("Not applicable (in-place editing)");
+    expect(text).toContain("Bash accountability:");
   });
 
   it("/orca in unmanaged, invalid_spec, and unsupported_spec_version shows diagnostics, NOT an enforcement claim", async () => {
@@ -272,7 +285,7 @@ describe("orca-pi extension entry", () => {
 
   it("persists a completed delegation as a session entry and shows it under /orca", async () => {
     const { pi, registered } = makeApi();
-    installOrca(pi as never, { createSession: scriptedCreateSession() });
+    installOrca(pi as never, { createSession: scriptedCreateSession(), stateRoot });
     writeSpec("multi-owner");
 
     const runCtx = makeCtx(dir, true);
@@ -310,7 +323,7 @@ describe("orca-pi extension entry", () => {
   it("a resumed session rebuilds delegation history from session entries ALONE", async () => {
     // First instance runs a delegation and captures the persisted entry.
     const first = makeApi();
-    installOrca(first.pi as never, { createSession: scriptedCreateSession() });
+    installOrca(first.pi as never, { createSession: scriptedCreateSession(), stateRoot });
     writeSpec("multi-owner");
     await first.registered.tools.get("orca_delegate")!.execute(
       "d1",
@@ -375,7 +388,7 @@ describe("orca-pi extension entry", () => {
 
   it("drives a full delegation headless without any UI calls", async () => {
     const { pi, registered } = makeApi();
-    installOrca(pi as never, { createSession: scriptedCreateSession() });
+    installOrca(pi as never, { createSession: scriptedCreateSession(), stateRoot });
     writeSpec("multi-owner");
     const ctx = makeCtx(dir, false);
     await registered.tools.get("orca_delegate")!.execute(
