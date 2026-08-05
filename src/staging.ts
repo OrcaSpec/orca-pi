@@ -5,6 +5,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { CompiledGrant } from "./resolver";
 import { checkGrant } from "./grant";
 import { COMMIT_CONFIG, gitFailure, gitRaw, gitText, tryGit } from "./git";
+import { ORCA_DIR } from "./state";
 
 /**
  * The staging seam and the promotion gate (staged-promotion plan, Phases 2–5;
@@ -65,6 +66,37 @@ export const PATCHES_DIR = "patches";
 /** The subdirectory of the state root holding preserved validator output. */
 export const VALIDATOR_OUTPUT_DIR = "validators";
 
+/**
+ * The fixed definition of a GOVERNANCE PATH (hardening plan, Phase 2): everything
+ * under the directory that holds the documents governing the agents themselves —
+ * the OrcaSpec document and the runtime overlay.
+ *
+ * A governance change is HELD, never applied: the apply stage splits the promotion
+ * patch here and writes this side to its own patch that only the user can land.
+ * That is a NARROWING applied after authorization, not a new authority check — an
+ * owner whose grant does not cover `.orca/**` is still refused at its staged commit
+ * by {@link commitAuthorizedWork}, exactly as before, and nothing here widens what
+ * any grant permits. The narrowing exists because an agent that can rewrite the
+ * document governing agents can rewrite its own limits, and the phase-4 rule that
+ * the runtime overlay is read from the USER's checkout is only half of that: this is
+ * the other half, keeping the rewrite out of the checkout in the first place.
+ */
+export const GOVERNANCE_SCOPE = `${ORCA_DIR}/**`;
+
+/**
+ * {@link GOVERNANCE_SCOPE} as the two git pathspecs that split a diff at it.
+ *
+ * git does the splitting rather than a hunk-level parse of the patch text, and the
+ * split is exact because the boundary is a directory PREFIX: no file can fall on
+ * both sides, so the two patches touch disjoint paths and each applies without the
+ * other. `:(top)` anchors both at the repository root regardless of the directory
+ * git is invoked from, and the negative pathspec is git's own exclusion — the
+ * promotable patch cannot contain a governance path because git never put one in
+ * it, which is a stronger guarantee than filtering the bytes afterwards.
+ */
+const GOVERNANCE_PATHSPEC = `:(top)${ORCA_DIR}`;
+const PROMOTABLE_PATHSPEC = `:(exclude,top)${ORCA_DIR}`;
+
 /** The commit message of the synthetic baseline the cumulative diff is taken against. */
 export const BASELINE_MESSAGE = "orca staged baseline (HEAD + dirty overlay)";
 
@@ -119,6 +151,13 @@ export interface StagedWorkspace {
   baselineCommit: string;
   /** Where a patch is preserved when it is not promoted. */
   patchPath: string;
+  /**
+   * Where the governance half of a promotion is held for the user's approval
+   * (hardening plan, Phase 2). A distinct file from {@link patchPath} because the two
+   * mean different things: that one is evidence of work that did NOT land, this one is
+   * a proposal awaiting a decision.
+   */
+  governancePatchPath: string;
   /** Where validator output is preserved when the acceptance gate refuses. */
   validatorOutputPath: string;
   /** Which provider produced this workspace, for diagnostics. */
@@ -167,6 +206,7 @@ export function stagingPaths(input: OpenStagingInput): {
   stateRoot: string;
   dir: string;
   patchPath: string;
+  governancePatchPath: string;
   validatorOutputPath: string;
 } {
   const stateRoot = input.stateRoot ?? defaultStateRoot();
@@ -175,6 +215,7 @@ export function stagingPaths(input: OpenStagingInput): {
     stateRoot,
     dir: join(stateRoot, CHECKOUTS_DIR, segment),
     patchPath: join(stateRoot, PATCHES_DIR, `${segment}.patch`),
+    governancePatchPath: join(stateRoot, PATCHES_DIR, `${segment}.governance.patch`),
     validatorOutputPath: join(stateRoot, VALIDATOR_OUTPUT_DIR, `${segment}.log`),
   };
 }
@@ -386,8 +427,18 @@ export function detectBaseDrift(
  * it was built on is gone, so the answer is to recover the preserved patch or
  * delegate again, and nothing about the delegation would have helped.
  * `not_attempted` means the delegation never reached the gate at all.
+ *
+ * `held` is neither a refusal nor a promotion (hardening plan, Phase 2): the gate
+ * ACCEPTED the work and nothing reached the user's files anyway, because every path
+ * it would have applied is a governance path and those are held for approval. It is
+ * a status of its own rather than a `promoted` with an empty applied set, because
+ * `promoted` is the word the compact `/orca` history line prints — and "promoted"
+ * over a delegation that changed nothing in the checkout, with a patch still waiting
+ * for a decision, reads as a success that did not happen. A promotion that applied
+ * some paths and held others stays `promoted`, with {@link PromotionRecord.heldGovernance}
+ * carrying the hold.
  */
-export type PromotionStatus = "promoted" | "rejected" | "conflict" | "not_attempted";
+export type PromotionStatus = "promoted" | "held" | "rejected" | "conflict" | "not_attempted";
 
 /**
  * How one declared validator ended. `unavailable` covers a validator that could
@@ -463,6 +514,34 @@ export type AcceptanceGate = (
 ) => Promise<AcceptanceResult>;
 
 /**
+ * The governance half of a promotion, held for the user's approval (hardening plan,
+ * Phase 2). Present on a `promoted` or `held` record whenever the delegation changed
+ * anything under {@link GOVERNANCE_SCOPE}, and absent on every refusal: a refused
+ * promotion preserves ONE cumulative evidence patch containing everything, and a
+ * proposal to approve out of a delegation that could not land is a contradiction.
+ *
+ * Plain strings and string arrays by design — the durable record persists this shape
+ * unchanged, and the `/orca` history a later session renders is the only thing that
+ * remembers where the patch is.
+ */
+export interface HeldGovernance {
+  /**
+   * Absolute path of the held patch. Nothing in the runtime applies it; a `git apply`
+   * the user runs (or, from Phase 3, an approval action they invoke) is the only way
+   * it can reach the checkout.
+   */
+  patchPath: string;
+  /** The governance paths it touches, repository-relative and sorted. */
+  paths: string[];
+  /**
+   * The user's `HEAD` when the delegation was staged — the base the patch was
+   * generated against. Recorded because the patch outlives the session and a user
+   * applying it later needs to know what it expects to find.
+   */
+  baseCommit: string;
+}
+
+/**
  * The steward-facing record of one promotion attempt. {@link appliedPaths} is
  * non-empty only for `promoted`; {@link patchPath} points at the preserved patch
  * whenever a non-empty change was not applied, so the work is recoverable.
@@ -482,6 +561,13 @@ export interface PromotionRecord {
   driftedPaths: string[];
   /** Absolute path of the preserved patch, when one was written. */
   patchPath?: string;
+  /**
+   * The authorized governance change the gate refused to APPLY and held instead
+   * ({@link HeldGovernance}). Absent when the delegation touched no governance path,
+   * which is the ordinary case and the one that must behave exactly as it did before
+   * this phase existed.
+   */
+  heldGovernance?: HeldGovernance;
   /**
    * Every declared validator that ran as the acceptance gate, in the order they
    * ran. Empty when the repository declared none, or when the promotion was
@@ -516,10 +602,15 @@ function worktreeDiff(dir: string, ref: string): StagedDiff {
   return { patch, paths: names.split("\0").filter(Boolean).sort() };
 }
 
-/** The diff between two commits inside the isolated checkout. */
-function commitDiff(dir: string, from: string, to: string): StagedDiff {
-  const names = gitText(dir, ["diff", "--no-renames", "--name-only", "-z", from, to]);
-  const patch = gitRaw(dir, ["diff", "--binary", "--no-renames", from, to]);
+/**
+ * The diff between two commits inside the isolated checkout, optionally narrowed to
+ * a pathspec. Both halves of the result come from the SAME narrowing, so the paths a
+ * record reports and the bytes it applies can never describe different sets.
+ */
+function commitDiff(dir: string, from: string, to: string, pathspec?: string): StagedDiff {
+  const limit = pathspec ? ["--", pathspec] : [];
+  const names = gitText(dir, ["diff", "--no-renames", "--name-only", "-z", from, to, ...limit]);
+  const patch = gitRaw(dir, ["diff", "--binary", "--no-renames", from, to, ...limit]);
   return { patch, paths: names.split("\0").filter(Boolean).sort() };
 }
 
@@ -528,12 +619,36 @@ function tryCommitDiff(
   dir: string,
   from: string,
   to: string,
+  pathspec?: string,
 ): { ok: true; diff: StagedDiff } | { ok: false; reason: string } {
   try {
-    return { ok: true, diff: commitDiff(dir, from, to) };
+    return { ok: true, diff: commitDiff(dir, from, to, pathspec) };
   } catch (error) {
     return { ok: false, reason: gitFailure(error) };
   }
+}
+
+/**
+ * The staged change split at the governance boundary (hardening plan, Phase 2): what
+ * may be applied, and what is held.
+ *
+ * Two narrowed diffs of the same commit pair rather than one diff cut up afterwards.
+ * The pair partitions the change — every path is on exactly one side, and the sides
+ * are computed by git itself (see {@link GOVERNANCE_PATHSPEC}) — so a governance path
+ * cannot appear in the promotable patch even if the reporting below were wrong.
+ */
+function trySplitAtGovernance(
+  dir: string,
+  from: string,
+  to: string,
+):
+  | { ok: true; promotable: StagedDiff; governance: StagedDiff }
+  | { ok: false; reason: string } {
+  const promotable = tryCommitDiff(dir, from, to, PROMOTABLE_PATHSPEC);
+  if (!promotable.ok) return promotable;
+  const governance = tryCommitDiff(dir, from, to, GOVERNANCE_PATHSPEC);
+  if (!governance.ok) return governance;
+  return { ok: true, promotable: promotable.diff, governance: governance.diff };
 }
 
 /**
@@ -561,6 +676,36 @@ function preservePatch(workspace: StagedWorkspace, patch: Buffer): string | unde
   mkdirSync(dirname(workspace.patchPath), { recursive: true });
   writeFileSync(workspace.patchPath, patch);
   return workspace.patchPath;
+}
+
+/**
+ * Hold the governance half of a promotion, or report why it could not be held.
+ *
+ * A failure here REFUSES the whole promotion, and that is why this runs before the
+ * promotable half is applied rather than after: if the hold cannot be written, the
+ * choice is between losing an authorized proposal silently and landing nothing, and
+ * landing nothing is the honest one. The cumulative evidence patch that a refusal
+ * preserves still contains the governance change, so the work is not lost either way.
+ */
+function holdGovernance(
+  workspace: StagedWorkspace,
+  governance: StagedDiff,
+): { ok: true; held?: HeldGovernance } | { ok: false; reason: string } {
+  if (governance.patch.length === 0) return { ok: true };
+  try {
+    mkdirSync(dirname(workspace.governancePatchPath), { recursive: true });
+    writeFileSync(workspace.governancePatchPath, governance.patch);
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+  return {
+    ok: true,
+    held: {
+      patchPath: workspace.governancePatchPath,
+      paths: governance.paths,
+      baseCommit: workspace.baseCommit,
+    },
+  };
 }
 
 function refused(
@@ -886,21 +1031,45 @@ export async function promoteStagedCommits(
   const staleNow = detectBaseDrift(workspace, diff.paths);
   if (staleNow) return conflicted(workspace, diff, staleNow, gate);
 
-  if (diff.patch.length === 0) {
+  // The apply stage, and the one place the governance narrowing lives (hardening
+  // plan, Phase 2). Everything above this line — the per-step guard, the pinned tip,
+  // both base checks, the acceptance gate, and the cumulative `diff` a refusal
+  // preserves — sees the change WHOLE, so a governance path still drifts, still
+  // conflicts, and is still evidence exactly as it was before this phase. Only what
+  // is handed to `git apply` is narrowed.
+  const split = trySplitAtGovernance(workspace.dir, workspace.baselineCommit, stagedTip);
+  if (!split.ok) return unreadableStagedChange(split.reason, gate);
+  const { promotable, governance } = split;
+
+  if (promotable.patch.length === 0) {
+    const holding = holdGovernance(workspace, governance);
+    if (!holding.ok) return refused(workspace, diff, [], [heldFailure(holding.reason)], gate);
     return {
-      status: "promoted",
+      status: holding.held ? "held" : "promoted",
       appliedPaths: [],
       rejectedPaths: [],
       driftedPaths: [],
+      heldGovernance: holding.held,
       validations: gate?.validations ?? [],
-      diagnostics: ["The delegation changed no files, so there was nothing to promote."],
+      diagnostics: [
+        holding.held
+          ? "The delegation changed nothing outside the governance directory, so nothing was applied " +
+            "to your checkout."
+          : "The delegation changed no files, so there was nothing to promote.",
+        ...(gate ? gate.diagnostics : []),
+      ],
     };
   }
 
+  // Only the promotable half is checked, because only the promotable half is applied.
+  // Whether the HELD patch still applies is a question with a shelf life — the user
+  // may edit their own `.orca/**` between now and whenever they decide — so it is
+  // asked when the patch is offered, not now. A failing check here aborts before
+  // anything is written, so a refusal can never leave the checkout half-changed.
   const check = tryGit(
     workspace.repoRoot,
     ["apply", "--check", "--whitespace=nowarn"],
-    diff.patch,
+    promotable.patch,
   );
   if (!check.ok) {
     return refused(
@@ -915,7 +1084,10 @@ export async function promoteStagedCommits(
     );
   }
 
-  const applied = tryGit(workspace.repoRoot, ["apply", "--whitespace=nowarn"], diff.patch);
+  const holding = holdGovernance(workspace, governance);
+  if (!holding.ok) return refused(workspace, diff, [], [heldFailure(holding.reason)], gate);
+
+  const applied = tryGit(workspace.repoRoot, ["apply", "--whitespace=nowarn"], promotable.patch);
   if (!applied.ok) {
     return refused(
       workspace,
@@ -928,15 +1100,25 @@ export async function promoteStagedCommits(
 
   return {
     status: "promoted",
-    appliedPaths: diff.paths,
+    appliedPaths: promotable.paths,
     rejectedPaths: [],
     driftedPaths: [],
+    heldGovernance: holding.held,
     validations: gate?.validations ?? [],
     diagnostics: [
-      `Promoted ${diff.paths.length} authorized path(s) to your checkout as unstaged changes.`,
+      `Promoted ${promotable.paths.length} authorized path(s) to your checkout as unstaged changes.`,
       ...(gate ? gate.diagnostics : []),
     ],
   };
+}
+
+/** The refusal wording for a governance change that could not be held. */
+function heldFailure(reason: string): string {
+  return (
+    "Orca refused to promote this delegation: its change to the governance directory " +
+    `\`${GOVERNANCE_SCOPE}\` could not be held for your approval (${reason}), and promoting the rest ` +
+    "while silently dropping that change is not something Orca will do."
+  );
 }
 
 /**

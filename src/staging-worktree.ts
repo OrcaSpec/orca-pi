@@ -117,7 +117,7 @@ function open(input: OpenStagingInput): OpenStagingResult {
     };
   }
   const baseCommit = head.out.toString("utf8").trim();
-  const { dir, patchPath, validatorOutputPath } = stagingPaths(input);
+  const { dir, patchPath, governancePatchPath, validatorOutputPath } = stagingPaths(input);
 
   // Reclaim anything a crashed run left behind before claiming the path again, so
   // one crash cannot wedge every later delegation for this identity.
@@ -144,6 +144,7 @@ function open(input: OpenStagingInput): OpenStagingResult {
     overlayBinding: new Map(),
     baselineCommit: baseCommit,
     patchPath,
+    governancePatchPath,
     validatorOutputPath,
     provider: gitWorktreeStaging.name,
   };

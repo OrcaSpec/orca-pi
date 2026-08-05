@@ -1,5 +1,5 @@
 import type { ResolvedDelegation, Resolution, TargetReasoning } from "./resolver";
-import type { PromotionStatus } from "./staging";
+import { GOVERNANCE_SCOPE, type HeldGovernance, type PromotionStatus } from "./staging";
 
 /**
  * Shared rendering for the two routing-preview tools. `orca_resolve` (model
@@ -35,6 +35,7 @@ export interface PromotionView {
   rejectedPaths: string[];
   driftedPaths: string[];
   patchPath?: string;
+  heldGovernance?: HeldGovernance;
   diagnostics: string[];
 }
 
@@ -42,10 +43,18 @@ export interface PromotionView {
  * The one-line answer to "what reached my files". Every refusal says the same two
  * things — nothing applied, checkout unchanged — because that is the fact a steward
  * needs before any explanation of why.
+ *
+ * A hold is named in the headline as well as in the detail (hardening plan, Phase 2),
+ * including on a `promoted` that applied other paths: "promoted" alone would let a
+ * steward close the report believing the whole delegation landed.
  */
 export function promotionHeadline(promotion: PromotionView, label = "Promotion"): string {
+  const held = promotion.heldGovernance?.paths.length ?? 0;
   const headline: Record<PromotionStatus, string> = {
-    promoted: `${label}: promoted — ${promotion.appliedPaths.length} path(s) applied to your checkout.`,
+    promoted:
+      `${label}: promoted — ${promotion.appliedPaths.length} path(s) applied to your checkout` +
+      (held > 0 ? `, ${held} governance path(s) HELD for your approval.` : "."),
+    held: `${label}: HELD — nothing was applied; ${held} governance path(s) await your approval.`,
     rejected: `${label}: REJECTED — nothing was applied; your checkout is unchanged.`,
     conflict: `${label}: CONFLICT — your checkout moved; nothing was applied.`,
     not_attempted: `${label}: not attempted — nothing was applied; your checkout is unchanged.`,
@@ -54,12 +63,36 @@ export function promotionHeadline(promotion: PromotionView, label = "Promotion")
 }
 
 /**
- * Why the promotion ended that way, in the gate's own words. The drifted paths and
- * the preserved patch are not repeated as separate lines: the gate's diagnostics
- * already name both, and a conflict's recovery hint is one of them.
+ * The pending governance patch, in the words both surfaces use (hardening plan,
+ * Phase 2). Derived from the structured {@link HeldGovernance} rather than written
+ * into the gate's diagnostics, because this is the one piece of a promotion report
+ * that is also an INSTRUCTION: the patch is the only copy of an authorized change
+ * that was deliberately not applied, and the hint has to name the base it expects so
+ * a user applying it days later knows what it was computed against.
+ */
+function heldGovernanceLines(held: HeldGovernance, indent: string): string[] {
+  return [
+    `${indent}HELD FOR YOUR APPROVAL — ${held.paths.length} governance path(s) under ` +
+      `\`${GOVERNANCE_SCOPE}\` were NOT applied: ${held.paths.join(", ")}.`,
+    `${indent}A delegated agent may not change the documents that govern the agents, so the change ` +
+      `is waiting as a patch at ${held.patchPath}.`,
+    `${indent}To apply it yourself: \`git apply ${held.patchPath}\` — it was generated against ` +
+      `${held.baseCommit}, the base captured when the delegation was staged.`,
+  ];
+}
+
+/**
+ * Why the promotion ended that way, in the gate's own words, LED by anything held
+ * for approval — a pending decision outranks an explanation of what already
+ * happened. The drifted paths and the preserved patch are not repeated as separate
+ * lines: the gate's diagnostics already name both, and a conflict's recovery hint is
+ * one of them.
  */
 export function promotionDetailLines(promotion: PromotionView, indent = "  "): string[] {
-  const lines = promotion.diagnostics.map((diagnostic) => `${indent}${diagnostic}`);
+  const lines = promotion.heldGovernance
+    ? heldGovernanceLines(promotion.heldGovernance, indent)
+    : [];
+  for (const diagnostic of promotion.diagnostics) lines.push(`${indent}${diagnostic}`);
   if (promotion.rejectedPaths.length > 0) {
     lines.push(`${indent}Unauthorized paths in the staged change: ${promotion.rejectedPaths.join(", ")}`);
   }

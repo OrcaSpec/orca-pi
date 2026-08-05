@@ -18,7 +18,12 @@ import {
   type UpstreamHandoff,
 } from "./delegation";
 import type { CapabilitySummary } from "./enforcement";
-import type { PromotionRecord, PromotionStatus, ValidatorStatus } from "./staging";
+import type {
+  HeldGovernance,
+  PromotionRecord,
+  PromotionStatus,
+  ValidatorStatus,
+} from "./staging";
 import { promotionDetailLines, promotionHeadline } from "./render";
 
 /**
@@ -90,6 +95,13 @@ export interface PersistedPromotion {
   driftedPaths: string[];
   /** Where the patch was preserved when nothing was applied; absolute. */
   patchPath?: string;
+  /**
+   * The governance change held for approval (hardening plan, Phase 2), carried
+   * through verbatim because {@link HeldGovernance} is already plain JSON. This is the
+   * one part of a promotion the steward may still have to ACT on, and the record is
+   * the only thing that remembers where the patch is once the session ends.
+   */
+  heldGovernance?: HeldGovernance;
   validations: PersistedValidatorRun[];
   /** Where preserved validator output was written; absolute. */
   validatorOutputPath?: string;
@@ -236,6 +248,11 @@ function toPersistedPromotion(promotion: PromotionRecord): PersistedPromotion {
     rejectedPaths: [...promotion.rejectedPaths],
     driftedPaths: [...promotion.driftedPaths],
     patchPath: promotion.patchPath,
+    heldGovernance: promotion.heldGovernance && {
+      patchPath: promotion.heldGovernance.patchPath,
+      paths: [...promotion.heldGovernance.paths],
+      baseCommit: promotion.heldGovernance.baseCommit,
+    },
     validations: promotion.validations.map((run) => ({
       agent: run.agent,
       program: run.program,
