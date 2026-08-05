@@ -246,6 +246,56 @@ describe("orca_delegate full lifecycle", () => {
     }
   });
 
+  it("refuses to delegate when the runtime overlay is malformed, naming the problem", async () => {
+    writeSpec("multi-owner");
+    // A misspelled field: the declared validator would silently never be configured,
+    // so the delegation is blocked rather than promoted unvalidated (Phase 4).
+    writeFileSync(
+      join(dir, ORCA_DIR, "runtime.yaml"),
+      "schema_version: 1\nvalidations:\n  web:\n    - program: npm\n      timeout: 60\n",
+    );
+    const { createSession, captured } = sessions();
+
+    const result = await run(["apps/web/app.tsx"], createSession);
+
+    expect(captured).toHaveLength(0);
+    expect(result.details?.kind).toBe("delegation_failed");
+    if (result.details?.kind !== "delegation_failed") return;
+    expect(result.details.failureKind).toBe("invalid_runtime_overlay");
+    const body = textOf(result);
+    expect(body).toContain("runtime.yaml");
+    expect(body).toContain("overlay.unknown_field");
+    expect(body).toContain("promoted unvalidated");
+    expect(existsSync(join(dir, "apps", "web", "app.tsx"))).toBe(false);
+  });
+
+  it("tells the steward which declared validator refused the promotion", async () => {
+    writeSpec("multi-owner");
+    writeFileSync(
+      join(dir, ORCA_DIR, "runtime.yaml"),
+      [
+        "schema_version: 1",
+        "validations:",
+        "  web:",
+        `    - program: ${process.execPath}`,
+        '      args: ["-e", "process.stderr.write(\'suite red\');process.exit(4);"]',
+        "      timeout_seconds: 10",
+      ].join("\n"),
+    );
+    const { createSession } = sessions();
+
+    const result = await run(["apps/web/app.tsx"], createSession);
+
+    const body = textOf(result);
+    expect(body).toContain("Promotion: REJECTED");
+    expect(body).toContain("a validator this repository declares");
+    expect(body).toContain("FAILED (exit 4)");
+    expect(body).toContain("The validator output is preserved at");
+    // The agent completed its work, and the checkout still did not change.
+    expect(body).toContain("Observed changed paths (1): apps/web/app.tsx");
+    expect(existsSync(join(dir, "apps", "web", "app.tsx"))).toBe(false);
+  });
+
   it("persists an explicit ready steward decision only after all integration audits pass", async () => {
     writeSpec("multi-owner");
     const { createSession } = sessions();

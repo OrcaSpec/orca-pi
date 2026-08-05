@@ -492,7 +492,12 @@ function delegationResult(
   return text(body, { kind: "delegation", outcome, record });
 }
 
-/** Single-owner pre-spawn build failure (required source missing / oversized). */
+/**
+ * Single-owner pre-spawn refusal: a required source is missing, the bundle is
+ * oversized, the repository cannot be staged, or its runtime overlay is unusable.
+ * The kind is named and the diagnostics are passed through verbatim, so each
+ * refusal explains itself in its own words rather than in a generic sentence.
+ */
 function delegationFailedResult(
   failureKind: DelegationFailureKind,
   diagnostics: string[],
