@@ -80,6 +80,61 @@ describe("a swept file is past the window and referenced by nothing", () => {
     expect(sweep.failures, "a clean sweep reports no failure").toEqual([]);
   });
 
+  it("keeps an artifact sitting exactly on the boundary", () => {
+    const stateRoot = makeStateRoot();
+    const onTheBoundary = evidencePatch(stateRoot, "boundary", 30);
+    const oneMoreMillisecond = artifact(stateRoot, "patches", "past.patch", 30);
+    const older = new Date(NOW - 30 * DAY_MS - 1);
+    utimesSync(oneMoreMillisecond, older, older);
+
+    const sweep = sweepPreservedArtifacts({
+      stateRoot,
+      now: NOW,
+      retainDays: 30,
+      referenced: [],
+    });
+
+    expect(sweep.removed, "the window is honored down to its last millisecond").toEqual([
+      oneMoreMillisecond,
+    ]);
+    expect(existsSync(onTheBoundary), "exactly 30 days old is not older than 30 days").toBe(true);
+  });
+
+  it("reports what it removed in a stable order", () => {
+    const stateRoot = makeStateRoot();
+    // Created in reverse so a report that echoed directory order would come out wrong on
+    // any filesystem that does not happen to enumerate alphabetically.
+    const last = evidencePatch(stateRoot, "zzz", 40);
+    const first = evidencePatch(stateRoot, "aaa", 40);
+
+    const sweep = sweepPreservedArtifacts({
+      stateRoot,
+      now: NOW,
+      retainDays: 30,
+      referenced: [],
+    });
+
+    expect(sweep.removed).toEqual([first, last]);
+    expect(sweep.removed, "the order is sorted, not whatever readdir returned").toEqual(
+      [...sweep.removed].sort(),
+    );
+  });
+
+  it("treats a state root that is not a directory as nothing to sweep", () => {
+    const stateRoot = join(makeStateRoot(), "a-file-where-the-state-root-should-be");
+    writeFileSync(stateRoot, "not a directory\n");
+
+    const sweep = sweepPreservedArtifacts({
+      stateRoot,
+      now: NOW,
+      retainDays: 30,
+      referenced: [],
+    });
+
+    expect(sweep.removed).toEqual([]);
+    expect(sweep.failures, "there is no evidence there, which is not a failure").toEqual([]);
+  });
+
   it("keeps an aged patch a retained history entry still points at", () => {
     const stateRoot = makeStateRoot();
     const referenced = evidencePatch(stateRoot, "referenced", 400);

@@ -3,7 +3,6 @@ import { join } from "node:path";
 import type { OrcaSpecDocument } from "orcaspec";
 import { readRuntimeOverlay, type RuntimeOverlayResult } from "./runtime-overlay";
 import {
-  ACCEPTED_PATCH_SUFFIX,
   EVIDENCE_PATCH_SUFFIX,
   GOVERNANCE_PATCH_SUFFIX,
   PATCHES_DIR,
@@ -91,13 +90,15 @@ interface SweptKind {
 const SWEPT_KINDS: readonly SweptKind[] = [
   {
     directory: PATCHES_DIR,
-    // The governance test comes FIRST and wins, which decides an otherwise ambiguous
-    // name: a delegation whose own id ends in `.governance` writes its cumulative
-    // patch to a file indistinguishable from another delegation's held patch. Erring
-    // toward retention costs a stale file; erring the other way deletes a proposal.
+    // One `.patch` test covers two of the three kinds, because the reusable accepted
+    // patch's suffix ENDS in the evidence one (`ACCEPTED_PATCH_SUFFIX`); spelling
+    // it out again would be a clause that cannot change the answer. The third kind is
+    // the carve-out, and it is tested first so it wins an otherwise ambiguous name: a
+    // delegation whose own id ends in `.governance` writes its cumulative patch to a
+    // file indistinguishable from another delegation's held patch. Erring toward
+    // retention costs a stale file; erring the other way deletes a proposal.
     expires: (name) =>
-      !name.endsWith(GOVERNANCE_PATCH_SUFFIX) &&
-      (name.endsWith(EVIDENCE_PATCH_SUFFIX) || name.endsWith(ACCEPTED_PATCH_SUFFIX)),
+      !name.endsWith(GOVERNANCE_PATCH_SUFFIX) && name.endsWith(EVIDENCE_PATCH_SUFFIX),
   },
   {
     directory: VALIDATOR_OUTPUT_DIR,
@@ -175,7 +176,10 @@ export function sweepPreservedArtifacts(input: RetentionSweepInput): RetentionSw
         // `unlink` would remove only the link, deciding its fate from another file's
         // timestamp is not a decision retention should be making.
         const stat = lstatSync(path);
-        if (!stat.isFile() || stat.mtimeMs > cutoff) continue;
+        // `>=` RETAINS the boundary: an artifact exactly `retainDays` old has not been
+        // kept for longer than the window, and a window is a promise about how long
+        // evidence survives, so it is honored down to its final millisecond.
+        if (!stat.isFile() || stat.mtimeMs >= cutoff) continue;
         unlinkSync(path);
         removed.push(path);
       } catch (error) {
