@@ -27,6 +27,7 @@ import {
 import { RouteLog } from "./src/routelog";
 import { ViolationLog } from "./src/violations";
 import {
+  classifyBrokenSpec,
   classifyDiscovery,
   classifyWrite,
   type DiscoveryTarget,
@@ -35,7 +36,7 @@ import {
   type GovernedTool,
   type GovernedWriteTool,
 } from "./src/governance";
-import { composeStewardPrompt } from "./src/steward";
+import { composeBrokenSpecNote, composeStewardPrompt } from "./src/steward";
 import type {
   DelegationProgress,
   DelegationSession,
@@ -47,11 +48,17 @@ import {
 } from "./src/session-runner";
 import { formatEnforcementSummary } from "./src/enforcement";
 import {
+  APPROVAL_ENTRY_TYPE,
   DELEGATION_ENTRY_TYPE,
   DelegationHistory,
   renderRecordLines,
+  toPersistedApproval,
   type PersistedDelegationRecord,
+  type PersistedGovernanceApproval,
 } from "./src/delegation-entry";
+import { approvalRecordLines, runApprovalAction } from "./src/approval";
+import { retentionSweepLine, runRetentionSweep, type RetentionSweep } from "./src/retention";
+import { defaultStateRoot } from "./src/staging";
 import {
   inflightFromProgress,
   progressLine,
@@ -85,13 +92,19 @@ import { linesComponent } from "./src/tui";
  * - **Steward identity**: `before_agent_start` appends a root-first trusted
  *   system-prompt block (`steward.ts`) — role, mode, discovery scope, delegation
  *   directive, four-state context — appended to pi's own prompt, never replacing it.
+ *   A broken spec gets the short fail-closed note instead.
  * - **Tool surface**: the steward gains `orca_delegate` (full lifecycle — statuses,
  *   scope expansion, multi-owner splits, unowned handling, cancellation). The
  *   parent session never receives `orca_checkpoint`.
  *
- * Governance activates ONLY in the `active` state; unmanaged and blocked
- * repositories see zero interception (every handler returns early), preserving
- * normal pi behavior. Handlers are registered once in the factory body, so the
+ * Only the `unmanaged` state (no `.orca/orca.yaml` at all) sees zero interception,
+ * preserving normal pi behavior. A spec that is present but unusable
+ * (`invalid_spec`, `unsupported_spec_version`) FAILS CLOSED: `write`/`edit` are
+ * blocked with the state's diagnostics and `orca_delegate` is unavailable in both
+ * modes, while discovery reads proceed so the document can be inspected and fixed
+ * (ADR 0028; `classifyBrokenSpec` in `governance.ts`).
+ *
+ * Handlers are registered once in the factory body, so the
  * `/reload` flow (which rebuilds a fresh extension instance) cannot accumulate
  * duplicate handlers or double-govern a call.
  */
@@ -103,6 +116,12 @@ import { linesComponent } from "./src/tui";
  */
 export interface OrcaOverrides {
   createSession?: (config: DelegationSessionConfig) => Promise<DelegationSession>;
+  /**
+   * Root of the runtime state directory for delegation staging worktrees and
+   * preserved patches. Defaults to pi's agent directory (`staging.ts`); the
+   * offline suite points it at a temp directory so a test never writes there.
+   */
+  stateRoot?: string;
 }
 
 export default function orcaPi(pi: ExtensionAPI): void {
@@ -133,6 +152,11 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
 
   // The in-flight delegation for the live status widget; undefined when idle.
   let inflight: InflightDelegation | undefined;
+
+  // What the last activation-time retention sweep did (hardening plan, Phase 6), kept
+  // only so `/orca` can say so in one line. Undefined until a sweep has run, and
+  // undefined again on a session start that did not sweep.
+  let lastSweep: RetentionSweep | undefined;
 
   // Advisory flags awaiting their tool_result, keyed by toolCallId. A flagged
   // (not blocked) call proceeds; when its result arrives we append the
@@ -178,12 +202,23 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
    */
   const composeStatusLines = (state: RepositoryState): string[] => {
     const lines = [...formatStatusLines(state)];
-    if (state.kind === "active") lines.push("", ...formatEnforcementSummary());
+    // Profile 1.1: the delegated bash tool reconciles retained effects and every
+    // staged change passes the promotion gate, so 1.1 is what this runtime
+    // actually enforces. Rendering the historical 1.0 profile would claim
+    // promotion gating is "not applicable" while it is gating every delegation.
+    if (state.kind === "active") lines.push("", ...formatEnforcementSummary("1.1"));
     const sections = [
+      // A held governance change leads every other section: it is the one thing in the
+      // status surface that is waiting on the user to act, and the numbered list it prints
+      // is the list `/orca approve [n]` counts through (hardening plan, Phase 3).
+      history.pendingHoldLines(),
       routeLog.statusLines(),
       violations.statusLines(),
       history.statusLines(),
       history.lastDetailLines(),
+      // Housekeeping goes last and usually says nothing at all: the sweep is silent
+      // unless it actually expired something or could not do its job (`retention.ts`).
+      [retentionSweepLine(lastSweep)].filter((line): line is string => line !== undefined),
     ];
     for (const section of sections) if (section.length > 0) lines.push("", ...section);
     return lines;
@@ -296,6 +331,32 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
     // Passive detection for every start reason; the governance handlers below
     // activate independently and only when active.
     const state = currentState(ctx);
+
+    // Opportunistic evidence retention (hardening plan, Phase 6). Activation is the ONE
+    // hook, for two reasons that both matter. The reference set is complete and freshly
+    // known here and nowhere else — the history was rebuilt from session entries in the
+    // statement above — and no delegation is in flight, which makes "a sweep failure
+    // never blocks a delegation" a fact about where this is called from rather than a
+    // promise about how carefully it handles errors. Hooking delegation completion too
+    // would put filesystem work on the promotion path to collect nothing: the artifacts
+    // a delegation just wrote are the newest files in the directory, so the next
+    // activation reclaims anything genuinely expired just as well.
+    //
+    // Only under an active spec, because the window is configured in the runtime overlay
+    // and an overlay is only interpretable against the document it governs. A broken
+    // spec refuses every delegation anyway, so nothing accumulates while it sweeps
+    // nothing — the same fail-closed reading the invalid-overlay case takes.
+    lastSweep =
+      state.kind === "active"
+        ? runRetentionSweep({
+            cwd: state.cwd,
+            document: state.document,
+            stateRoot: overrides.stateRoot ?? defaultStateRoot(),
+            now: Date.now(),
+            referenced: history.referencedArtifacts(),
+          })
+        : undefined;
+
     const surface = new Surface(ctx);
     surface.status(shortStatus(state));
     surface.widget(
@@ -317,17 +378,50 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
     }
   });
 
-  // Steward governance. Runs on every parent tool call but returns immediately
-  // unless the repository is under active governance — unmanaged and blocked
-  // states get zero interception, preserving normal pi behavior.
+  // Steward governance. Runs on every parent tool call. Only `unmanaged` (no spec
+  // at all) gets zero interception; a spec that is present but broken fails closed
+  // (see below), and `active` runs the full decision matrix.
   pi.on("tool_call", async (event, ctx): Promise<ToolCallEventResult | undefined> => {
     const state = detectRepositoryState(ctx.cwd, requestedMode);
-    if (state.kind !== "active") return undefined;
-    const { document, effectiveMode } = state;
+    if (state.kind === "unmanaged") return undefined;
 
     let write: { tool: GovernedWriteTool; raw: string } | undefined;
     if (isToolCallEventType("write", event)) write = { tool: "write", raw: event.input.path };
     else if (isToolCallEventType("edit", event)) write = { tool: "edit", raw: event.input.path };
+
+    let read: { tool: GovernedReadTool; raw: string | undefined } | undefined;
+    if (isToolCallEventType("read", event)) read = { tool: "read", raw: event.input.path };
+    else if (isToolCallEventType("grep", event)) read = { tool: "grep", raw: event.input.path };
+    else if (isToolCallEventType("find", event)) read = { tool: "find", raw: event.input.path };
+    else if (isToolCallEventType("ls", event)) read = { tool: "ls", raw: event.input.path };
+
+    const governed = write ?? read;
+    if (!governed) return undefined;
+
+    // A present but unusable spec (invalid_spec / unsupported_spec_version) fails
+    // closed regardless of the requested mode: writes are blocked with the state's
+    // diagnostics, discovery reads proceed so the user can fix the document
+    // (ADR 0028). The recorded mode is the requested one — there is no effective
+    // mode without a validated spec, and the block does not depend on it.
+    //
+    // A read is reduced to its real target first, exactly as under an active spec,
+    // so the protected read denies salvaged from the unusable document are checked
+    // against the path a symlink actually resolves onto (Phase 4). A write needs no
+    // target: it is blocked whatever it points at.
+    if (state.kind !== "active") {
+      const target = read ? resolveDiscoveryTarget(read.raw, ctx.cwd) : null;
+      const decision = classifyBrokenSpec(state, governed.tool, target);
+      return applyDecision(
+        ctx,
+        event.toolCallId,
+        governed.tool,
+        displayOf(governed.raw),
+        requestedMode,
+        decision,
+      );
+    }
+
+    const { document, effectiveMode } = state;
     if (write) {
       const norm = normalizeTarget(write.raw, ctx.cwd);
       const decision = classifyWrite(document, effectiveMode, norm.ok ? norm.path : null);
@@ -341,11 +435,6 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
       );
     }
 
-    let read: { tool: GovernedReadTool; raw: string | undefined } | undefined;
-    if (isToolCallEventType("read", event)) read = { tool: "read", raw: event.input.path };
-    else if (isToolCallEventType("grep", event)) read = { tool: "grep", raw: event.input.path };
-    else if (isToolCallEventType("find", event)) read = { tool: "find", raw: event.input.path };
-    else if (isToolCallEventType("ls", event)) read = { tool: "ls", raw: event.input.path };
     if (read) {
       const target = resolveDiscoveryTarget(read.raw, ctx.cwd);
       const decision = classifyDiscovery(document, effectiveMode, target);
@@ -374,18 +463,47 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
   });
 
   // Steward identity: append the root-first trusted governance block to pi's
-  // system prompt, only while active. Absent in unmanaged and blocked states.
+  // system prompt while active, or the short broken-spec note when the spec is
+  // present but unusable, so the session knows writes are blocked and why. Absent
+  // only in the unmanaged state.
   pi.on("before_agent_start", async (event, ctx) => {
     const state = detectRepositoryState(ctx.cwd, requestedMode);
-    if (state.kind !== "active") return undefined;
-    return { systemPrompt: `${event.systemPrompt}\n\n${composeStewardPrompt(state)}` };
+    if (state.kind === "unmanaged") return undefined;
+    const block =
+      state.kind === "active" ? composeStewardPrompt(state) : composeBrokenSpecNote(state);
+    return { systemPrompt: `${event.systemPrompt}\n\n${block}` };
   });
 
   pi.registerCommand("orca", {
     description:
-      "Show Orca governance status, or set the requested mode: /orca mode advisory|enforce",
+      "Show Orca governance status, set the requested mode (/orca mode advisory|enforce), or land a " +
+      "held governance change (/orca approve [n])",
     handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
       const [subcommand, ...rest] = args.trim().split(/\s+/).filter(Boolean);
+
+      // The explicit approval action (hardening plan, Phase 3): the ONLY runtime path
+      // from a held governance patch to the user's checkout, and deliberately a COMMAND
+      // rather than a tool — a tool would let the agent whose change was held approve it.
+      //
+      // The whole remainder is the selector, not just the first word, so a patch path
+      // containing a space still addresses its hold.
+      if (subcommand === "approve") {
+        const result = runApprovalAction({
+          cwd: ctx.cwd,
+          selector: rest.length > 0 ? rest.join(" ") : undefined,
+          holds: history.holds(),
+          now: Date.now(),
+        });
+        // Every attempt that reached git is persisted, refusals included: the decision (or
+        // the failed decision) belongs to the durable trail, and the history rebuild reads
+        // exactly these back. A selector that matched nothing produced no attempt.
+        if (result.approval) {
+          pi.appendEntry(APPROVAL_ENTRY_TYPE, toPersistedApproval(result.approval));
+          history.recordApproval(result.approval);
+        }
+        new Surface(ctx).notify(result.lines.join("\n"), result.level);
+        return;
+      }
 
       if (subcommand === "mode") {
         const requested = rest[0];
@@ -418,7 +536,18 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
   // sole record of prior delegations. The renderer is pure over `entry.data`.
   pi.registerEntryRenderer<PersistedDelegationRecord>(DELEGATION_ENTRY_TYPE, (entry) => {
     const record = entry.data;
-    return record ? linesComponent(renderRecordLines(record)) : undefined;
+    // The approval is layered on from the live history rather than read off the entry: the
+    // delegation entry was written before the user decided, and the decision is its own
+    // entry (hardening plan, Phase 3).
+    return record
+      ? linesComponent(renderRecordLines(record, history.approvalFor(record)))
+      : undefined;
+  });
+
+  // The user's decision about a held governance change, rendered where they made it.
+  pi.registerEntryRenderer<PersistedGovernanceApproval>(APPROVAL_ENTRY_TYPE, (entry) => {
+    const approval = entry.data;
+    return approval ? linesComponent(approvalRecordLines(approval)) : undefined;
   });
 
   pi.registerTool(createResolveTool(toolDeps));
@@ -428,6 +557,7 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
       ...toolDeps,
       getThinkingLevel: () => parentThinkingLevel,
       createSession,
+      stateRoot: overrides.stateRoot,
       onDelegation: (entry) =>
         routeLog.record(
           `delegated ${entry.owner}: ${entry.status}, ${entry.changedPaths.length} changed path(s)`,

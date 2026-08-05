@@ -1,10 +1,10 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as orcaspec from "orcaspec";
 import type { Model } from "@earendil-works/pi-ai";
 import { resolve } from "../src/resolver";
+import { makeGitRepo, makeStateRoot } from "./git-fixture";
 import {
   buildIntegrationRecord,
   runDelegationSequence,
@@ -22,6 +22,7 @@ import {
   parseDelegationEntry,
   recordSummaryLine,
   renderRecordLines,
+  type PersistedPromotion,
   type PersistedDelegationRecord,
 } from "../src/delegation-entry";
 
@@ -81,16 +82,19 @@ function orderedFor(cwd: string, paths: string[]): DelegationInputs[] {
 
 describe("delegation record: build, digest, round-trip", () => {
   let dir: string;
+  let stateRoot: string;
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "orca-pi-entry-"));
+    dir = makeGitRepo("orca-pi-entry-");
+    stateRoot = makeStateRoot();
   });
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
   });
 
   async function buildRecord(paths: string[], usage: Record<string, DelegationUsage> = {}) {
     const ordered = orderedFor(dir, paths);
-    const sequence = await runDelegationSequence(ordered, { createSession: completingSessions(usage) });
+    const sequence = await runDelegationSequence(ordered, { createSession: completingSessions(usage), stateRoot });
     return buildDelegationRecord({
       task: "align the buttons and bill for it",
       targets: paths,
@@ -186,16 +190,19 @@ describe("delegation record: build, digest, round-trip", () => {
 
 describe("DelegationHistory rebuild from entries alone", () => {
   let dir: string;
+  let stateRoot: string;
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "orca-pi-hist-"));
+    dir = makeGitRepo("orca-pi-hist-");
+    stateRoot = makeStateRoot();
   });
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
   });
 
   async function record(paths: string[]): Promise<PersistedDelegationRecord> {
     const ordered = orderedFor(dir, paths);
-    const sequence = await runDelegationSequence(ordered, { createSession: completingSessions() });
+    const sequence = await runDelegationSequence(ordered, { createSession: completingSessions(), stateRoot });
     return buildDelegationRecord({
       task: `task for ${paths.join("+")}`,
       targets: paths,
@@ -225,7 +232,10 @@ describe("DelegationHistory rebuild from entries alone", () => {
     const history = new DelegationHistory();
     history.rebuildFrom(branch);
     expect(history.count()).toBe(2);
-    expect(history.all().map(recordSummaryLine)).toEqual([recordSummaryLine(a), recordSummaryLine(b)]);
+    expect(history.all().map((entry) => recordSummaryLine(entry))).toEqual([
+      recordSummaryLine(a),
+      recordSummaryLine(b),
+    ]);
   });
 
   it("a resumed session displays prior history from entries ONLY (fresh in-memory state)", async () => {
@@ -249,19 +259,140 @@ describe("DelegationHistory rebuild from entries alone", () => {
   });
 });
 
-describe("renderRecordLines (transcript + last-delegation detail)", () => {
+describe("the promotion a record carries (staged-promotion plan, Phase 5)", () => {
   let dir: string;
+  let stateRoot: string;
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "orca-pi-render-"));
+    dir = makeGitRepo("orca-pi-promo-");
+    stateRoot = makeStateRoot();
   });
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  async function recordFor(
+    paths: string[],
+    createSession: Parameters<typeof runDelegationSequence>[1]["createSession"],
+  ): Promise<PersistedDelegationRecord> {
+    const ordered = orderedFor(dir, paths);
+    const sequence = await runDelegationSequence(ordered, { createSession, stateRoot });
+    return buildDelegationRecord({
+      task: "align the buttons and bill for it",
+      targets: paths,
+      grantDigest: digestGrants(ordered.map((input) => input.grant)),
+      sequence,
+      startedAt: 1,
+      endedAt: 2,
+    });
+  }
+
+  it("records what reached the user's files, so a resumed session can still say", async () => {
+    const record = await recordFor(["apps/web/app.tsx"], completingSessions());
+
+    expect(record.promotion).toMatchObject({
+      status: "promoted",
+      appliedPaths: [],
+      driftedPaths: [],
+    });
+    expect(JSON.parse(JSON.stringify(record))).toEqual(record);
+  });
+
+  it("carries a conflict's drifted paths, patch pointer, and recovery hint", async () => {
+    // The user edits their own uncommitted file while the delegation runs.
+    writeFileSync(join(dir, "notes.md"), "my uncommitted draft\n");
+    const record = await recordFor(["apps/web/app.tsx"], async (config) => ({
+      prompt: async () => {
+        writeFileSync(join(dir, "notes.md"), "my uncommitted draft, revised\n");
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "delegated\n" });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      },
+      abort: () => {},
+    }));
+
+    expect(record.promotion).toMatchObject({
+      status: "conflict",
+      appliedPaths: [],
+      driftedPaths: ["notes.md"],
+    });
+    const patchPath = record.promotion!.patchPath!;
+    expect(existsSync(patchPath)).toBe(true);
+    // The durable record survives the session, and so must the route back to the work:
+    // it round-trips as plain JSON and still names the patch and how to apply it.
+    const persisted = JSON.parse(JSON.stringify(record)) as PersistedDelegationRecord;
+    expect(persisted.promotion).toEqual(record.promotion);
+    expect(persisted.promotion!.diagnostics.join("\n")).toContain(`git apply ${patchPath}`);
+  });
+
+  it("shows a conflict in the `/orca` history rather than letting it read as success", async () => {
+    writeFileSync(join(dir, "notes.md"), "my uncommitted draft\n");
+    const record = await recordFor(["apps/web/app.tsx"], async (config) => ({
+      prompt: async () => {
+        writeFileSync(join(dir, "notes.md"), "my uncommitted draft, revised\n");
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "delegated\n" });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      },
+      abort: () => {},
+    }));
+
+    // Rebuilt from the persisted entry alone, exactly as a resumed session does.
+    const history = new DelegationHistory();
+    history.rebuildFrom([
+      { type: "custom", customType: DELEGATION_ENTRY_TYPE, data: JSON.parse(JSON.stringify(record)) },
+    ]);
+
+    // The compact line cannot read as a success: the owner completed and nothing landed.
+    const summary = history.statusLines().join("\n");
+    expect(summary).toContain("web=completed");
+    expect(summary).toContain("promotion: conflict");
+    // The detail names the drift, the preserved patch, and the way back to the work.
+    const detail = history.lastDetailLines().join("\n");
+    expect(detail).toContain("CONFLICT");
+    expect(detail).toContain("notes.md");
+    expect(detail).toContain(record.promotion!.patchPath!);
+    expect(detail).toMatch(/git apply /);
+  });
+
+  it("keeps a record from before promotions were persisted renderable", () => {
+    const legacy: PersistedDelegationRecord = {
+      v: DELEGATION_ENTRY_VERSION,
+      task: "an older delegation",
+      owners: ["web"],
+      targets: ["apps/web/app.tsx"],
+      grantDigest: "abc123",
+      steps: [
+        { owner: "web", status: "completed", summary: "done", changedPaths: ["apps/web/app.tsx"] },
+      ],
+      usage: usageOf(0, 0),
+      startedAt: 1,
+      endedAt: 2,
+    };
+
+    // No promotion field at all: the history says nothing about promotion rather than
+    // inventing a status for a delegation that never recorded one.
+    const rendered = renderRecordLines(legacy).join("\n");
+    expect(rendered).not.toMatch(/Promotion/);
+    expect(recordSummaryLine(legacy)).not.toMatch(/promotion/);
+  });
+});
+
+describe("renderRecordLines (transcript + last-delegation detail)", () => {
+  let dir: string;
+  let stateRoot: string;
+  beforeEach(() => {
+    dir = makeGitRepo("orca-pi-render-");
+    stateRoot = makeStateRoot();
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
   });
 
   it("renders checkpoint outcome, capability summary, bash activity (labelled), and usage", async () => {
     const ordered = orderedFor(dir, ["apps/web/app.tsx"]);
     const sequence = await runDelegationSequence(ordered, {
       createSession: completingSessions({ web: usageOf(1234, 0.0456) }),
+      stateRoot,
     });
     const record = buildDelegationRecord({
       task: "restyle the primary button",
@@ -297,6 +428,7 @@ describe("renderRecordLines (transcript + last-delegation detail)", () => {
         },
         abort: () => {},
       }),
+      stateRoot,
     });
     const integration = buildIntegrationRecord(sequence, dir, {
       status: "stopped",
@@ -329,5 +461,109 @@ describe("renderRecordLines (transcript + last-delegation detail)", () => {
     expect(text).toContain(
       "Repeated validation/investigation: inspect provider aliases [billing, web]",
     );
+  });
+});
+
+/**
+ * What "a retained delegation entry references this file" means concretely (hardening
+ * plan, Phase 6). Retention deletes files, so this projection is the whole safety
+ * property: every artifact path any VISIBLE history entry can print has to come out of
+ * it, or a sweep can leave the `/orca` surface pointing at a file that is gone.
+ *
+ * Plain record literals rather than real delegations here, deliberately: no single
+ * delegation produces all four artifact pointers at once — a hold and a `needs_scope`
+ * reusable patch are mutually exclusive outcomes — and the record is plain JSON, so the
+ * literal IS the real collaborator.
+ */
+describe("the artifacts a retained history entry points at", () => {
+  function recordWith(promotion: Partial<PersistedPromotion>): PersistedDelegationRecord {
+    return {
+      v: DELEGATION_ENTRY_VERSION,
+      task: "widen the billing scope",
+      owners: ["billing"],
+      targets: ["services/billing/x.rb"],
+      grantDigest: "abc123",
+      steps: [],
+      usage: { available: false, totalTokens: 0, costUsd: 0 } as DelegationUsage,
+      startedAt: 1,
+      endedAt: 2,
+      promotion: {
+        status: "conflict",
+        appliedPaths: [],
+        rejectedPaths: [],
+        driftedPaths: [],
+        validations: [],
+        diagnostics: [],
+        ...promotion,
+      },
+    };
+  }
+
+  it("collects every artifact pointer one record carries", () => {
+    const history = new DelegationHistory();
+    history.add(
+      recordWith({
+        patchPath: "/state/patches/seq.patch",
+        validatorOutputPath: "/state/validators/seq.log",
+        heldGovernance: { patchPath: "/state/patches/seq.governance.patch", paths: [".orca/orca.yaml"], baseCommit: "aaa" },
+        acceptedWork: {
+          patchPath: "/state/patches/seq.accepted.patch",
+          paths: ["services/billing/x.rb"],
+          owners: ["billing"],
+          baseCommit: "aaa",
+          excludedGovernancePaths: [],
+        },
+      }),
+    );
+
+    expect(history.referencedArtifacts(), "all four artifact kinds are pointed at").toEqual([
+      "/state/patches/seq.accepted.patch",
+      "/state/patches/seq.governance.patch",
+      "/state/patches/seq.patch",
+      "/state/validators/seq.log",
+    ]);
+  });
+
+  it("counts a patch an approval entry references even with no delegation record", () => {
+    const history = new DelegationHistory();
+    history.recordApproval({
+      patchPath: "/state/patches/settled.governance.patch",
+      paths: [".orca/runtime.yaml"],
+      outcome: "applied",
+      at: 10,
+    });
+
+    expect(
+      history.referencedArtifacts(),
+      "an approval is the record of what was landed and names its patch",
+    ).toEqual(["/state/patches/settled.governance.patch"]);
+  });
+
+  it("says nothing about a record written before promotions were persisted", () => {
+    const history = new DelegationHistory();
+    const legacy = recordWith({});
+    delete legacy.promotion;
+    history.add(legacy);
+
+    expect(history.referencedArtifacts(), "a record with no promotion points at nothing").toEqual(
+      [],
+    );
+  });
+
+  it("drops the artifacts of a record evicted past the history's capacity", () => {
+    // The boundary of "retained": the history keeps a bounded number of records and
+    // every surface — the summary list, the last-delegation detail, the pending-hold
+    // list — reads that bounded set. A record beyond it can no longer print a pointer,
+    // so its orphaned artifacts are exactly what age is allowed to reclaim.
+    const history = new DelegationHistory(2);
+    history.add(recordWith({ patchPath: "/state/patches/first.patch" }));
+    history.add(recordWith({ patchPath: "/state/patches/second.patch" }));
+    history.add(recordWith({ patchPath: "/state/patches/third.patch" }));
+
+    expect(history.count(), "the capacity is what bounds retention").toBe(2);
+    expect(history.referencedArtifacts(), "the evicted record's patch is an orphan now").toEqual([
+      "/state/patches/second.patch",
+      "/state/patches/third.patch",
+    ]);
   });
 });

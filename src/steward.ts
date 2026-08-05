@@ -1,4 +1,6 @@
-import type { ActiveState } from "./state";
+import { formatDiagnostic } from "./diagnostics";
+import { describeProtectionSalvage } from "./salvage";
+import type { ActiveState, BrokenSpecState } from "./state";
 
 /**
  * Compose the steward's trusted system-prompt addition, root-first (ADR 0051,
@@ -18,6 +20,10 @@ import type { ActiveState } from "./state";
  * {@link composeStewardPrompt} returns headed sections in a fixed order;
  * {@link STEWARD_SECTIONS} names them so tests can assert the root-first
  * sequence without pinning prose.
+ *
+ * A broken spec gets {@link composeBrokenSpecNote} instead — deliberately short,
+ * because none of the sections above can be stated truthfully when the ownership
+ * map failed to validate. It tells the session what is blocked and how to fix it.
  */
 
 /** Section headings in their root-first order, for composition and tests. */
@@ -41,6 +47,51 @@ function sourceList(sources: { required?: string[]; optional?: string[] } | unde
   if (required.length > 0) parts.push(`required: ${required.join(", ")}`);
   if (optional.length > 0) parts.push(`optional: ${optional.join(", ")}`);
   return parts.join("; ");
+}
+
+/** Heading of the broken-spec note, so tests can find it without pinning prose. */
+export const BROKEN_SPEC_SECTION = "## Orca governance blocked (broken spec)";
+
+/**
+ * The short trusted note injected while the spec is present but unusable
+ * (`invalid_spec` / `unsupported_spec_version`, ADR 0028). Governance fails closed
+ * in these states, so the session must know four things and nothing more: writes
+ * and delegation are blocked in both modes, discovery reads still work, which
+ * read-protection regime is in force, and where the problem is. None of the
+ * active-governance sections apply — there is no validated ownership map,
+ * discovery scope, or agent list to describe.
+ *
+ * The regime line is rendered from the state's own salvage record through the same
+ * {@link describeProtectionSalvage} that `/orca` status and the block reasons use,
+ * so the session is never told something the enforcement contradicts.
+ */
+export function composeBrokenSpecNote(state: BrokenSpecState): string {
+  const problem =
+    state.kind === "unsupported_spec_version"
+      ? `declares spec_version '${state.foundVersion}', but this runtime supports '${state.supportedVersion}'`
+      : "failed validation";
+  const first = state.diagnostics[0];
+  const rest = state.diagnostics.length - 1;
+  const salvaged = state.protections.kind === "enforcing";
+
+  return [
+    BROKEN_SPEC_SECTION,
+    `This repository is under Orca governance, but \`${state.specPath}\` ${problem} — the repository ` +
+      `state is '${state.kind}'. Orca fails closed here: your write and edit tools are BLOCKED, and ` +
+      "orca_delegate is unavailable, in advisory and enforce modes alike. There is no validated " +
+      "ownership map, so no write can be authorized (ADR 0028).",
+    `Your read, grep, find, and ls tools still work${salvaged ? ", minus the protected paths named below" : ", unscoped"}, so you can inspect the document and ` +
+      "explain the problem. Tell the user what is wrong and how to fix the spec; do not attempt to " +
+      "work around the block, and do not claim the repository is ungoverned.",
+    describeProtectionSalvage(state.protections) +
+      (salvaged
+        ? " Do not try to read around them; they are the one thing still enforced from the document."
+        : ""),
+    first
+      ? `First diagnostic${rest > 0 ? ` (of ${state.diagnostics.length})` : ""}: ${formatDiagnostic(first)}` +
+        (rest > 0 ? " — `/orca` lists them all." : "")
+      : "No diagnostics were reported; inspect the document directly.",
+  ].join("\n");
 }
 
 export function composeStewardPrompt(state: ActiveState): string {

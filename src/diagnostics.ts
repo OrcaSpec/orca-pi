@@ -7,8 +7,16 @@
  * activates no governance (ADR 0028).
  */
 
-/** Which validation stage produced a diagnostic. */
-export type DiagnosticPhase = "yaml" | "structural" | "semantic";
+/**
+ * Which validation stage produced a diagnostic. `yaml`, `structural`, and
+ * `semantic` are the OrcaSpec load phases; `overlay` is Orca's own runtime
+ * overlay (`.orca/runtime.yaml`, see `runtime-overlay.ts`), which is not part of
+ * OrcaSpec and therefore carries its own `overlay.*` reason codes; `salvage` is
+ * the best-effort recovery of protected read denies from an already-unusable
+ * document (see `salvage.ts`), whose `salvage.*` codes report what could not be
+ * recovered rather than why the document is invalid.
+ */
+export type DiagnosticPhase = "yaml" | "structural" | "semantic" | "overlay" | "salvage";
 
 /**
  * A single actionable validation problem.
@@ -41,4 +49,21 @@ export interface Diagnostic {
   path?: string;
   /** Extra structured detail (e.g. the duplicated id or conflicting scope). */
   detail?: Record<string, unknown>;
+}
+
+/**
+ * One diagnostic as a single readable line: `[reason] at location: message`, with
+ * the location omitted when the problem cannot be anchored to a node. Shared by
+ * every surface that shows diagnostics — `/orca` status, the broken-spec block
+ * reason, and the steward note — so a user reading a block message and a user
+ * reading `/orca` see the same text for the same problem.
+ */
+export function formatDiagnostic(diagnostic: Diagnostic): string {
+  const location =
+    diagnostic.pointer !== undefined && diagnostic.pointer !== ""
+      ? ` at ${diagnostic.pointer}`
+      : diagnostic.path
+        ? ` at ${diagnostic.path}`
+        : "";
+  return `[${diagnostic.reason}]${location}: ${diagnostic.message}`;
 }

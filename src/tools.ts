@@ -10,7 +10,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { normalizeTarget } from "./paths";
 import { resolve, resolveEffective, type Resolution } from "./resolver";
-import { renderExplain, renderResolvePreview, summarizeResolution } from "./render";
+import {
+  promotionDetailLines,
+  promotionHeadline,
+  renderExplain,
+  renderResolvePreview,
+  summarizeResolution,
+} from "./render";
 import { formatStatusLines, type ActiveState, type RepositoryState } from "./state";
 import type { OperatingMode } from "./mode";
 import type { CheckpointStatus } from "./checkpoint";
@@ -28,8 +34,10 @@ import {
   type DelegationSessionConfig,
   type SequenceOutcome,
   type OwnerAssignment,
+  type RunFailureKind,
   type StewardDecisionRequest,
 } from "./delegation";
+import type { PromotionRecord } from "./staging";
 import {
   buildDelegationRecord,
   digestGrants,
@@ -67,7 +75,7 @@ const paramsSchema = Type.Object(
 type ToolParams = Static<typeof paramsSchema>;
 
 /** Pre-spawn delegation failure kinds surfaced to the steward. */
-export type DelegationFailureKind = "unknown_owner" | "required_missing" | "oversized";
+export type DelegationFailureKind = RunFailureKind;
 
 /** Structured details attached to a tool result for logs / UI. */
 export type ResolveToolDetails =
@@ -128,13 +136,24 @@ function text(body: string, details: ResolveToolDetails): AgentToolResult<Resolv
   return { content: [{ type: "text", text: body }], details };
 }
 
+/**
+ * The result when governance is not active. `unmanaged` is simply nothing to route
+ * against; a broken spec is a BLOCK — the same fail-closed decision the `tool_call`
+ * handler applies to a direct write (ADR 0028) — so it leads with that rather than
+ * with unavailability, and the delegation never spawns a session. Either way the
+ * full status lines follow, so the reason and `/orca` agree.
+ */
 function inactiveResult(state: RepositoryState): AgentToolResult<ResolveToolDetails> {
-  const body = [
-    "Orca routing is unavailable: the repository is not under active governance.",
-    "",
-    ...formatStatusLines(state),
-  ].join("\n");
-  return text(body, { kind: "inactive", state: state.kind });
+  const lead =
+    state.kind === "unmanaged"
+      ? "Orca routing is unavailable: the repository is not under active governance."
+      : `Orca blocked this call: the OrcaSpec document is present but unusable (${state.kind}), so no ` +
+        "owner can be resolved and no write can be authorized. Delegation is blocked in advisory and " +
+        "enforce modes alike; discovery reads still work, so read the spec and report what is wrong.";
+  return text([lead, "", ...formatStatusLines(state)].join("\n"), {
+    kind: "inactive",
+    state: state.kind,
+  });
 }
 
 function invalidResult(
@@ -325,6 +344,11 @@ export interface DelegateDeps extends ToolDeps {
    * is ALSO streamed into the tool's `onUpdate` for the TUI regardless of this.
    */
   onProgress?: (progress: DelegationProgress, ctx: ExtensionContext) => void;
+  /**
+   * Root of the runtime state directory holding each delegation sequence's shared
+   * staging worktree and any preserved patch. Defaults to pi's agent directory.
+   */
+  stateRoot?: string;
 }
 
 /** The observed-manifest line shared by every checkpoint rendering. */
@@ -332,6 +356,25 @@ function manifestLine(paths: string[]): string {
   return paths.length > 0
     ? `Observed changed paths (${paths.length}): ${paths.join(", ")}`
     : "Observed changed paths: (none).";
+}
+
+/**
+ * What actually reached the user's files. The delegation ran in a staging
+ * worktree, so "the agent changed X" and "X changed in your checkout" are
+ * different claims: these lines are the second one, and they name the preserved
+ * patch whenever the staged change did not land, so nothing is quietly lost.
+ *
+ * A sequence promotes ONCE, so its promotion is reported once under its own label;
+ * a step inside a sequence shows only the headline of its share, because the
+ * diagnostics belong to the sequence and would otherwise repeat per owner.
+ */
+function promotionLines(
+  promotion: PromotionRecord,
+  options: { label?: string; detail?: boolean } = {},
+): string[] {
+  const lines = [promotionHeadline(promotion, options.label)];
+  if (options.detail === false) return lines;
+  return [...lines, ...promotionDetailLines(promotion)];
 }
 
 /**
@@ -365,8 +408,10 @@ function scopeExpansionGuidance(outcome: DelegationOutcome): string[] {
  * statuses reads distinctly and actionably: `needs_scope` shows the scope request
  * and the re-delegation recipe; `blocked`/`failed` lead with the summary and any
  * remaining risks alongside the manifest of whatever was already changed.
+ * `promotionDetail` is off inside a sequence, whose one promotion is reported in
+ * the sequence block instead.
  */
-function checkpointBody(outcome: DelegationOutcome): string[] {
+function checkpointBody(outcome: DelegationOutcome, promotionDetail = true): string[] {
   const cp = outcome.checkpoint;
   const synth = cp.synthesized
     ? " (synthesized — the session ended without calling orca_checkpoint)"
@@ -378,6 +423,7 @@ function checkpointBody(outcome: DelegationOutcome): string[] {
     failed: `Status: failed${synth}.`,
   };
   const lines = [headline[cp.status], `Summary: ${cp.summary}`, manifestLine(cp.changedPaths)];
+  lines.push(...promotionLines(outcome.promotion, { detail: promotionDetail }));
   lines.push(
     `Validation: ${cp.validation.status}${
       cp.status === "completed" && cp.validation.status !== "passed"
@@ -441,7 +487,12 @@ function delegationResult(
   return text(body, { kind: "delegation", outcome, record });
 }
 
-/** Single-owner pre-spawn build failure (required source missing / oversized). */
+/**
+ * Single-owner pre-spawn refusal: a required source is missing, the bundle is
+ * oversized, the repository cannot be staged, or its runtime overlay is unusable.
+ * The kind is named and the diagnostics are passed through verbatim, so each
+ * refusal explains itself in its own words rather than in a generic sentence.
+ */
 function delegationFailedResult(
   failureKind: DelegationFailureKind,
   diagnostics: string[],
@@ -493,9 +544,10 @@ function allUnmanagedResult(resolution: Resolution): AgentToolResult<ResolveTool
 
 /**
  * The aggregate result for a multi-owner sequence (and any owned+unowned advisory
- * mix). Reports the per-owner status, the completed/not-run split, the early-stop
- * reason, and — when a step needs scope — the re-delegation recipe. Unowned paths
- * are called out as unmanaged advisory work at the end.
+ * mix). Reports the sequence's ONE promotion, the per-owner status, the
+ * completed/not-run split, the early-stop reason, and — when a step needs scope —
+ * the re-delegation recipe. Unowned paths are called out as unmanaged advisory work
+ * at the end.
  */
 function delegationSequenceResult(
   sequence: SequenceOutcome,
@@ -520,17 +572,19 @@ function delegationSequenceResult(
   } else {
     lines.push(
       `Outcome: stopped at '${sequence.stoppedAt}' — ${completed} completed, ${notRun} not run. ` +
-        "Later owners were not started: the plan stops on the first non-completed status because " +
-        "in-place editing has no transactional rollback (ADR 0009/0077).",
+        "The sequence is ONE TRANSACTION (ADR 0009): it stops on the first non-completed status, " +
+        "and nothing at all was promoted — not even the work of owners that completed before it.",
     );
   }
+  // The one fact about the user's own files, reported once for the whole sequence.
+  lines.push(...promotionLines(sequence.promotion, { label: "Sequence promotion" }));
 
   let index = 0;
   for (const step of sequence.steps) {
     index += 1;
     if (step.kind === "delegated") {
       lines.push("", `${index}. ${step.outcome.owner}:`);
-      for (const line of checkpointBody(step.outcome)) lines.push(`   ${line}`);
+      for (const line of checkpointBody(step.outcome, false)) lines.push(`   ${line}`);
     } else if (step.kind === "build_failed") {
       lines.push("", `${index}. ${step.owner}: build failed (${step.failureKind}) — not spawned.`);
       for (const diagnostic of step.diagnostics) lines.push(`   - ${diagnostic}`);
@@ -787,6 +841,7 @@ export function createDelegateTool(
             createSession: deps.createSession,
             signal,
             onProgress,
+            stateRoot: deps.stateRoot,
           });
           const endedAt = Date.now();
           for (const step of sequence.steps) {

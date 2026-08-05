@@ -1,0 +1,1410 @@
+import { createHash } from "node:crypto";
+import { lstatSync, mkdirSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import type { CompiledGrant } from "./resolver";
+import { checkGrant } from "./grant";
+import { COMMIT_CONFIG, gitFailure, gitRaw, gitText, tryGit } from "./git";
+import { ORCA_DIR } from "./state";
+
+/**
+ * The staging seam and the promotion gate (staged-promotion plan, Phases 2–5;
+ * PRD items 2, 3, 5).
+ *
+ * A delegated session never edits the user's checkout. It runs instead in an
+ * ISOLATED CHECKOUT that a {@link StagingProvider} prepares: the user's `HEAD`
+ * plus their materialized dirty overlay, capped by a synthetic baseline commit.
+ * Mutation accountability gates writes inside that checkout, and nothing leaves
+ * it except through the two-part gate below.
+ *
+ * The gate is two-part because a delegation SEQUENCE is one transaction over one
+ * shared checkout (Phase 3):
+ *
+ * - {@link commitAuthorizedWork} runs once per owner, as that owner finishes:
+ *   every path the owner changed is authorized against ITS OWN compiled grant and
+ *   the result is committed inside staging. The next owner therefore starts from
+ *   accepted work, and each staged commit is attributable to exactly one grant.
+ * - {@link promoteStagedCommits} runs once per sequence, after the last owner:
+ *   it diffs the baseline against the last staged COMMIT — never the worktree — so
+ *   only content that already passed a per-owner authorization can reach the
+ *   user's files, and it reaches them as one patch or not at all.
+ *
+ * A single-owner delegation is the degenerate case of exactly that: one
+ * authorized staged commit, then one promotion.
+ *
+ * The split in this module is the point:
+ *
+ * - HOW an isolated checkout is produced is a provider concern
+ *   ({@link StagingProvider}). `staging-worktree.ts` supplies the only current
+ *   implementation, `git worktree`. A copy-on-write provider (APFS `clonefile`,
+ *   btrfs subvolume) is a drop-in alternative — it satisfies the same contract
+ *   and nothing below has to change.
+ * - WHAT may leave staging is not. The gate here is git-native and
+ *   provider-independent: it authorizes each changed path, commits it, and applies
+ *   the accumulated commits with `git apply`. Every provider funnels through this
+ *   one gate, so a new provider cannot invent a laxer path to the user's files.
+ *
+ * Two invariants are structural rather than conventional:
+ *
+ * - Git runs only through `git.ts`, argv-only, so nothing is shell-interpolated.
+ * - The isolated checkout is torn down on EVERY exit path (the caller's
+ *   `finally`); a preserved patch is written OUTSIDE it, so evidence survives
+ *   cleanup.
+ *
+ * A repository that cannot be staged gets no silent in-place fallback: the
+ * provider refuses with a diagnostic and the delegation never spawns. Explicit
+ * degradation is the point — an ungoverned in-place edit is exactly what staging
+ * exists to prevent.
+ */
+
+/** The subdirectory of the state root holding one isolated checkout per delegation sequence. */
+export const CHECKOUTS_DIR = "worktrees";
+
+/**
+ * The subdirectory of the state root holding preserved patches. Three kinds live
+ * here, distinguished by file name and by what a steward may do with them: the
+ * cumulative EVIDENCE patch of a delegation that did not land (`<id>.patch`), the
+ * GOVERNANCE patch a promotion held for approval (`<id>.governance.patch`, Phase 2),
+ * and the REUSABLE accepted work a `needs_scope` stop left behind
+ * (`<id>.accepted.patch`, Phase 5 — see {@link AcceptedWork}).
+ */
+export const PATCHES_DIR = "patches";
+
+/** The subdirectory of the state root holding preserved validator output. */
+export const VALIDATOR_OUTPUT_DIR = "validators";
+
+/**
+ * The file-name suffix of each preserved artifact kind, exported because the NAME is
+ * the only thing that distinguishes the three patch kinds on disk. Retention reads
+ * these to classify what it may sweep (`retention.ts`, Phase 6), so the sweeper's idea
+ * of which file is a held governance patch is the same string {@link stagingPaths}
+ * wrote it under, rather than a second spelling that could drift from it.
+ */
+export const EVIDENCE_PATCH_SUFFIX = ".patch";
+export const GOVERNANCE_PATCH_SUFFIX = `.governance${EVIDENCE_PATCH_SUFFIX}`;
+export const ACCEPTED_PATCH_SUFFIX = `.accepted${EVIDENCE_PATCH_SUFFIX}`;
+export const VALIDATOR_OUTPUT_SUFFIX = ".log";
+
+/**
+ * The fixed definition of a GOVERNANCE PATH (hardening plan, Phase 2): everything
+ * under the directory that holds the documents governing the agents themselves —
+ * the OrcaSpec document and the runtime overlay.
+ *
+ * A governance change is HELD, never applied: the apply stage splits the promotion
+ * patch here and writes this side to its own patch that only the user can land.
+ * That is a NARROWING applied after authorization, not a new authority check — an
+ * owner whose grant does not cover `.orca/**` is still refused at its staged commit
+ * by {@link commitAuthorizedWork}, exactly as before, and nothing here widens what
+ * any grant permits. The narrowing exists because an agent that can rewrite the
+ * document governing agents can rewrite its own limits, and the phase-4 rule that
+ * the runtime overlay is read from the USER's checkout is only half of that: this is
+ * the other half, keeping the rewrite out of the checkout in the first place.
+ */
+export const GOVERNANCE_SCOPE = `${ORCA_DIR}/**`;
+
+/**
+ * {@link GOVERNANCE_SCOPE} as the two git pathspecs that split a diff at it.
+ *
+ * git does the splitting rather than a hunk-level parse of the patch text, and the
+ * split is exact because the boundary is a directory PREFIX: no file can fall on
+ * both sides, so the two patches touch disjoint paths and each applies without the
+ * other. `:(top)` anchors both at the repository root regardless of the directory
+ * git is invoked from, and the negative pathspec is git's own exclusion — the
+ * promotable patch cannot contain a governance path because git never put one in
+ * it, which is a stronger guarantee than filtering the bytes afterwards.
+ */
+const GOVERNANCE_PATHSPEC = `:(top)${ORCA_DIR}`;
+const PROMOTABLE_PATHSPEC = `:(exclude,top)${ORCA_DIR}`;
+
+/** The commit message of the synthetic baseline the cumulative diff is taken against. */
+export const BASELINE_MESSAGE = "orca staged baseline (HEAD + dirty overlay)";
+
+/** The commit-message prefix of one owner's authorized staged change. */
+export const STEP_MESSAGE_PREFIX = "orca staged step";
+
+/**
+ * The runtime state directory for staged checkouts and preserved patches. It
+ * follows the one state-directory convention the extension already uses — pi's
+ * agent directory (`session-runner.ts` hands the same `getAgentDir()` to the
+ * child's resource loader) — under an `orca/` subtree, and therefore honors pi's
+ * own `PI_CODING_AGENT_DIR` override.
+ */
+export function defaultStateRoot(): string {
+  return join(getAgentDir(), "orca");
+}
+
+/**
+ * One prepared staging workspace: an isolated checkout, valid until the provider
+ * closes it.
+ *
+ * This is the whole contract between a provider and the promotion gate. A
+ * provider MUST guarantee, for the workspace it returns:
+ *
+ * 1. {@link dir} is a git working tree outside the user's working tree, whose
+ *    content equals the user's working tree for every non-ignored path (`HEAD`
+ *    plus the dirty overlay: staged, unstaged, and non-ignored untracked files).
+ * 2. Its `HEAD` is {@link baselineCommit}, a commit whose tree is exactly that
+ *    content — so a diff of {@link dir} against {@link baselineCommit} is the
+ *    delegation's cumulative change and nothing else.
+ * 3. {@link baseCommit} is the user's `HEAD` at the moment staging began, and
+ *    {@link overlayBinding} digests the dirty overlay it staged from. Together they
+ *    are the BASE BINDING (Phase 5): the complete description of the state the
+ *    delegation's patch will be computed against, re-verified before promotion.
+ *
+ * Given those three, promotion works identically for any provider.
+ */
+export interface StagedWorkspace {
+  /** Canonical root of the user's checkout (never written during the delegation). */
+  repoRoot: string;
+  /** Canonical isolated checkout; the child session's `cwd`. */
+  dir: string;
+  /** `HEAD` at staging time; half of the base binding (see {@link overlayBinding}). */
+  baseCommit: string;
+  /**
+   * The other half: one digest per dirty-overlay path, as the user's checkout held
+   * it when staging began. Produced by {@link captureOverlayBinding} so every
+   * provider measures the same thing the same way.
+   */
+  overlayBinding: OverlayBinding;
+  /** The synthetic baseline commit inside the checkout; the diff's left side. */
+  baselineCommit: string;
+  /** Where a patch is preserved when it is not promoted. */
+  patchPath: string;
+  /**
+   * Where the governance half of a promotion is held for the user's approval
+   * (hardening plan, Phase 2). A distinct file from {@link patchPath} because the two
+   * mean different things: that one is evidence of work that did NOT land, this one is
+   * a proposal awaiting a decision.
+   */
+  governancePatchPath: string;
+  /**
+   * Where the accepted work of the owners that completed before a `needs_scope` stop
+   * is preserved (hardening plan, Phase 5). The third distinct file for the third
+   * distinct meaning: {@link patchPath} is evidence of everything a delegation did,
+   * {@link governancePatchPath} is a proposal awaiting a decision, and this one is a
+   * REUSABLE subset — the part of the attempt that was authorized and accepted.
+   */
+  acceptedPatchPath: string;
+  /** Where validator output is preserved when the acceptance gate refuses. */
+  validatorOutputPath: string;
+  /** Which provider produced this workspace, for diagnostics. */
+  provider: string;
+}
+
+/** What a provider is asked for. */
+export interface OpenStagingInput {
+  /** Any directory inside the user's repository. */
+  cwd: string;
+  /** Identity of the delegation; names its subdirectory under the state root. */
+  delegationId: string;
+  /** Runtime state root; defaults to {@link defaultStateRoot}. */
+  stateRoot?: string;
+}
+
+/** Opening a workspace either yields one or refuses with human-readable diagnostics. */
+export type OpenStagingResult =
+  | { ok: true; workspace: StagedWorkspace }
+  | { ok: false; diagnostics: string[] };
+
+/**
+ * A strategy for isolating a delegation's work from the user's checkout.
+ *
+ * Implementations differ only in HOW they produce the isolated checkout and how
+ * they dispose of it; the {@link StagedWorkspace} contract above is what they all
+ * promise, and the promotion gate in this module is what they all go through.
+ * Keep the surface at exactly these two operations — anything more and providers
+ * start owning policy that belongs to the gate.
+ */
+export interface StagingProvider {
+  /** Provider name, surfaced in diagnostics and evidence. */
+  readonly name: string;
+  /** Prepare an isolated checkout, or refuse with diagnostics. */
+  open(input: OpenStagingInput): OpenStagingResult;
+  /**
+   * Dispose of the checkout and any metadata it created. Must be safe to call on
+   * every exit path and more than once, and must never throw: cleanup runs in a
+   * `finally` and must not mask the outcome that got it there.
+   */
+  close(workspace: StagedWorkspace): void;
+}
+
+/** Resolve where a delegation's checkout and its preserved evidence belong. */
+export function stagingPaths(input: OpenStagingInput): {
+  stateRoot: string;
+  dir: string;
+  patchPath: string;
+  governancePatchPath: string;
+  acceptedPatchPath: string;
+  validatorOutputPath: string;
+} {
+  const stateRoot = input.stateRoot ?? defaultStateRoot();
+  const segment = safeSegment(input.delegationId);
+  return {
+    stateRoot,
+    dir: join(stateRoot, CHECKOUTS_DIR, segment),
+    patchPath: join(stateRoot, PATCHES_DIR, `${segment}${EVIDENCE_PATCH_SUFFIX}`),
+    governancePatchPath: join(stateRoot, PATCHES_DIR, `${segment}${GOVERNANCE_PATCH_SUFFIX}`),
+    acceptedPatchPath: join(stateRoot, PATCHES_DIR, `${segment}${ACCEPTED_PATCH_SUFFIX}`),
+    validatorOutputPath: join(stateRoot, VALIDATOR_OUTPUT_DIR, `${segment}${VALIDATOR_OUTPUT_SUFFIX}`),
+  };
+}
+
+/** A filesystem-safe directory name for a delegation identity. */
+function safeSegment(id: string): string {
+  const cleaned = id.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
+  return cleaned.length > 0 ? cleaned : "delegation";
+}
+
+/**
+ * Commit everything currently in the isolated checkout and report the commit id.
+ * The pinned identity and disabled signing keep a staged commit from depending on
+ * (or being broken by) the user's global git configuration: an unset `user.email`
+ * or `commit.gpgsign = true` would otherwise fail an otherwise valid delegation.
+ * Hooks are skipped for the same reason — a repository's own hooks are the user's,
+ * not something a staged commit may run.
+ */
+function commitStagedTree(dir: string, message: string): string {
+  gitRaw(dir, ["add", "-A"]);
+  gitRaw(dir, [...COMMIT_CONFIG, "commit", "-q", "--no-verify", "--allow-empty", "-m", message]);
+  return gitText(dir, ["rev-parse", "HEAD"]).trim();
+}
+
+/**
+ * Commit the isolated checkout's current content as its synthetic baseline and
+ * report the commit id. Shared by every provider: whatever mechanism produced the
+ * checkout, the baseline it will be diffed against is made the same way, so
+ * clause 2 of the {@link StagedWorkspace} contract cannot drift between providers.
+ */
+export function commitStagedBaseline(dir: string): string {
+  return commitStagedTree(dir, BASELINE_MESSAGE);
+}
+
+// --- The base binding (staged-promotion plan, Phase 5) ------------------------
+
+/**
+ * One digest per dirty-overlay path: what the user's uncommitted state contained
+ * when staging began.
+ *
+ * A `Map` rather than an object because the keys are repository paths and a
+ * repository may contain a file called `__proto__`; a plain object would let that
+ * path collide with `Object.prototype`. It is held IN MEMORY on the workspace and
+ * never persisted: the binding is meaningful only for the life of the one sequence
+ * that staged it, so persisting it would create a second source of truth and a
+ * stale-file problem. What outlives the sequence is the {@link PromotionRecord} —
+ * the drifted paths and the preserved patch — which is what a later session and the
+ * `/orca` history actually need.
+ */
+export type OverlayBinding = ReadonlyMap<string, string>;
+
+/**
+ * Every path the user's dirty overlay covers: staged, unstaged, and non-ignored
+ * untracked files, one record per path.
+ *
+ * This is THE definition of the overlay set, shared by the two things that must
+ * agree about it: the provider materializing the overlay into the isolated checkout
+ * (`staging-worktree.ts`) and {@link captureOverlayBinding} digesting it. If they
+ * enumerated separately, a delegation could be bound to a set of files different
+ * from the set it was staged from, which is the exact class of bug the binding
+ * exists to catch.
+ */
+export function dirtyOverlayPaths(repoRoot: string): string[] {
+  const status = gitText(repoRoot, [
+    "status",
+    "--porcelain",
+    "-z",
+    "--untracked-files=all",
+    "--no-renames",
+  ]);
+  // Porcelain v1 records are `XY <path>`, NUL-terminated; `--no-renames` keeps
+  // every record single-pathed so no second path can be mistaken for a status.
+  return status
+    .split("\0")
+    .filter((entry) => entry.length >= 4)
+    .map((entry) => entry.slice(3));
+}
+
+/**
+ * The digest of one overlay path as it exists on disk.
+ *
+ * What is digested is CONTENT plus the two things git itself tracks about a
+ * working-tree file — whether it is a symlink, and whether it is executable — so a
+ * `chmod +x` counts as drift while a `chmod g-r` does not. What is deliberately NOT
+ * digested is the INDEX: promotion applies its patch to the working tree, so a
+ * `git add` of unchanged bytes moves nothing the patch depends on, and treating it
+ * as drift would cost the user a promotion for staging a file they had already
+ * edited before the delegation started.
+ *
+ * `sha256` over content rather than a size/mtime pair: mtime is unreliable across
+ * editors and filesystems, and size collides on any same-length edit. The cost is
+ * bounded by the overlay — the same files staging already copies once.
+ */
+function overlayDigest(absolute: string): string {
+  try {
+    const stat = lstatSync(absolute);
+    if (stat.isSymbolicLink()) return `symlink:${digestOf(Buffer.from(readlinkSync(absolute)))}`;
+    // Anything that is neither a file nor a symlink is a dirty submodule, which the
+    // MVP does not stage and therefore does not bind (see `staging-worktree.ts`).
+    if (!stat.isFile()) return "other";
+    return `${(stat.mode & 0o111) !== 0 ? "exec" : "file"}:${digestOf(readFileSync(absolute))}`;
+  } catch {
+    // Gone, or no longer readable. Symmetric on both sides of the comparison: a
+    // path that is absent when the binding is captured and still absent when it is
+    // verified has not drifted (an uncommitted deletion is a normal overlay state),
+    // while one that was readable and now is not has.
+    return "absent";
+  }
+}
+
+function digestOf(content: Buffer): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+/**
+ * Digest `paths` as they exist under `root`. The caller supplies the enumeration
+ * (from {@link dirtyOverlayPaths}) so the set that is bound is exactly the set that
+ * was staged, taken from ONE `git status`.
+ */
+export function captureOverlayBinding(root: string, paths: readonly string[]): OverlayBinding {
+  return new Map(paths.map((path) => [path, overlayDigest(join(root, path))]));
+}
+
+/**
+ * How the user's checkout has moved away from the base a workspace was staged
+ * from. Any of the three fields being present means the staged patch's base no
+ * longer exists, so nothing may be applied.
+ */
+export interface BaseDrift {
+  /** The user's `HEAD` now, when it is no longer the commit staging began from. */
+  head?: string;
+  /** Paths whose content the user changed since staging began (sorted). */
+  paths: string[];
+  /** Why the base could not be re-read at all, when that is what happened. */
+  unreadable?: string;
+}
+
+/**
+ * Re-verify the base binding against the user's checkout, and report the drift, or
+ * `undefined` when the base is exactly what the delegation was staged from.
+ *
+ * Two classes of path are checked, and the difference matters:
+ *
+ * - Every path in the binding, by re-digesting it. This catches an edit, a
+ *   revert, a deletion, a restoration, and a `chmod +x` of a file the user already
+ *   had uncommitted work in — the patch was computed against that content.
+ * - Paths NOT in the binding, but only where the staged patch touches them and the
+ *   user has since made them dirty. At staging time such a path matched `HEAD`, so
+ *   "dirty now" means the user has touched it; that is the plan's "added
+ *   overlapping files". A path the user made dirty that the patch does NOT touch is
+ *   ignored on purpose: refusing a promotion because the user edited an unrelated
+ *   file would make every long delegation a coin flip.
+ *
+ * Overlap is compared by exact path, not by prefix. A structural collision that
+ * exact paths cannot see — the user creating a DIRECTORY where the patch creates a
+ * file — is left to git, which refuses it when the patch is offered; that refusal is
+ * a `rejected`, because nothing the user did to a BOUND path moved.
+ *
+ * A base that cannot be read at all is drift too, not a pass: an unverifiable base
+ * is indistinguishable from a moved one, and the fail-closed reading is the only
+ * safe one.
+ */
+export function detectBaseDrift(
+  workspace: StagedWorkspace,
+  patchPaths: readonly string[],
+): BaseDrift | undefined {
+  const head = tryGit(workspace.repoRoot, ["rev-parse", "HEAD"]);
+  if (!head.ok) {
+    return { paths: [], unreadable: `your repository's HEAD could not be read (${head.reason})` };
+  }
+  const currentHead = head.out.toString("utf8").trim();
+
+  let dirtyNow: Set<string>;
+  try {
+    dirtyNow = new Set(dirtyOverlayPaths(workspace.repoRoot));
+  } catch (error) {
+    return {
+      paths: [],
+      unreadable: `your working state could not be re-read (${gitFailure(error)})`,
+    };
+  }
+
+  const drifted = new Set<string>();
+  for (const [path, digest] of workspace.overlayBinding) {
+    if (overlayDigest(join(workspace.repoRoot, path)) !== digest) drifted.add(path);
+  }
+  for (const path of patchPaths) {
+    if (workspace.overlayBinding.has(path)) continue;
+    if (dirtyNow.has(path)) drifted.add(path);
+  }
+
+  const moved = currentHead !== workspace.baseCommit;
+  if (!moved && drifted.size === 0) return undefined;
+  return {
+    head: moved ? currentHead : undefined,
+    paths: [...drifted].sort(),
+  };
+}
+
+// --- The promotion gate (provider-independent) --------------------------------
+
+/**
+ * What the promotion gate did with the staged change.
+ *
+ * The line between the two refusals is which side needs attention, and it is worth
+ * keeping sharp: `rejected` is about the CHANGE — a path no grant authorized, a
+ * validator that did not pass, a patch git will not take — so the delegation is what
+ * has to be different. `conflict` is about the BASE: the work is sound and the state
+ * it was built on is gone, so the answer is to recover the preserved patch or
+ * delegate again, and nothing about the delegation would have helped.
+ * `not_attempted` means the delegation never reached the gate at all.
+ *
+ * `held` is neither a refusal nor a promotion (hardening plan, Phase 2): the gate
+ * ACCEPTED the work and nothing reached the user's files anyway, because every path
+ * it would have applied is a governance path and those are held for approval. It is
+ * a status of its own rather than a `promoted` with an empty applied set, because
+ * `promoted` is the word the compact `/orca` history line prints — and "promoted"
+ * over a delegation that changed nothing in the checkout, with a patch still waiting
+ * for a decision, reads as a success that did not happen. A promotion that applied
+ * some paths and held others stays `promoted`, with {@link PromotionRecord.heldGovernance}
+ * carrying the hold.
+ */
+export type PromotionStatus = "promoted" | "held" | "rejected" | "conflict" | "not_attempted";
+
+/**
+ * How one declared validator ended. `unavailable` covers a validator that could
+ * not be started at all (a program that is not on this machine, a declared `cwd`
+ * that does not exist in the checkout); `cancelled` covers one the runtime killed
+ * because the delegation was cancelled under it (hardening plan, Phase 1). Like the
+ * other failures they refuse the promotion, because a declared check that did not run
+ * is not a check that passed.
+ */
+export type ValidatorStatus = "passed" | "failed" | "timed_out" | "unavailable" | "cancelled";
+
+/**
+ * One run of one declared validator (`runtime.yaml`, see `validators.ts`).
+ *
+ * Distinct from the `ValidationEvidence` on a checkpoint: that is the agent's own
+ * account of what it verified — advisory metadata, believed only as far as the
+ * agent is honest — while this is the runtime's own observation of a program it
+ * executed itself. Only this one gates a promotion.
+ */
+export interface ValidatorRun {
+  /** The OrcaSpec agent id whose declaration this run came from. */
+  agent: string;
+  program: string;
+  /** Arguments as declared; recorded as an array because that is how they are passed. */
+  args: string[];
+  /** Repository-relative directory it ran in; `""` is the checkout root. */
+  cwd: string;
+  timeoutSeconds: number;
+  status: ValidatorStatus;
+  /** Exit code, when the process ran to completion. */
+  exitCode?: number;
+  /** Terminating signal, when one killed it (including the timeout's). */
+  signal?: string;
+  /** Captured stdout, truncated for evidence. */
+  stdout: string;
+  /** Captured stderr, truncated for evidence. */
+  stderr: string;
+}
+
+/**
+ * What an acceptance gate decided about the staged work as a whole. `ok: false`
+ * refuses the promotion; {@link validations} is recorded either way, so a steward
+ * can see what gated (or cleared) their change.
+ */
+export interface AcceptanceResult {
+  ok: boolean;
+  validations: ValidatorRun[];
+  /** Absolute path of preserved validator output, when any was written. */
+  validatorOutputPath?: string;
+  diagnostics: string[];
+}
+
+/**
+ * The seam through which anything other than authorization can refuse a
+ * promotion. `validators.ts` supplies the only implementation — the programs
+ * `.orca/runtime.yaml` declares — and this module owns WHEN it runs: after every
+ * owner's change is authorized and committed, so the gate sees the sequence's
+ * complete work, and before a single byte reaches the user's checkout.
+ *
+ * A gate may write into the checkout (a test run leaves caches; a formatter
+ * rewrites files) and it does not matter: promotion applies the diff between
+ * COMMITS, so nothing a gate does to the working tree can ride along.
+ *
+ * A gate is AWAITED, and it is handed the delegation's cancellation signal (hardening
+ * plan, Phase 1). The signal arrives at invocation rather than at construction
+ * because cancellation is a fact about this one run, while a gate is built once from
+ * the repository's overlay; a gate that honors it must stop running programs and
+ * report what it had, which is one more refusal and not a path of its own.
+ */
+export type AcceptanceGate = (
+  workspace: StagedWorkspace,
+  signal?: AbortSignal,
+) => Promise<AcceptanceResult>;
+
+/**
+ * The governance half of a promotion, held for the user's approval (hardening plan,
+ * Phase 2). Present on a `promoted` or `held` record whenever the delegation changed
+ * anything under {@link GOVERNANCE_SCOPE}, and absent on every refusal: a refused
+ * promotion preserves ONE cumulative evidence patch containing everything, and a
+ * proposal to approve out of a delegation that could not land is a contradiction.
+ *
+ * Plain strings and string arrays by design — the durable record persists this shape
+ * unchanged, and the `/orca` history a later session renders is the only thing that
+ * remembers where the patch is.
+ */
+export interface HeldGovernance {
+  /**
+   * Absolute path of the held patch. Nothing in the runtime applies it; a `git apply`
+   * the user runs (or, from Phase 3, an approval action they invoke) is the only way
+   * it can reach the checkout.
+   */
+  patchPath: string;
+  /** The governance paths it touches, repository-relative and sorted. */
+  paths: string[];
+  /**
+   * The user's `HEAD` when the delegation was staged — the base the patch was
+   * generated against. Recorded because the patch outlives the session and a user
+   * applying it later needs to know what it expects to find.
+   */
+  baseCommit: string;
+}
+
+/**
+ * The accepted work of the owners that completed before a sequence stopped at
+ * `needs_scope` (hardening plan, Phase 5), preserved as a patch of its own.
+ *
+ * It exists because `needs_scope` is the one stop that is not a failure. The
+ * sequence ends so the STEWARD can re-resolve ownership and delegate again with a
+ * wider target set (ADR 0008), and the owners that finished before it had their
+ * change authorized against their own grant and accepted into a staged commit. The
+ * cumulative evidence patch cannot serve that purpose: it is the whole attempt,
+ * including the half-finished work of the owner that could not continue, and
+ * applying it would land exactly the part nobody accepted.
+ *
+ * So this is a strict subset, cut where staging already cut it — at the last staged
+ * COMMIT — and it carries no promise beyond that. Orca never applies it; there is no
+ * stale-base machinery around it and no automatic reseeding of a follow-up
+ * delegation. It is a `git apply` input the user may choose to use, under ordinary
+ * git semantics, against whatever their checkout holds when they decide.
+ *
+ * Plain strings and string arrays, like {@link HeldGovernance}, because the durable
+ * record persists this shape unchanged and the `/orca` history is the only thing that
+ * remembers where the patch is.
+ */
+export interface AcceptedWork {
+  /** Absolute path of the reusable patch. */
+  patchPath: string;
+  /** The paths it carries, repository-relative and sorted. */
+  paths: string[];
+  /** The owners whose staged commits it contains, in execution order. */
+  owners: string[];
+  /**
+   * The user's `HEAD` when the delegation was staged — the base the patch was
+   * generated against, recorded for the same reason {@link HeldGovernance} records it:
+   * the patch outlives the session, and whoever applies it later needs to know what it
+   * expects to find.
+   */
+  baseCommit: string;
+  /**
+   * Governance paths a completed owner changed that were deliberately LEFT OUT of the
+   * patch (sorted); empty in the ordinary case.
+   *
+   * Such a change was authorized and accepted in staging, but promotion would have HELD
+   * it rather than applying it ({@link GOVERNANCE_SCOPE}), so a patch offered for reuse
+   * must not carry it: `git apply` of a reusable patch would land, in one unreviewed
+   * step, the change that the whole held-for-approval rule exists to keep out of the
+   * checkout. It stays in the cumulative evidence patch, and the outcome names it here
+   * rather than dropping it silently.
+   */
+  excludedGovernancePaths: string[];
+}
+
+/**
+ * The steward-facing record of one promotion attempt. {@link appliedPaths} is
+ * non-empty only for `promoted`; {@link patchPath} points at the preserved patch
+ * whenever a non-empty change was not applied, so the work is recoverable.
+ */
+export interface PromotionRecord {
+  status: PromotionStatus;
+  /** Repository-relative paths applied to the user's checkout (sorted). */
+  appliedPaths: string[];
+  /** Changed paths the grant did not authorize; they fail the whole promotion. */
+  rejectedPaths: string[];
+  /**
+   * Paths in the user's own checkout that moved while the delegation ran, on a
+   * `conflict`. Non-empty only there, and distinct from {@link rejectedPaths}: a
+   * rejected path is something the DELEGATION was not allowed to change, a drifted
+   * path is something the USER changed under it.
+   */
+  driftedPaths: string[];
+  /** Absolute path of the preserved patch, when one was written. */
+  patchPath?: string;
+  /**
+   * The authorized governance change the gate refused to APPLY and held instead
+   * ({@link HeldGovernance}). Absent when the delegation touched no governance path,
+   * which is the ordinary case and the one that must behave exactly as it did before
+   * this phase existed.
+   */
+  heldGovernance?: HeldGovernance;
+  /**
+   * The reusable accepted work preserved when a sequence stopped at `needs_scope`
+   * ({@link AcceptedWork}). Present only on that stop, and only when an owner actually
+   * completed and left something outside the governance directory behind.
+   */
+  acceptedWork?: AcceptedWork;
+  /**
+   * Every declared validator that ran as the acceptance gate, in the order they
+   * ran. Empty when the repository declared none, or when the promotion was
+   * refused before the gate was reached.
+   */
+  validations: ValidatorRun[];
+  /** Absolute path of preserved validator output, when any was written. */
+  validatorOutputPath?: string;
+  /** Why the gate reached this status, in the words the steward reads. */
+  diagnostics: string[];
+}
+
+/** The change of an isolated checkout against one of its commits. */
+export interface StagedDiff {
+  /** A binary-safe patch, empty when nothing changed. */
+  patch: Buffer;
+  /** Every changed repository-relative path, sorted. */
+  paths: string[];
+}
+
+/**
+ * The diff of the isolated checkout's WORKING TREE against `ref`. Staging
+ * everything first (`git add -A`) makes newly created files part of the diff while
+ * still honoring `.gitignore` — an ignored file is not repository content and is
+ * never promoted. Renames are not detected, so every change is an add, delete, or
+ * modify of a single path and can be authorized on its own.
+ */
+function worktreeDiff(dir: string, ref: string): StagedDiff {
+  gitRaw(dir, ["add", "-A"]);
+  const names = gitText(dir, ["diff", "--cached", "--no-renames", "--name-only", "-z", ref]);
+  const patch = gitRaw(dir, ["diff", "--cached", "--binary", "--no-renames", ref]);
+  return { patch, paths: names.split("\0").filter(Boolean).sort() };
+}
+
+/**
+ * The diff between two commits inside the isolated checkout, optionally narrowed to
+ * a pathspec. Both halves of the result come from the SAME narrowing, so the paths a
+ * record reports and the bytes it applies can never describe different sets.
+ */
+function commitDiff(dir: string, from: string, to: string, pathspec?: string): StagedDiff {
+  const limit = pathspec ? ["--", pathspec] : [];
+  const names = gitText(dir, ["diff", "--no-renames", "--name-only", "-z", from, to, ...limit]);
+  const patch = gitRaw(dir, ["diff", "--binary", "--no-renames", from, to, ...limit]);
+  return { patch, paths: names.split("\0").filter(Boolean).sort() };
+}
+
+/** {@link commitDiff} where a git failure is an outcome the gate reports, not a throw. */
+function tryCommitDiff(
+  dir: string,
+  from: string,
+  to: string,
+  pathspec?: string,
+): { ok: true; diff: StagedDiff } | { ok: false; reason: string } {
+  try {
+    return { ok: true, diff: commitDiff(dir, from, to, pathspec) };
+  } catch (error) {
+    return { ok: false, reason: gitFailure(error) };
+  }
+}
+
+/**
+ * The staged change split at the governance boundary (hardening plan, Phase 2): what
+ * may be applied, and what is held.
+ *
+ * Two narrowed diffs of the same commit pair rather than one diff cut up afterwards.
+ * The pair partitions the change — every path is on exactly one side, and the sides
+ * are computed by git itself (see {@link GOVERNANCE_PATHSPEC}) — so a governance path
+ * cannot appear in the promotable patch even if the reporting below were wrong.
+ */
+function trySplitAtGovernance(
+  dir: string,
+  from: string,
+  to: string,
+):
+  | { ok: true; promotable: StagedDiff; governance: StagedDiff }
+  | { ok: false; reason: string } {
+  const promotable = tryCommitDiff(dir, from, to, PROMOTABLE_PATHSPEC);
+  if (!promotable.ok) return promotable;
+  const governance = tryCommitDiff(dir, from, to, GOVERNANCE_PATHSPEC);
+  if (!governance.ok) return governance;
+  return { ok: true, promotable: promotable.diff, governance: governance.diff };
+}
+
+/**
+ * The cumulative diff of the isolated checkout's working tree against its
+ * synthetic baseline: everything the delegation left behind, authorized or not.
+ * This is the EVIDENCE view — what a preserved patch contains — and deliberately
+ * not what promotion applies (see {@link promoteStagedCommits}).
+ */
+export function stagedDiff(workspace: StagedWorkspace): StagedDiff {
+  return worktreeDiff(workspace.dir, workspace.baselineCommit);
+}
+
+/** The evidence diff, or nothing when the checkout can no longer be read. */
+function tryStagedDiff(workspace: StagedWorkspace): StagedDiff {
+  try {
+    return stagedDiff(workspace);
+  } catch {
+    return { patch: Buffer.alloc(0), paths: [] };
+  }
+}
+
+/**
+ * What became of the evidence patch: where it was written, or why it could not be.
+ * Three states rather than two, because "no patch" and "a patch that could not be
+ * written" must not read the same to a steward looking for their work.
+ */
+interface PreservedPatch {
+  path?: string;
+  failure?: string;
+}
+
+/**
+ * Write a patch into the state directory as evidence.
+ *
+ * Never throws, because the two functions that call it promise not to: a state
+ * directory that cannot be written is a bad day for the evidence, not a reason to
+ * lose the promotion record that explains what happened to the user's files.
+ */
+function preservePatch(workspace: StagedWorkspace, patch: Buffer): PreservedPatch {
+  if (patch.length === 0) return {};
+  try {
+    mkdirSync(dirname(workspace.patchPath), { recursive: true });
+    writeFileSync(workspace.patchPath, patch);
+  } catch (error) {
+    return { failure: error instanceof Error ? error.message : String(error) };
+  }
+  return { path: workspace.patchPath };
+}
+
+/** The closing sentence of a refusal: nothing landed, and where the work is. */
+function preservationLine(preserved: PreservedPatch): string {
+  if (preserved.path) {
+    return (
+      "Nothing was applied; your checkout is unchanged. The staged patch is preserved at " +
+      `${preserved.path}.`
+    );
+  }
+  if (preserved.failure) {
+    return (
+      "Nothing was applied; your checkout is unchanged. The staged patch could NOT be preserved " +
+      `either (${preserved.failure}), so this delegation's work is only in the staging checkout.`
+    );
+  }
+  return "Nothing was applied; the delegation produced no change to preserve.";
+}
+
+/**
+ * Hold the governance half of a promotion, or report why it could not be held.
+ *
+ * A failure here REFUSES the whole promotion, and that is why this runs before the
+ * promotable half is applied rather than after: if the hold cannot be written, the
+ * choice is between losing an authorized proposal silently and landing nothing, and
+ * landing nothing is the honest one. The cumulative evidence patch that a refusal
+ * preserves still contains the governance change, so the work is not lost either way.
+ */
+function holdGovernance(
+  workspace: StagedWorkspace,
+  governance: StagedDiff,
+): { ok: true; held?: HeldGovernance } | { ok: false; reason: string } {
+  if (governance.patch.length === 0) return { ok: true };
+  try {
+    mkdirSync(dirname(workspace.governancePatchPath), { recursive: true });
+    writeFileSync(workspace.governancePatchPath, governance.patch);
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+  return {
+    ok: true,
+    held: {
+      patchPath: workspace.governancePatchPath,
+      paths: governance.paths,
+      baseCommit: workspace.baseCommit,
+    },
+  };
+}
+
+function refused(
+  workspace: StagedWorkspace,
+  diff: StagedDiff,
+  rejectedPaths: string[],
+  diagnostics: string[],
+  acceptance?: AcceptanceResult,
+): PromotionRecord {
+  const preserved = preservePatch(workspace, diff.patch);
+  return {
+    status: "rejected",
+    appliedPaths: [],
+    rejectedPaths,
+    driftedPaths: [],
+    patchPath: preserved.path,
+    validations: acceptance?.validations ?? [],
+    validatorOutputPath: acceptance?.validatorOutputPath,
+    diagnostics: [...diagnostics, preservationLine(preserved)],
+  };
+}
+
+/**
+ * The refusal for a base that moved: the delegation's work is sound, but the state
+ * it was built on is gone, so applying it would silently interleave the staged
+ * change with whatever the user did meanwhile.
+ *
+ * This is the one refusal that comes with a RECOVERY ROUTE rather than a fix. There
+ * is nothing for the delegation to do differently — the user moved — so the record
+ * names what moved, where the work is, and the two ways to get it: apply the
+ * preserved patch by hand (which is why the patch is a real `git apply` input, not a
+ * summary), or delegate again so the work is re-staged on the current base.
+ */
+function conflicted(
+  workspace: StagedWorkspace,
+  diff: StagedDiff,
+  drift: BaseDrift,
+  acceptance?: AcceptanceResult,
+): PromotionRecord {
+  const preserved = preservePatch(workspace, diff.patch);
+  const diagnostics = [
+    "Orca refused to promote this delegation: your checkout moved while it was running, so the " +
+      "staged change is no longer based on the state it was made from.",
+  ];
+  if (drift.head) {
+    diagnostics.push(
+      `HEAD moved: the delegation was staged from ${workspace.baseCommit}, your checkout is now at ` +
+        `${drift.head}.`,
+    );
+  }
+  if (drift.paths.length > 0) {
+    diagnostics.push(
+      `Changed in your checkout since the delegation started (${drift.paths.length}): ` +
+        `${drift.paths.join(", ")}.`,
+    );
+  }
+  if (drift.unreadable) diagnostics.push(`Orca could not verify your base: ${drift.unreadable}.`);
+  diagnostics.push(preservationLine(preserved));
+  if (preserved.path) {
+    diagnostics.push(
+      `To recover the work: apply it yourself with \`git apply ${preserved.path}\` (add \`--3way\` to ` +
+        "merge it into your current state), or delegate the task again so it is re-staged on your " +
+        "current base.",
+    );
+  }
+  return {
+    status: "conflict",
+    appliedPaths: [],
+    rejectedPaths: [],
+    driftedPaths: drift.paths,
+    patchPath: preserved.path,
+    validations: acceptance?.validations ?? [],
+    validatorOutputPath: acceptance?.validatorOutputPath,
+    diagnostics,
+  };
+}
+
+/**
+ * The refusal for a staged change git can no longer read. Nothing is applied, and
+ * nothing is preserved either — the patch is exactly what could not be computed.
+ */
+function unreadableStagedChange(reason: string, acceptance?: AcceptanceResult): PromotionRecord {
+  return {
+    status: "rejected",
+    appliedPaths: [],
+    rejectedPaths: [],
+    driftedPaths: [],
+    validations: acceptance?.validations ?? [],
+    validatorOutputPath: acceptance?.validatorOutputPath,
+    diagnostics: [
+      `Orca could not compute the staged change for promotion (${reason}). ` +
+        "Nothing was applied; your checkout is unchanged.",
+    ],
+  };
+}
+
+/** What the per-owner staging gate did with one owner's change. */
+export type StagedCommitStatus = "committed" | "rejected" | "not_attempted";
+
+/**
+ * The record of one owner's pass through the per-owner half of the gate. Only a
+ * `committed` record can contribute to a promotion, and {@link commit} is the
+ * staged commit the next owner starts from.
+ */
+export interface StagedCommitRecord {
+  status: StagedCommitStatus;
+  /** Who the staged commit belongs to, for diagnostics and the commit message. */
+  label: string;
+  /** Repository-relative paths this owner changed (sorted). */
+  paths: string[];
+  /** Paths this owner's own grant did not authorize; they fail the step. */
+  rejectedPaths: string[];
+  /** The staged commit id, present exactly when {@link status} is `committed`. */
+  commit?: string;
+  diagnostics: string[];
+}
+
+/**
+ * The per-owner half of the gate: authorize everything this owner changed against
+ * ITS OWN compiled grant and, if all of it is authorized, commit it inside
+ * staging.
+ *
+ * A single unauthorized path fails the whole step rather than being filtered out,
+ * so a partial commit is never invented from a change the grant did not cover —
+ * and because the refusal leaves the change uncommitted, it can never be promoted
+ * (promotion reads commits, not the worktree). The commit is what makes a
+ * multi-owner sequence work: the next owner starts from accepted work, and every
+ * promoted path traces back to the one grant that authorized it.
+ *
+ * Like the rest of the gate this never throws; a git failure becomes a `rejected`
+ * record with the reason in its diagnostics.
+ */
+export function commitAuthorizedWork(
+  workspace: StagedWorkspace,
+  grant: CompiledGrant,
+  label: string,
+): StagedCommitRecord {
+  let diff: StagedDiff;
+  try {
+    diff = worktreeDiff(workspace.dir, "HEAD");
+  } catch (error) {
+    return {
+      status: "rejected",
+      label,
+      paths: [],
+      rejectedPaths: [],
+      diagnostics: [
+        `Orca could not compute the staged change for promotion (${gitFailure(error)}).`,
+      ],
+    };
+  }
+
+  const unauthorized = diff.paths.filter((path) => !checkGrant(grant, "write", path).allowed);
+  if (unauthorized.length > 0) {
+    return {
+      status: "rejected",
+      label,
+      paths: diff.paths,
+      rejectedPaths: unauthorized,
+      diagnostics: [
+        `The staged change made by '${label}' touches path(s) outside its write grant: ` +
+          `${unauthorized.join(", ")}.`,
+      ],
+    };
+  }
+
+  try {
+    const commit = commitStagedTree(workspace.dir, `${STEP_MESSAGE_PREFIX}: ${label}`);
+    return {
+      status: "committed",
+      label,
+      paths: diff.paths,
+      rejectedPaths: [],
+      commit,
+      diagnostics: [
+        diff.paths.length > 0
+          ? `Committed ${diff.paths.length} authorized path(s) in staging for '${label}'.`
+          : `'${label}' changed no files; nothing was committed in staging for it.`,
+      ],
+    };
+  } catch (error) {
+    return {
+      status: "rejected",
+      label,
+      paths: diff.paths,
+      rejectedPaths: [],
+      diagnostics: [
+        `Orca could not commit '${label}'s authorized change in staging (${gitFailure(error)}).`,
+      ],
+    };
+  }
+}
+
+/**
+ * The once-per-sequence half of the gate: apply the accumulated authorized staged
+ * commits to the user's checkout, or refuse and preserve them.
+ *
+ * The order is deliberate. Every step must have committed, because an owner whose
+ * change was not authorized must not have its work reach the checkout inside
+ * somebody else's patch — one refused step fails the WHOLE promotion. Then the base
+ * binding: the user's `HEAD` and their dirty overlay must both still be what staging
+ * began from, or the patch's base is stale and the outcome is a `conflict`. Only
+ * then is the patch offered to `git apply --check` and, if that passes, applied.
+ *
+ * The binding is verified TWICE, bracketing the acceptance gate (Phase 5). Once
+ * before, so a stale base is discovered without first spending minutes of the user's
+ * time running validators on work nothing can promote; once immediately before the
+ * patch is applied, because the gate is arbitrary programs taking arbitrary time and
+ * the user is editing their own files throughout. The second check is the one the
+ * plan means by "immediately before promotion": it leaves no window wider than
+ * `git apply --check` itself, which is the last thing that can catch a base moving
+ * out from under the patch.
+ *
+ * The patch is the diff between the synthetic baseline and the LAST STAGED COMMIT,
+ * not the worktree, so anything a session left uncommitted — including a change no
+ * grant authorized, and anything the acceptance gate itself wrote — is structurally
+ * excluded from what can be promoted.
+ *
+ * At the apply stage the patch SPLITS (hardening plan, Phase 2): the governance half
+ * is held for the user ({@link GOVERNANCE_SCOPE}) and only the rest is applied. The
+ * split is the last thing that happens, deliberately — every guard above it sees the
+ * change whole, so a governance path still fails an unauthorized step, still drifts,
+ * still conflicts, and is still preserved as evidence exactly as before the phase. A
+ * hold is therefore something only a promotion that would otherwise have SUCCEEDED
+ * can produce.
+ *
+ * `acceptance` is the optional last word before the patch is applied (Phase 4): the
+ * validators `.orca/runtime.yaml` declares, run in the checkout with the sequence's
+ * complete work in place. It is consulted AFTER the base guard, because a stale base
+ * makes any promotion impossible whatever the validators think, and it is consulted
+ * even when the cumulative diff is empty, so a repository's declared checks report
+ * honestly on a delegation that changed nothing. Without a gate this function
+ * behaves exactly as it did before the phase.
+ *
+ * `signal` is the delegation's cancellation, and it exists for the gate alone
+ * (hardening plan, Phase 1): everything else here is git on local files, measured in
+ * milliseconds, while the gate is arbitrary programs taking arbitrary time. A
+ * cancellation reaching the gate comes back as a refusal with the killed run
+ * recorded, which is why this function needs no cancellation branch of its own — the
+ * work is refused, the patch is preserved, and the checkout is untouched, exactly as
+ * for a validator that failed. An abort that arrives AFTER the gate has returned is
+ * deliberately not honored: by then the declared checks have accepted the work, and
+ * what remains is one `git apply` of an already-computed patch. Racing a cancellation
+ * against it could only mean a half-applied patch, which is the one outcome this gate
+ * exists to make impossible.
+ *
+ * This never throws: a promotion failure must not destroy the delegation's
+ * outcome, so an unexpected git error becomes a `rejected` record with the reason
+ * in its diagnostics.
+ */
+export async function promoteStagedCommits(
+  workspace: StagedWorkspace,
+  staged: readonly StagedCommitRecord[],
+  acceptance?: AcceptanceGate,
+  signal?: AbortSignal,
+): Promise<PromotionRecord> {
+  const refusedSteps = staged.filter((step) => step.status !== "committed");
+  if (refusedSteps.length > 0) {
+    return refused(
+      workspace,
+      tryStagedDiff(workspace),
+      [...new Set(refusedSteps.flatMap((step) => step.rejectedPaths))].sort(),
+      [
+        "Orca refused to promote this delegation: not every step's change was authorized and " +
+          "committed in staging.",
+        ...refusedSteps.flatMap((step) => step.diagnostics),
+      ],
+    );
+  }
+
+  // The staged tip is PINNED here, before anything else runs, and every patch below
+  // is the baseline→tip diff of that one commit. Both halves matter once an
+  // acceptance gate exists: taking COMMITS excludes whatever the gate writes into
+  // the working tree, and pinning the tip excludes a gate that commits in the
+  // checkout itself — a validator is arbitrary code with the checkout as its `cwd`,
+  // so "the current HEAD" would be something it could move.
+  const tip = tryGit(workspace.dir, ["rev-parse", "HEAD"]);
+  if (!tip.ok) return unreadableStagedChange(tip.reason);
+  const stagedTip = tip.out.toString("utf8").trim();
+
+  const beforeGate = tryCommitDiff(workspace.dir, workspace.baselineCommit, stagedTip);
+  if (!beforeGate.ok) return unreadableStagedChange(beforeGate.reason);
+
+  const staleBeforeGate = detectBaseDrift(workspace, beforeGate.diff.paths);
+  if (staleBeforeGate) return conflicted(workspace, beforeGate.diff, staleBeforeGate);
+
+  const gate = await acceptance?.(workspace, signal);
+
+  // Re-diff AFTER the gate: what is offered to the user's files is computed once the
+  // validators have finished doing whatever they do, and it is still only the pinned
+  // committed work. A validator cannot smuggle a change into a promotion it cleared,
+  // and the patch preserved from a refusal is the delegation's work rather than the
+  // delegation's work plus a formatter's opinion of it.
+  const afterGate = tryCommitDiff(workspace.dir, workspace.baselineCommit, stagedTip);
+  if (!afterGate.ok) return unreadableStagedChange(afterGate.reason, gate);
+  const diff = afterGate.diff;
+
+  if (gate && !gate.ok) {
+    // A cancelled run is read off the evidence rather than off the signal: the signal
+    // can fire in the moment AFTER a validator genuinely failed, and blaming the
+    // cancellation for a red suite would send the steward looking in the wrong place.
+    const cancelled = gate.validations.some((run) => run.status === "cancelled");
+    return refused(
+      workspace,
+      diff,
+      [],
+      [
+        cancelled
+          ? "Orca refused to promote this delegation: it was cancelled while the validators this " +
+            "repository declares in `.orca/runtime.yaml` were running."
+          : "Orca refused to promote this delegation: a validator this repository declares in " +
+            "`.orca/runtime.yaml` did not pass.",
+        ...gate.diagnostics,
+      ],
+      gate,
+    );
+  }
+
+  // The base binding again, now that the gate has finished and the next statement
+  // would touch the user's files. Everything the acceptance gate did happened inside
+  // this window: the programs it ran took real time, and they are arbitrary code that
+  // could itself have written into the user's checkout.
+  const staleNow = detectBaseDrift(workspace, diff.paths);
+  if (staleNow) return conflicted(workspace, diff, staleNow, gate);
+
+  // The apply stage, and the one place the governance narrowing lives (hardening
+  // plan, Phase 2). Everything above this line — the per-step guard, the pinned tip,
+  // both base checks, the acceptance gate, and the cumulative `diff` a refusal
+  // preserves — sees the change WHOLE, so a governance path still drifts, still
+  // conflicts, and is still evidence exactly as it was before this phase. Only what
+  // is handed to `git apply` is narrowed.
+  const split = trySplitAtGovernance(workspace.dir, workspace.baselineCommit, stagedTip);
+  if (!split.ok) return unreadableStagedChange(split.reason, gate);
+  const { promotable, governance } = split;
+
+  if (promotable.patch.length === 0) {
+    const holding = holdGovernance(workspace, governance);
+    if (!holding.ok) return refused(workspace, diff, [], [heldFailure(holding.reason)], gate);
+    return {
+      status: holding.held ? "held" : "promoted",
+      appliedPaths: [],
+      rejectedPaths: [],
+      driftedPaths: [],
+      heldGovernance: holding.held,
+      validations: gate?.validations ?? [],
+      diagnostics: [
+        holding.held
+          ? "The delegation changed nothing outside the governance directory, so nothing was applied " +
+            "to your checkout."
+          : "The delegation changed no files, so there was nothing to promote.",
+        ...(gate ? gate.diagnostics : []),
+      ],
+    };
+  }
+
+  // Only the promotable half is checked, because only the promotable half is applied.
+  // Whether the HELD patch still applies is a question with a shelf life — the user
+  // may edit their own `.orca/**` between now and whenever they decide — so it is
+  // asked when the patch is offered, not now. A failing check here aborts before
+  // anything is written, so a refusal can never leave the checkout half-changed.
+  const check = tryGit(
+    workspace.repoRoot,
+    ["apply", "--check", "--whitespace=nowarn"],
+    promotable.patch,
+  );
+  if (!check.ok) {
+    return refused(
+      workspace,
+      diff,
+      [],
+      [
+        "Orca refused to promote this delegation: the staged patch does not apply cleanly to your " +
+          `checkout (git apply --check failed: ${check.reason}).`,
+      ],
+      gate,
+    );
+  }
+
+  const holding = holdGovernance(workspace, governance);
+  if (!holding.ok) return refused(workspace, diff, [], [heldFailure(holding.reason)], gate);
+
+  const applied = tryGit(workspace.repoRoot, ["apply", "--whitespace=nowarn"], promotable.patch);
+  if (!applied.ok) {
+    return refused(
+      workspace,
+      diff,
+      [],
+      [`Orca could not apply the staged patch to your checkout (${applied.reason}).`],
+      gate,
+    );
+  }
+
+  return {
+    status: "promoted",
+    appliedPaths: promotable.paths,
+    rejectedPaths: [],
+    driftedPaths: [],
+    heldGovernance: holding.held,
+    validations: gate?.validations ?? [],
+    diagnostics: [
+      `Promoted ${promotable.paths.length} authorized path(s) to your checkout as unstaged changes.`,
+      ...(gate ? gate.diagnostics : []),
+    ],
+  };
+}
+
+/** The refusal wording for a governance change that could not be held. */
+function heldFailure(reason: string): string {
+  return (
+    "Orca refused to promote this delegation: its change to the governance directory " +
+    `\`${GOVERNANCE_SCOPE}\` could not be held for your approval (${reason}), and promoting the rest ` +
+    "while silently dropping that change is not something Orca will do."
+  );
+}
+
+/**
+ * Record that promotion was never attempted — the delegation did not complete —
+ * while still preserving whatever it staged, so a failed or cancelled attempt
+ * leaves recoverable evidence instead of discarding the work with the checkout.
+ * Like {@link promoteStagedCommits} this never throws.
+ */
+export function abandonStagedWork(workspace: StagedWorkspace, reason: string): PromotionRecord {
+  let diff: StagedDiff;
+  try {
+    diff = stagedDiff(workspace);
+  } catch (error) {
+    return {
+      status: "not_attempted",
+      appliedPaths: [],
+      rejectedPaths: [],
+      driftedPaths: [],
+      validations: [],
+      diagnostics: [reason, `The staged change could not be read (${gitFailure(error)}).`],
+    };
+  }
+  const preserved = preservePatch(workspace, diff.patch);
+  return {
+    status: "not_attempted",
+    appliedPaths: [],
+    rejectedPaths: [],
+    driftedPaths: [],
+    patchPath: preserved.path,
+    validations: [],
+    diagnostics: [
+      reason,
+      preserved.path
+        ? `Your checkout is unchanged. The staged patch is preserved at ${preserved.path}.`
+        : preserved.failure
+          ? `Your checkout is unchanged. The staged patch could NOT be preserved (${preserved.failure}).`
+          : "Your checkout is unchanged; the delegation staged no change to preserve.",
+    ],
+  };
+}
+
+/**
+ * Add the reusable accepted work to an abandoned sequence's record (hardening plan,
+ * Phase 5): the completed owners' staged commits, diffed against the synthetic
+ * baseline and written to their own patch.
+ *
+ * A DECORATOR over {@link abandonStagedWork}'s record rather than a branch inside it,
+ * because whether this artifact belongs is not a fact about staging: it is the
+ * caller's reading of WHY the sequence stopped (`needs_scope` and nothing else), and
+ * that decision stays visible at the call site in `delegation.ts`. What lives here is
+ * everything that must not: which commit the accepted work ends at, where the
+ * governance boundary falls, and the words for each way there is nothing to preserve.
+ *
+ * The cut is the last staged COMMIT of the completed owners, exactly as promotion's
+ * would be. That is what makes the patch trustworthy without inspecting it: the
+ * stopping owner never committed — {@link commitAuthorizedWork} runs only for a
+ * completed step — so its work is uncommitted in the shared checkout and is excluded
+ * structurally, not by filtering. The evidence patch, which diffs the WORKING TREE, is
+ * unaffected and still contains everything.
+ *
+ * Like everything else in the gate this never throws: a patch that cannot be written
+ * is a worse day for the steward, not a reason to lose the record that explains what
+ * happened to their files.
+ */
+export function preserveAcceptedWork(
+  workspace: StagedWorkspace,
+  staged: readonly StagedCommitRecord[],
+  abandoned: PromotionRecord,
+): PromotionRecord {
+  const also = (line: string): PromotionRecord => ({
+    ...abandoned,
+    diagnostics: [...abandoned.diagnostics, line],
+  });
+
+  const completed = staged.filter((step) => step.status === "committed" && step.commit);
+  // The LAST completed owner's commit is the accumulated tip: the owners ran in
+  // sequence in one checkout, each committing on top of the previous one.
+  const tip = completed[completed.length - 1]?.commit;
+  if (!tip) {
+    return also(
+      "No owner completed before the sequence stopped, so there is no accepted work to reuse: the " +
+        "preserved patch is evidence of the attempt and nothing in it was accepted.",
+    );
+  }
+  const owners = completed.map((step) => step.label);
+
+  const split = trySplitAtGovernance(workspace.dir, workspace.baselineCommit, tip);
+  if (!split.ok) {
+    return also(
+      `Orca could not preserve the accepted work of ${owners.join(", ")} as its own patch ` +
+        `(${split.reason}); that work is still inside the cumulative patch above.`,
+    );
+  }
+  if (split.promotable.patch.length === 0) {
+    return also(
+      split.governance.paths.length > 0
+        ? `The owner(s) that completed (${owners.join(", ")}) changed only governance path(s) under ` +
+            `\`${GOVERNANCE_SCOPE}\` (${split.governance.paths.join(", ")}), which a reusable patch may ` +
+            "not carry; that change stays in the cumulative patch above and no reusable patch was written."
+        : `The owner(s) that completed (${owners.join(", ")}) changed no files, so there is no accepted ` +
+            "work to reuse.",
+    );
+  }
+
+  try {
+    mkdirSync(dirname(workspace.acceptedPatchPath), { recursive: true });
+    writeFileSync(workspace.acceptedPatchPath, split.promotable.patch);
+  } catch (error) {
+    return also(
+      `Orca could not write the accepted work of ${owners.join(", ")} to ` +
+        `${workspace.acceptedPatchPath} (${error instanceof Error ? error.message : String(error)}); ` +
+        "that work is still inside the cumulative patch above.",
+    );
+  }
+
+  return {
+    ...abandoned,
+    acceptedWork: {
+      patchPath: workspace.acceptedPatchPath,
+      paths: split.promotable.paths,
+      owners,
+      baseCommit: workspace.baseCommit,
+      excludedGovernancePaths: split.governance.paths,
+    },
+  };
+}
+
+/**
+ * One owner's view of the sequence's single promotion.
+ *
+ * A sequence promotes once, so no owner has a promotion of its own; what an owner
+ * can honestly report is which of ITS paths the one promotion carried. On a
+ * promotion that is its committed paths narrowed to what the cumulative patch
+ * actually applied — a path an owner created and a later owner deleted nets out and
+ * is not claimed. On any refusal every owner reports the same refusal, because
+ * that is what happened to all of them: nothing was applied — including, on a
+ * `needs_scope` stop, the pointer to the reusable accepted work, which every owner's
+ * entry carries because the patch covers the sequence's completed owners rather than
+ * any one of them.
+ *
+ * The validator runs and any held governance change are carried through unnarrowed,
+ * for the same reason: the acceptance gate ran over the whole sequence's work and the
+ * hold is one decision about the sequence's one promotion, so every owner's entry
+ * answers those questions with the same evidence. The hold in particular must not be
+ * narrowed away — a single-owner delegation reports through this projection, and
+ * "promoted" with the hold dropped would tell a steward everything landed.
+ */
+export function stepPromotion(
+  sequence: PromotionRecord,
+  staged: StagedCommitRecord,
+): PromotionRecord {
+  if (sequence.status !== "promoted") return sequence;
+  const applied = staged.paths.filter((path) => sequence.appliedPaths.includes(path));
+  return {
+    status: "promoted",
+    appliedPaths: applied,
+    rejectedPaths: [],
+    driftedPaths: [],
+    heldGovernance: sequence.heldGovernance,
+    validations: sequence.validations,
+    validatorOutputPath: sequence.validatorOutputPath,
+    diagnostics: [
+      `Promoted ${applied.length} path(s) from this owner to your checkout, as part of the ` +
+        `sequence's single promotion of ${sequence.appliedPaths.length} path(s).`,
+    ],
+  };
+}

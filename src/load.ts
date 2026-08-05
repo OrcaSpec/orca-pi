@@ -3,6 +3,7 @@ import { SPEC_VERSION } from "orcaspec";
 import type { OrcaSpecDocument } from "orcaspec";
 import type { Diagnostic } from "./diagnostics";
 import { DEFAULT_MODE, type OperatingMode } from "./mode";
+import { salvageProtectedDenies, type ProtectionSalvage } from "./salvage";
 import { parseRestrictedYaml } from "./yaml";
 import { validateStructural } from "./schema";
 import { checkSemanticRules, checkUnsupportedVersion } from "./semantic";
@@ -14,6 +15,11 @@ import { checkSemanticRules, checkUnsupportedVersion } from "./semantic";
  * support check (ADR 0046) → semantic validation, short-circuiting at the first
  * failing phase. A present but unusable spec is always blocking and never
  * activates partial governance (ADR 0028).
+ *
+ * The one thing carried out of an unusable document is its protected read denies,
+ * best-effort (see `salvage.ts`). That is not partial governance: salvaged
+ * protections grant nothing and can only ADD read refusals to the fail-closed
+ * broken-spec regime.
  */
 
 export interface SpecDigest {
@@ -42,6 +48,8 @@ export type LoadOutcome =
       kind: "invalid_spec";
       digest: SpecDigest;
       diagnostics: Diagnostic[];
+      /** Protected read denies recovered from the unusable document (ADR 0015, 0068). */
+      protections: ProtectionSalvage;
     }
   | {
       kind: "unsupported_spec_version";
@@ -49,6 +57,8 @@ export type LoadOutcome =
       foundVersion: string;
       supportedVersion: string;
       diagnostics: Diagnostic[];
+      /** Protected read denies recovered from the unusable document (ADR 0015, 0068). */
+      protections: ProtectionSalvage;
     };
 
 /** Compute the spec digest from the raw document source. */
@@ -59,15 +69,23 @@ export function digestOf(source: string): SpecDigest {
 
 export function loadSpec(source: string): LoadOutcome {
   const digest = digestOf(source);
+  // Every broken outcome carries the same salvage attempt, computed from the same
+  // source, so `invalid_spec` and `unsupported_spec_version` protect reads alike.
+  const invalid = (diagnostics: Diagnostic[]): LoadOutcome => ({
+    kind: "invalid_spec",
+    digest,
+    diagnostics,
+    protections: salvageProtectedDenies(source),
+  });
 
   const yaml = parseRestrictedYaml(source);
   if (!yaml.ok) {
-    return { kind: "invalid_spec", digest, diagnostics: yaml.diagnostics };
+    return invalid(yaml.diagnostics);
   }
 
   const structural = validateStructural(yaml.value);
   if (structural.length > 0) {
-    return { kind: "invalid_spec", digest, diagnostics: structural };
+    return invalid(structural);
   }
 
   // Structural validation guarantees the six-section shape and field types.
@@ -81,12 +99,13 @@ export function loadSpec(source: string): LoadOutcome {
       foundVersion: document.spec_version,
       supportedVersion: SPEC_VERSION,
       diagnostics: [unsupported],
+      protections: salvageProtectedDenies(source),
     };
   }
 
   const semantic = checkSemanticRules(document);
   if (semantic.length > 0) {
-    return { kind: "invalid_spec", digest, diagnostics: semantic };
+    return invalid(semantic);
   }
 
   return {

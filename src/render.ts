@@ -1,4 +1,11 @@
+import { approvalStateOf, isSettled, type GovernanceApproval } from "./approval";
 import type { ResolvedDelegation, Resolution, TargetReasoning } from "./resolver";
+import {
+  GOVERNANCE_SCOPE,
+  type AcceptedWork,
+  type HeldGovernance,
+  type PromotionStatus,
+} from "./staging";
 
 /**
  * Shared rendering for the two routing-preview tools. `orca_resolve` (model
@@ -20,6 +27,165 @@ export function formatGrant(delegation: ResolvedDelegation, indent = "    "): st
     `${indent}write.allow: ${list(write.allow)}`,
     `${indent}write.deny:  ${list(write.deny)}`,
   ];
+}
+
+/**
+ * The promotion facts every surface renders: the live {@link PromotionRecord} from
+ * a just-finished delegation and the flattened one a `/orca` history entry was
+ * rebuilt from both satisfy this shape, so both render through the two functions
+ * below and cannot disagree about what happened to the user's files.
+ */
+export interface PromotionView {
+  status: PromotionStatus;
+  appliedPaths: string[];
+  rejectedPaths: string[];
+  driftedPaths: string[];
+  patchPath?: string;
+  heldGovernance?: HeldGovernance;
+  /**
+   * The reusable accepted work a `needs_scope` stop preserved (hardening plan, Phase
+   * 5). Rendered from the structured record for the same reason the hold is: the two
+   * preserved patches mean different things, and a steward who cannot tell which is
+   * which will either apply the wrong one or apply neither.
+   */
+  acceptedWork?: AcceptedWork;
+  /**
+   * What the user decided about {@link heldGovernance} afterwards (hardening plan,
+   * Phase 3), when they have decided anything. It is not part of the promotion — the
+   * promotion ended before the decision existed — which is exactly why it is a separate
+   * field the caller supplies: the live report a delegation prints has none, and a
+   * history entry has whatever the approval action last recorded.
+   */
+  governanceApproval?: GovernanceApproval;
+  diagnostics: string[];
+}
+
+/**
+ * The one-line answer to "what reached my files". Every refusal says the same two
+ * things — nothing applied, checkout unchanged — because that is the fact a steward
+ * needs before any explanation of why.
+ *
+ * A hold is named in the headline as well as in the detail (hardening plan, Phase 2),
+ * including on a `promoted` that applied other paths: "promoted" alone would let a
+ * steward close the report believing the whole delegation landed.
+ */
+export function promotionHeadline(promotion: PromotionView, label = "Promotion"): string {
+  const held = promotion.heldGovernance?.paths.length ?? 0;
+  // An approved hold must change the HEADLINE too, not only the detail: "await your
+  // approval" is an instruction, and repeating it after the user has approved sends them
+  // to do a thing they already did.
+  const approved = isSettled(promotion.governanceApproval);
+  const headline: Record<PromotionStatus, string> = {
+    promoted:
+      `${label}: promoted — ${promotion.appliedPaths.length} path(s) applied to your checkout` +
+      (held > 0
+        ? approved
+          ? `, ${held} governance path(s) APPROVED and applied.`
+          : `, ${held} governance path(s) HELD for your approval.`
+        : "."),
+    held: approved
+      ? `${label}: HELD, then APPROVED — the delegation applied nothing; its ${held} governance ` +
+        "path(s) were approved and applied."
+      : `${label}: HELD — nothing was applied; ${held} governance path(s) await your approval.`,
+    rejected: `${label}: REJECTED — nothing was applied; your checkout is unchanged.`,
+    conflict: `${label}: CONFLICT — your checkout moved; nothing was applied.`,
+    not_attempted: `${label}: not attempted — nothing was applied; your checkout is unchanged.`,
+  };
+  return headline[promotion.status];
+}
+
+/**
+ * The pending governance patch, in the words both surfaces use (hardening plan,
+ * Phase 2). Derived from the structured {@link HeldGovernance} rather than written
+ * into the gate's diagnostics, because this is the one piece of a promotion report
+ * that is also an INSTRUCTION: the patch is the only copy of an authorized change
+ * that was deliberately not applied, and the hint has to name the base it expects so
+ * a user applying it days later knows what it was computed against.
+ */
+function heldGovernanceLines(
+  held: HeldGovernance,
+  approval: GovernanceApproval | undefined,
+  indent: string,
+): string[] {
+  // An approved hold is no longer an instruction, so it stops reading like one: the paths
+  // and the patch stay on the record (the patch is what was approved), and the pending
+  // sentence and the apply hint go away. A refused ATTEMPT keeps the instruction and adds
+  // what happened, because the change still has not landed and the reason is what the
+  // steward needs before they try again.
+  if (approval && isSettled(approval)) {
+    return [
+      `${indent}APPROVED — ${held.paths.length} governance path(s) under \`${GOVERNANCE_SCOPE}\` were ` +
+        `${approvalStateOf(approval)}: ${held.paths.join(", ")}.`,
+      `${indent}The approved patch is preserved at ${held.patchPath}.`,
+    ];
+  }
+  return [
+    `${indent}HELD FOR YOUR APPROVAL — ${held.paths.length} governance path(s) under ` +
+      `\`${GOVERNANCE_SCOPE}\` were NOT applied: ${held.paths.join(", ")}.`,
+    `${indent}A delegated agent may not change the documents that govern the agents, so the change ` +
+      `is waiting as a patch at ${held.patchPath}.`,
+    ...(approval ? [`${indent}Last attempt: ${approvalStateOf(approval)}.`] : []),
+    `${indent}To approve it: \`/orca approve\`. To apply it yourself: \`git apply ${held.patchPath}\` ` +
+      `— it was generated against ${held.baseCommit}, the base captured when the delegation was staged.`,
+  ];
+}
+
+/**
+ * The reusable accepted work, in the words both surfaces use (hardening plan, Phase
+ * 5), and what tells it apart from the cumulative patch named just above it.
+ *
+ * Both artifacts are patches in the same directory with almost the same name, and the
+ * difference is the whole point: one is EVIDENCE of an attempt that did not land, the
+ * other is a SUBSET of it that was accepted and is worth reusing. So these lines say
+ * which owners it covers, that it holds nothing from the owner that stopped, and what
+ * `git apply` will and will not do with it. Nothing here promises the patch still
+ * applies — no stale-base machinery guards it — so the hint says what base it was
+ * generated against and leaves the decision with the user.
+ */
+function acceptedWorkLines(accepted: AcceptedWork, indent: string): string[] {
+  return [
+    `${indent}REUSABLE ACCEPTED WORK — the ${accepted.owners.length} owner(s) that completed before the ` +
+      `stop (${accepted.owners.join(", ")}) had ${accepted.paths.length} path(s) authorized and accepted ` +
+      `in staging, preserved as their own patch at ${accepted.patchPath}: ${accepted.paths.join(", ")}.`,
+    `${indent}That patch holds ONLY that accepted work — nothing from the owner that stopped the ` +
+      "sequence, not even its edits to the same files. The cumulative patch named above is the other " +
+      "thing: evidence of the whole attempt, unfinished work included.",
+    ...(accepted.excludedGovernancePaths.length > 0
+      ? [
+          `${indent}Left out of it: ${accepted.excludedGovernancePaths.length} governance path(s) under ` +
+            `\`${GOVERNANCE_SCOPE}\` (${accepted.excludedGovernancePaths.join(", ")}). Promotion would ` +
+            "have held those for your approval rather than applying them, so a patch offered for reuse " +
+            "does not carry them; they remain in the cumulative patch.",
+        ]
+      : []),
+    `${indent}To reuse it: \`git apply ${accepted.patchPath}\` — it was generated against ` +
+      `${accepted.baseCommit}, the base captured when the delegation was staged, and it is ordinary git ` +
+      "from here: nothing re-checks that base for you, and Orca will not apply it or reseed a follow-up " +
+      "delegation on its own.",
+  ];
+}
+
+/**
+ * Why the promotion ended that way, in the gate's own words, LED by anything held
+ * for approval — a pending decision outranks an explanation of what already
+ * happened. The drifted paths and the preserved patch are not repeated as separate
+ * lines: the gate's diagnostics already name both, and a conflict's recovery hint is
+ * one of them.
+ *
+ * Reusable accepted work comes AFTER the diagnostics rather than before them, unlike a
+ * hold: it is an option, not a pending decision, and it is only legible once the
+ * cumulative patch it is a subset of has been named.
+ */
+export function promotionDetailLines(promotion: PromotionView, indent = "  "): string[] {
+  const lines = promotion.heldGovernance
+    ? heldGovernanceLines(promotion.heldGovernance, promotion.governanceApproval, indent)
+    : [];
+  for (const diagnostic of promotion.diagnostics) lines.push(`${indent}${diagnostic}`);
+  if (promotion.acceptedWork) lines.push(...acceptedWorkLines(promotion.acceptedWork, indent));
+  if (promotion.rejectedPaths.length > 0) {
+    lines.push(`${indent}Unauthorized paths in the staged change: ${promotion.rejectedPaths.join(", ")}`);
+  }
+  return lines;
 }
 
 function delegationHeader(delegation: ResolvedDelegation): string {

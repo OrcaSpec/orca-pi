@@ -65,9 +65,14 @@ export const ENFORCEMENT_PROFILE: readonly EnforcementDimension[] = [
 ] as const;
 
 /**
- * Contract 1.1 profile. The 1.0 profile above remains readable for historical
- * evidence; new delegations may claim this profile only when their bash tool is
- * wrapped by post-command and checkpoint reconciliation.
+ * Contract 1.1 profile — what THIS runtime does, and therefore what `/orca`
+ * renders. The 1.0 profile above remains readable for historical evidence only:
+ * its bash row predates post-command reconciliation and its promotion row
+ * predates staged promotion, so presenting it now would understate bash
+ * accountability and outright misstate promotion gating. A delegation may claim
+ * this profile only when its bash tool is wrapped by post-command and checkpoint
+ * reconciliation (it is — `delegation-tools.ts`) and its change reaches the
+ * checkout only through the promotion gate (it does — `staging.ts`).
  */
 export const ENFORCEMENT_PROFILE_1_1: readonly EnforcementDimension[] = [
   { dimension: "Repository reads via file tools", claim: "enforced", detail: "Enforced" },
@@ -87,7 +92,13 @@ export const ENFORCEMENT_PROFILE_1_1: readonly EnforcementDimension[] = [
     claim: "reconciled",
     detail: "Observed manifests plus sanitized mutation-disposition evidence",
   },
-  { dimension: "Promotion gating", claim: "enforced", detail: "Unauthorized mutations excluded" },
+  {
+    dimension: "Promotion gating",
+    claim: "enforced",
+    detail:
+      "Staged in a git worktree; every changed path is authorized against the grant, the base it was " +
+      "staged from is re-verified, and it is applied via git apply, or nothing is applied",
+  },
 ] as const;
 
 /** The ADR 0023 explanatory summary for a delegation's tool set. */

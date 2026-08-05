@@ -78,6 +78,48 @@ describe("detectRepositoryState", () => {
     }
   });
 
+  it("states what a broken spec actually enforces, so status cannot contradict behavior", () => {
+    // `/orca` reads these lines; `classifyBrokenSpec` implements them. Both broken
+    // states make the same claim: writes blocked in both modes, reads available.
+    for (const fixture of ["duplicate-agent-id", "unsupported-spec-version"] as const) {
+      writeSpec(dir, orcaspec.loadFixtureSource(fixture));
+      const lines = formatStatusLines(detectRepositoryState(dir)).join("\n");
+      expect(lines, `${fixture}: names the block`).toContain("write and edit are BLOCKED");
+      expect(lines, `${fixture}: covers delegation`).toContain("orca_delegate is unavailable");
+      expect(lines, `${fixture}: covers both modes`).toContain(
+        "advisory and enforce modes alike",
+      );
+      expect(lines, `${fixture}: reads proceed`).toContain(
+        "Discovery reads (read, grep, find, ls) proceed",
+      );
+    }
+  });
+
+  it("states which read-protection regime a broken spec is under, in all three outcomes", () => {
+    // `/orca` must agree with what `classifyBrokenSpec` actually does, including the
+    // case where protections lapsed — a lapse the user is not told about is the one
+    // failure this phase exists to prevent.
+    const base = orcaspec.loadFixtureSource("multi-owner"); // protected read: secrets/**
+
+    writeSpec(dir, `${base}\nnot_a_section:\n  anything: true\n`);
+    const enforcing = formatStatusLines(detectRepositoryState(dir)).join("\n");
+    expect(enforcing, "names the salvaged set").toContain("ENFORCING 1");
+    expect(enforcing, "names the scope it enforces").toContain("secrets/**");
+    expect(enforcing, "and no longer claims reads are wholly unscoped").toContain(
+      "unscoped except for the salvaged protected paths",
+    );
+
+    writeSpec(dir, base.replace("protected_denies:\n  read:\n    - secrets/**", "protected_denies: 3\n#"));
+    const lapsed = formatStatusLines(detectRepositoryState(dir)).join("\n");
+    expect(lapsed, "states the lapse").toContain("LAPSED");
+    expect(lapsed, "carries the salvage diagnostic").toContain("salvage.protections_lapsed");
+
+    writeSpec(dir, orcaspec.loadFixtureSource("duplicate-agent-id")); // declares read: []
+    const none = formatStatusLines(detectRepositoryState(dir)).join("\n");
+    expect(none, "a document with nothing to lose has not lapsed").not.toContain("LAPSED");
+    expect(none).toContain("none are declared");
+  });
+
   it("reports unsupported_spec_version identically in both modes", () => {
     writeSpec(dir, orcaspec.loadFixtureSource("unsupported-spec-version"));
     const advisory = detectRepositoryState(dir, "advisory");

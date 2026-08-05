@@ -1,9 +1,10 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { OrcaSpecDocument } from "orcaspec";
-import type { Diagnostic } from "./diagnostics";
+import { formatDiagnostic, type Diagnostic } from "./diagnostics";
 import { DEFAULT_MODE, stricterMode, type OperatingMode } from "./mode";
 import { loadSpec, type DeclaredAgent, type SpecDigest } from "./load";
+import { describeProtectionSalvage, type ProtectionSalvage } from "./salvage";
 
 /** Directory, relative to the repository root, that holds the OrcaSpec document. */
 export const ORCA_DIR = ".orca";
@@ -55,6 +56,8 @@ export interface InvalidSpecState {
   specPath: string;
   digest: SpecDigest;
   diagnostics: Diagnostic[];
+  /** Protected read denies salvaged from the unusable document (see `salvage.ts`). */
+  protections: ProtectionSalvage;
 }
 
 /** The spec declares a well-formed but unsupported `spec_version`. */
@@ -66,7 +69,16 @@ export interface UnsupportedSpecVersionState {
   foundVersion: string;
   supportedVersion: string;
   diagnostics: Diagnostic[];
+  /** Protected read denies salvaged from the unusable document (see `salvage.ts`). */
+  protections: ProtectionSalvage;
 }
+
+/**
+ * The two states in which a spec is PRESENT but unusable. Governance fails closed
+ * in both (ADR 0028): they are not `unmanaged`, and they never activate policy —
+ * see `classifyBrokenSpec` in `governance.ts`.
+ */
+export type BrokenSpecState = InvalidSpecState | UnsupportedSpecVersionState;
 
 /** Absolute path to the OrcaSpec document for a repository root. */
 export function specPathFor(cwd: string): string {
@@ -112,6 +124,7 @@ export function detectRepositoryState(
         specPath,
         digest: outcome.digest,
         diagnostics: outcome.diagnostics,
+        protections: outcome.protections,
       };
     case "unsupported_spec_version":
       return {
@@ -122,6 +135,7 @@ export function detectRepositoryState(
         foundVersion: outcome.foundVersion,
         supportedVersion: outcome.supportedVersion,
         diagnostics: outcome.diagnostics,
+        protections: outcome.protections,
       };
   }
 }
@@ -187,6 +201,7 @@ export function formatStatusLines(state: RepositoryState): string[] {
         `Spec: ${state.specPath}`,
         `Digest: ${state.digest.short}`,
         "The OrcaSpec document is present but failed validation. Orca-managed work is blocked in both advisory and enforce modes until it is fixed (ADR 0028).",
+        ...brokenSpecEnforcementLines(state),
         ...formatDiagnostics(state.diagnostics),
       ];
     case "unsupported_spec_version":
@@ -195,21 +210,33 @@ export function formatStatusLines(state: RepositoryState): string[] {
         `Spec: ${state.specPath}`,
         `Digest: ${state.digest.short}`,
         `The document declares spec_version '${state.foundVersion}', but this runtime supports '${state.supportedVersion}'. Orca-managed work is blocked in both modes until the version is supported or the document is updated (ADR 0028, 0046).`,
+        ...brokenSpecEnforcementLines(state),
         ...formatDiagnostics(state.diagnostics),
       ];
   }
 }
 
+/**
+ * What a broken spec actually enforces, stated where the user reads the state.
+ * This text and `classifyBrokenSpec` describe one behavior: if they disagree, the
+ * status is lying. The read-protection regime is rendered from the state's own
+ * salvage record through the same `describeProtectionSalvage` the block reasons
+ * and the steward note use, so all three cannot disagree about it. The dimensioned
+ * enforcement profile is deliberately NOT shown for a broken spec — no
+ * constructive routing is active to describe.
+ */
+function brokenSpecEnforcementLines(state: BrokenSpecState): string[] {
+  const salvaged = state.protections.kind === "enforcing";
+  return [
+    "In effect right now: write and edit are BLOCKED for the parent session and orca_delegate is unavailable, in advisory and enforce modes alike — a spec that is present but unusable fails closed rather than reverting to ungoverned writes.",
+    `Discovery reads (read, grep, find, ls) proceed ${salvaged ? "unscoped except for the salvaged protected paths below" : "unscoped"} so you can inspect the document and fix it.`,
+    describeProtectionSalvage(state.protections),
+    ...state.protections.diagnostics.map((diagnostic) => `  - ${formatDiagnostic(diagnostic)}`),
+  ];
+}
+
 function formatDiagnostics(diagnostics: Diagnostic[]): string[] {
   const lines = [`Diagnostics (${diagnostics.length}):`];
-  for (const diagnostic of diagnostics) {
-    const location =
-      diagnostic.pointer !== undefined && diagnostic.pointer !== ""
-        ? ` at ${diagnostic.pointer}`
-        : diagnostic.path
-          ? ` at ${diagnostic.path}`
-          : "";
-    lines.push(`  - [${diagnostic.reason}]${location}: ${diagnostic.message}`);
-  }
+  for (const diagnostic of diagnostics) lines.push(`  - ${formatDiagnostic(diagnostic)}`);
   return lines;
 }

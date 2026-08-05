@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +11,7 @@ import type {
   DelegationSessionConfig,
 } from "../src/delegation";
 import type { PersistedDelegationRecord } from "../src/delegation-entry";
+import { initGitRepo, makeStateRoot } from "./git-fixture";
 
 const fakeModel = { id: "offline-fixture", provider: "offline" } as unknown as Model<any>;
 const fixtureOutput = process.env.ORCA_CROSS_PACKAGE_OUTPUT;
@@ -39,8 +40,10 @@ describe("cross-package canonical delegation fixture", () => {
   it("emits one deterministic provider-then-tests v2 sequence without inference", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-01-02T03:04:05.000Z"));
-    const repository = mkdtempSync(join(tmpdir(), "orca-cross-package-v2-"));
-    temporaryRoots.push(repository);
+    // A real git repository: each owner stages into a worktree and promotes back.
+    const repository = initGitRepo(realpathSync(mkdtempSync(join(tmpdir(), "orca-cross-package-v2-"))));
+    const stateRoot = makeStateRoot();
+    temporaryRoots.push(repository, stateRoot);
     mkdirSync(join(repository, ORCA_DIR), { recursive: true });
     writeFileSync(
       join(repository, ORCA_DIR, ORCA_SPEC_FILE),
@@ -123,6 +126,7 @@ describe("cross-package canonical delegation fixture", () => {
       getThinkingLevel: () => "medium",
       createSession,
       onDelegationRecord: (record) => records.push(record),
+      stateRoot,
     };
 
     const result = await createDelegateTool(deps).execute(

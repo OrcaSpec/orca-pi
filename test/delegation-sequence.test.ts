@@ -1,5 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as orcaspec from "orcaspec";
@@ -14,6 +13,7 @@ import {
   type DelegationSession,
   type DelegationSessionConfig,
 } from "../src/delegation";
+import { makeGitRepo, makeStateRoot } from "./git-fixture";
 
 /**
  * The pure multi-owner sequence runner (ADR 0006, 0009, 0077, 0083) and the
@@ -72,12 +72,17 @@ function sessions(scripts: Record<string, Script>, fallback?: Script) {
 }
 
 describe("runDelegationSequence", () => {
+  // Real git repositories: the sequence runs in one shared staging worktree and
+  // promotes its cumulative authorized change back into this checkout once.
   let dir: string;
+  let stateRoot: string;
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "orca-pi-seq-"));
+    dir = makeGitRepo("orca-pi-seq-");
+    stateRoot = makeStateRoot();
   });
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
   });
 
   it("runs owners strictly sequentially in order, never interleaved", async () => {
@@ -90,7 +95,7 @@ describe("runDelegationSequence", () => {
     const { createSession } = sessions({ billing: track, web: track, infra: track });
     const seq = await runDelegationSequence(
       orderedFor(dir, ["apps/web/app.tsx", "services/billing/x.rb", "infra/main.tf"]),
-      { createSession },
+      { createSession, stateRoot },
     );
     // Each owner starts only after the previous one ends (no interleave).
     expect(events).toEqual([
@@ -146,11 +151,83 @@ describe("runDelegationSequence", () => {
       dependencies: ["billing"],
     };
 
-    const sequence = await runDelegationSequence([web, billing], { createSession });
+    const sequence = await runDelegationSequence([web, billing], { createSession, stateRoot });
 
     expect(events).toEqual(["billing", "web"]);
     expect(sequence.assignmentGraph.executionOrder).toEqual(["billing", "web"]);
     expect(sequence.allCompleted).toBe(true);
+  });
+
+  it("hands a later owner the earlier owner's work through staging, not through the checkout", async () => {
+    // One shared staged checkout per sequence (Phase 3): billing's change is
+    // committed IN STAGING, which is where web reads it. Dependency ordering means
+    // what it says without any intermediate state reaching the user's files — the
+    // detailed transaction behavior lives in `staged-sequence.test.ts`.
+    let webSawBilling: string | undefined;
+    let checkoutHadItDuringWeb = true;
+    const { createSession } = sessions({
+      billing: async (config) => {
+        await callTool(config, "write", {
+          path: "services/billing/x.rb",
+          content: "PROVIDER = 'ready'\n",
+        });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "provider ready" });
+      },
+      web: async (config) => {
+        webSawBilling = readFileSync(join(config.cwd, "services", "billing", "x.rb"), "utf8");
+        checkoutHadItDuringWeb = existsSync(join(dir, "services", "billing", "x.rb"));
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "consumed it" });
+      },
+    });
+
+    const sequence = await runDelegationSequence(
+      orderedFor(dir, ["apps/web/app.tsx", "services/billing/x.rb"]),
+      { createSession, stateRoot },
+    );
+
+    expect(sequence.allCompleted).toBe(true);
+    expect(webSawBilling).toBe("PROVIDER = 'ready'\n");
+    expect(checkoutHadItDuringWeb).toBe(false);
+    // The single promotion at the end is what put it in the checkout.
+    expect(sequence.promotion.status).toBe("promoted");
+    expect(readFileSync(join(dir, "services", "billing", "x.rb"), "utf8")).toBe(
+      "PROVIDER = 'ready'\n",
+    );
+  });
+
+  it("promotes nothing at all when an owner stops the sequence, not even the completed owners' work", async () => {
+    const { createSession } = sessions({
+      billing: async (config) => {
+        await callTool(config, "write", {
+          path: "services/billing/x.rb",
+          content: "committed in staging\n",
+        });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "did my part" });
+      },
+      web: async (config) => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "half-done\n" });
+        await callTool(config, "orca_checkpoint", { status: "failed", summary: "could not finish" });
+      },
+    });
+
+    const sequence = await runDelegationSequence(
+      orderedFor(dir, ["apps/web/app.tsx", "services/billing/x.rb"]),
+      { createSession, stateRoot },
+    );
+
+    expect(sequence.stoppedAt).toBe("web");
+    // A sequence is one transaction: the completed owner's work is held back too.
+    expect(sequence.promotion.status).toBe("not_attempted");
+    expect(sequence.promotion.diagnostics.join("\n")).toContain("step 'web' ended 'failed'");
+    expect(existsSync(join(dir, "services", "billing", "x.rb"))).toBe(false);
+    expect(existsSync(join(dir, "apps", "web", "app.tsx"))).toBe(false);
+    // Every step reports the one promotion that did not happen.
+    for (const step of sequence.steps) {
+      if (step.kind === "delegated") {
+        expect(step.outcome.promotion.status).toBe("not_attempted");
+        expect(step.outcome.promotion.appliedPaths).toEqual([]);
+      }
+    }
   });
 
   it("rejects a cyclic assignment graph before starting any child session", async () => {
@@ -176,7 +253,7 @@ describe("runDelegationSequence", () => {
     };
     const { createSession, captured } = sessions({});
 
-    await expect(runDelegationSequence([billing, web], { createSession })).rejects.toThrow(
+    await expect(runDelegationSequence([billing, web], { createSession, stateRoot })).rejects.toThrow(
       /cycle/i,
     );
     expect(captured).toHaveLength(0);
@@ -226,7 +303,7 @@ describe("runDelegationSequence", () => {
     const { createSession } = sessions({ billing: validate, web: validate });
     const sequence = await runDelegationSequence(
       orderedFor(dir, ["services/billing/x.rb", "apps/web/app.tsx"]),
-      { createSession },
+      { createSession, stateRoot },
     );
 
     const refused = buildIntegrationRecord(sequence, dir, {
@@ -252,6 +329,7 @@ describe("runDelegationSequence", () => {
     const { createSession, captured } = sessions({});
     await runDelegationSequence(orderedFor(dir, ["apps/web/app.tsx", "services/billing/x.rb"]), {
       createSession,
+      stateRoot,
     });
     const resolution = resolve(doc, ["apps/web/app.tsx", "services/billing/x.rb"]);
     const billing = resolution.delegations.find((d) => d.owner === "billing")!.grant;
@@ -271,7 +349,7 @@ describe("runDelegationSequence", () => {
       });
       const seq = await runDelegationSequence(
         orderedFor(dir, ["apps/web/app.tsx", "services/billing/x.rb"]),
-        { createSession },
+        { createSession, stateRoot },
       );
       expect(captured.map((c) => c.owner)).toEqual(["billing"]); // web never spawned
       expect(seq.stoppedAt).toBe("billing");
@@ -323,7 +401,7 @@ describe("runDelegationSequence", () => {
       ...orderedFor(dir, ["apps/web/app.tsx"]),
     ];
     const { createSession, captured } = sessions({});
-    const seq = await runDelegationSequence(ordered, { createSession });
+    const seq = await runDelegationSequence(ordered, { createSession, stateRoot });
     expect(captured).toHaveLength(0); // the build failure never spawns; web is not started
     expect(seq.steps[0].kind).toBe("build_failed");
     if (seq.steps[0].kind === "build_failed") expect(seq.steps[0].failureKind).toBe("required_missing");
@@ -338,7 +416,7 @@ describe("runDelegationSequence", () => {
     const { createSession, captured } = sessions({});
     const seq = await runDelegationSequence(
       orderedFor(dir, ["apps/web/app.tsx", "services/billing/x.rb"]),
-      { createSession, signal: AbortSignal.abort() },
+      { createSession, stateRoot, signal: AbortSignal.abort() },
     );
     expect(captured).toHaveLength(0);
     expect(seq.cancelled).toBe(true);
@@ -355,7 +433,7 @@ describe("runDelegationSequence", () => {
     });
     const seq = await runDelegationSequence(
       orderedFor(dir, ["apps/web/app.tsx", "services/billing/x.rb"]),
-      { createSession, signal: controller.signal },
+      { createSession, stateRoot, signal: controller.signal },
     );
     expect(abort).toHaveBeenCalled();
     expect(captured.map((c) => c.owner)).toEqual(["billing"]); // web never spawned
@@ -381,7 +459,7 @@ describe("runDelegationSequence", () => {
     });
     const seq = await runDelegationSequence(
       orderedFor(dir, ["apps/web/app.tsx", "services/billing/x.rb"]),
-      { createSession, signal: controller.signal },
+      { createSession, stateRoot, signal: controller.signal },
     );
     expect(captured.map((c) => c.owner)).toEqual(["billing"]); // web never spawned
     expect(seq.cancelled).toBe(true);
