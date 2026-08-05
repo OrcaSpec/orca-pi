@@ -438,6 +438,22 @@ describe("abandoning staged work", () => {
     expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("committed\n");
   });
 
+  it("reports a state directory it cannot write to instead of throwing", () => {
+    const { repo, stateRoot } = fixture();
+    // The patches directory's path is occupied by a file. Preserving evidence is the
+    // last thing a failed delegation does, and it must not be able to destroy the
+    // record explaining what happened to the user's files.
+    writeFileSync(join(stateRoot, "patches"), "in the way\n");
+    const workspace = open(repo, stateRoot);
+    writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "unfinished\n");
+
+    const record = abandonStagedWork(workspace, "cancelled.");
+
+    expect(record.status).toBe("not_attempted");
+    expect(record.patchPath).toBeUndefined();
+    expect(record.diagnostics.join("\n")).toMatch(/could NOT be preserved/);
+  });
+
   it("preserves an unauthorized change too, since nothing is being applied", () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);

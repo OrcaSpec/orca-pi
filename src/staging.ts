@@ -670,12 +670,49 @@ function tryStagedDiff(workspace: StagedWorkspace): StagedDiff {
   }
 }
 
-/** Write a patch into the state directory as evidence; returns its path. */
-function preservePatch(workspace: StagedWorkspace, patch: Buffer): string | undefined {
-  if (patch.length === 0) return undefined;
-  mkdirSync(dirname(workspace.patchPath), { recursive: true });
-  writeFileSync(workspace.patchPath, patch);
-  return workspace.patchPath;
+/**
+ * What became of the evidence patch: where it was written, or why it could not be.
+ * Three states rather than two, because "no patch" and "a patch that could not be
+ * written" must not read the same to a steward looking for their work.
+ */
+interface PreservedPatch {
+  path?: string;
+  failure?: string;
+}
+
+/**
+ * Write a patch into the state directory as evidence.
+ *
+ * Never throws, because the two functions that call it promise not to: a state
+ * directory that cannot be written is a bad day for the evidence, not a reason to
+ * lose the promotion record that explains what happened to the user's files.
+ */
+function preservePatch(workspace: StagedWorkspace, patch: Buffer): PreservedPatch {
+  if (patch.length === 0) return {};
+  try {
+    mkdirSync(dirname(workspace.patchPath), { recursive: true });
+    writeFileSync(workspace.patchPath, patch);
+  } catch (error) {
+    return { failure: error instanceof Error ? error.message : String(error) };
+  }
+  return { path: workspace.patchPath };
+}
+
+/** The closing sentence of a refusal: nothing landed, and where the work is. */
+function preservationLine(preserved: PreservedPatch): string {
+  if (preserved.path) {
+    return (
+      "Nothing was applied; your checkout is unchanged. The staged patch is preserved at " +
+      `${preserved.path}.`
+    );
+  }
+  if (preserved.failure) {
+    return (
+      "Nothing was applied; your checkout is unchanged. The staged patch could NOT be preserved " +
+      `either (${preserved.failure}), so this delegation's work is only in the staging checkout.`
+    );
+  }
+  return "Nothing was applied; the delegation produced no change to preserve.";
 }
 
 /**
@@ -715,21 +752,16 @@ function refused(
   diagnostics: string[],
   acceptance?: AcceptanceResult,
 ): PromotionRecord {
-  const patchPath = preservePatch(workspace, diff.patch);
+  const preserved = preservePatch(workspace, diff.patch);
   return {
     status: "rejected",
     appliedPaths: [],
     rejectedPaths,
     driftedPaths: [],
-    patchPath,
+    patchPath: preserved.path,
     validations: acceptance?.validations ?? [],
     validatorOutputPath: acceptance?.validatorOutputPath,
-    diagnostics: [
-      ...diagnostics,
-      patchPath
-        ? `Nothing was applied; your checkout is unchanged. The staged patch is preserved at ${patchPath}.`
-        : "Nothing was applied; the delegation produced no change to preserve.",
-    ],
+    diagnostics: [...diagnostics, preservationLine(preserved)],
   };
 }
 
@@ -750,7 +782,7 @@ function conflicted(
   drift: BaseDrift,
   acceptance?: AcceptanceResult,
 ): PromotionRecord {
-  const patchPath = preservePatch(workspace, diff.patch);
+  const preserved = preservePatch(workspace, diff.patch);
   const diagnostics = [
     "Orca refused to promote this delegation: your checkout moved while it was running, so the " +
       "staged change is no longer based on the state it was made from.",
@@ -768,15 +800,12 @@ function conflicted(
     );
   }
   if (drift.unreadable) diagnostics.push(`Orca could not verify your base: ${drift.unreadable}.`);
-  diagnostics.push(
-    patchPath
-      ? `Nothing was applied; your checkout is unchanged. The staged patch is preserved at ${patchPath}.`
-      : "Nothing was applied; the delegation produced no change to preserve.",
-  );
-  if (patchPath) {
+  diagnostics.push(preservationLine(preserved));
+  if (preserved.path) {
     diagnostics.push(
-      `To recover the work: apply it yourself with \`git apply ${patchPath}\` (add \`--3way\` to merge ` +
-        "it into your current state), or delegate the task again so it is re-staged on your current base.",
+      `To recover the work: apply it yourself with \`git apply ${preserved.path}\` (add \`--3way\` to ` +
+        "merge it into your current state), or delegate the task again so it is re-staged on your " +
+        "current base.",
     );
   }
   return {
@@ -784,7 +813,7 @@ function conflicted(
     appliedPaths: [],
     rejectedPaths: [],
     driftedPaths: drift.paths,
-    patchPath,
+    patchPath: preserved.path,
     validations: acceptance?.validations ?? [],
     validatorOutputPath: acceptance?.validatorOutputPath,
     diagnostics,
@@ -1141,19 +1170,21 @@ export function abandonStagedWork(workspace: StagedWorkspace, reason: string): P
       diagnostics: [reason, `The staged change could not be read (${gitFailure(error)}).`],
     };
   }
-  const patchPath = preservePatch(workspace, diff.patch);
+  const preserved = preservePatch(workspace, diff.patch);
   return {
     status: "not_attempted",
     appliedPaths: [],
     rejectedPaths: [],
     driftedPaths: [],
-    patchPath,
+    patchPath: preserved.path,
     validations: [],
     diagnostics: [
       reason,
-      patchPath
-        ? `Your checkout is unchanged. The staged patch is preserved at ${patchPath}.`
-        : "Your checkout is unchanged; the delegation staged no change to preserve.",
+      preserved.path
+        ? `Your checkout is unchanged. The staged patch is preserved at ${preserved.path}.`
+        : preserved.failure
+          ? `Your checkout is unchanged. The staged patch could NOT be preserved (${preserved.failure}).`
+          : "Your checkout is unchanged; the delegation staged no change to preserve.",
     ],
   };
 }
