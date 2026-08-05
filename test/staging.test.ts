@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { DomainAgent } from "orcaspec";
 import { compileGrant, type CompiledGrant } from "../src/resolver";
 import {
@@ -502,6 +503,11 @@ describe("closing a staging workspace", () => {
 
 describe("the runtime state root", () => {
   it("lives under pi's agent directory, so it follows the same convention as the child loader", () => {
-    expect(defaultStateRoot().endsWith(join("agent", "orca"))).toBe(true);
+    // Asserted against `getAgentDir()` itself rather than a literal `agent/orca` tail:
+    // the invariant is the RELATIONSHIP to pi's agent directory, and stating it that way
+    // holds whether or not `PI_CODING_AGENT_DIR` has redirected that directory — which
+    // is the same override the doc on `defaultStateRoot` promises to honor, and the one
+    // the suite itself uses to keep its sweeps off a developer's real state.
+    expect(defaultStateRoot()).toBe(join(getAgentDir(), "orca"));
   });
 });

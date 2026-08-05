@@ -57,6 +57,8 @@ import {
   type PersistedGovernanceApproval,
 } from "./src/delegation-entry";
 import { approvalRecordLines, runApprovalAction } from "./src/approval";
+import { retentionSweepLine, runRetentionSweep, type RetentionSweep } from "./src/retention";
+import { defaultStateRoot } from "./src/staging";
 import {
   inflightFromProgress,
   progressLine,
@@ -151,6 +153,11 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
   // The in-flight delegation for the live status widget; undefined when idle.
   let inflight: InflightDelegation | undefined;
 
+  // What the last activation-time retention sweep did (hardening plan, Phase 6), kept
+  // only so `/orca` can say so in one line. Undefined until a sweep has run, and
+  // undefined again on a session start that did not sweep.
+  let lastSweep: RetentionSweep | undefined;
+
   // Advisory flags awaiting their tool_result, keyed by toolCallId. A flagged
   // (not blocked) call proceeds; when its result arrives we append the
   // explanation so the model sees the same note the human was notified of.
@@ -209,6 +216,9 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
       violations.statusLines(),
       history.statusLines(),
       history.lastDetailLines(),
+      // Housekeeping goes last and usually says nothing at all: the sweep is silent
+      // unless it actually expired something or could not do its job (`retention.ts`).
+      [retentionSweepLine(lastSweep)].filter((line): line is string => line !== undefined),
     ];
     for (const section of sections) if (section.length > 0) lines.push("", ...section);
     return lines;
@@ -321,6 +331,32 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
     // Passive detection for every start reason; the governance handlers below
     // activate independently and only when active.
     const state = currentState(ctx);
+
+    // Opportunistic evidence retention (hardening plan, Phase 6). Activation is the ONE
+    // hook, for two reasons that both matter. The reference set is complete and freshly
+    // known here and nowhere else — the history was rebuilt from session entries in the
+    // statement above — and no delegation is in flight, which makes "a sweep failure
+    // never blocks a delegation" a fact about where this is called from rather than a
+    // promise about how carefully it handles errors. Hooking delegation completion too
+    // would put filesystem work on the promotion path to collect nothing: the artifacts
+    // a delegation just wrote are the newest files in the directory, so the next
+    // activation reclaims anything genuinely expired just as well.
+    //
+    // Only under an active spec, because the window is configured in the runtime overlay
+    // and an overlay is only interpretable against the document it governs. A broken
+    // spec refuses every delegation anyway, so nothing accumulates while it sweeps
+    // nothing — the same fail-closed reading the invalid-overlay case takes.
+    lastSweep =
+      state.kind === "active"
+        ? runRetentionSweep({
+            cwd: state.cwd,
+            document: state.document,
+            stateRoot: overrides.stateRoot ?? defaultStateRoot(),
+            now: Date.now(),
+            referenced: history.referencedArtifacts(),
+          })
+        : undefined;
+
     const surface = new Surface(ctx);
     surface.status(shortStatus(state));
     surface.widget(
