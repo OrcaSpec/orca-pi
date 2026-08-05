@@ -375,7 +375,17 @@ export function detectBaseDrift(
 
 // --- The promotion gate (provider-independent) --------------------------------
 
-/** What the promotion gate did with the staged change. */
+/**
+ * What the promotion gate did with the staged change.
+ *
+ * The line between the two refusals is which side needs attention, and it is worth
+ * keeping sharp: `rejected` is about the CHANGE — a path no grant authorized, a
+ * validator that did not pass, a patch git will not take — so the delegation is what
+ * has to be different. `conflict` is about the BASE: the work is sound and the state
+ * it was built on is gone, so the answer is to recover the preserved patch or
+ * delegate again, and nothing about the delegation would have helped.
+ * `not_attempted` means the delegation never reached the gate at all.
+ */
 export type PromotionStatus = "promoted" | "rejected" | "conflict" | "not_attempted";
 
 /**

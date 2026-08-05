@@ -96,8 +96,8 @@ export const ENFORCEMENT_PROFILE_1_1: readonly EnforcementDimension[] = [
     dimension: "Promotion gating",
     claim: "enforced",
     detail:
-      "Staged in a git worktree; every changed path is authorized against the grant and applied via " +
-      "git apply, or nothing is applied",
+      "Staged in a git worktree; every changed path is authorized against the grant, the base it was " +
+      "staged from is re-verified, and it is applied via git apply, or nothing is applied",
   },
 ] as const;
 

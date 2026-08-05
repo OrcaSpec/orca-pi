@@ -177,6 +177,33 @@ describe("a user who keeps working during a delegation", () => {
   });
 });
 
+describe("a user who leaves their checkout alone", () => {
+  it("gets the promotion Phase 3 gave them, dirty overlay and all", () => {
+    const { repo, stateRoot } = fixture();
+    // A working checkout is normally dirty. The overlay is the state the delegation
+    // is staged FROM, so it must never read as drift against itself — the binding is
+    // a comparison over time, not a demand for a clean tree.
+    writeFileSync(join(repo, "keep.md"), "my uncommitted draft\n");
+    writeFileSync(join(repo, "untracked.md"), "a note I have not committed\n");
+    const workspace = open(repo, stateRoot);
+    writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "delegated work\n");
+
+    const record = gate(workspace);
+
+    expect(record).toMatchObject({
+      status: "promoted",
+      appliedPaths: ["apps/web/app.tsx"],
+      driftedPaths: [],
+    });
+    expect(record.patchPath).toBeUndefined();
+    // The user's uncommitted work is exactly as they left it, and the delegation's
+    // change arrived on top of it.
+    expect(readFileSync(join(repo, "keep.md"), "utf8")).toBe("my uncommitted draft\n");
+    expect(readFileSync(join(repo, "untracked.md"), "utf8")).toBe("a note I have not committed\n");
+    expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("delegated work\n");
+  });
+});
+
 describe("what the overlay digest does and does not count as drift", () => {
   it("counts a revert: the file is back to HEAD, which is not what was staged", () => {
     const { repo, stateRoot } = fixture();
