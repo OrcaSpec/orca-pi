@@ -1115,6 +1115,13 @@ export type SequenceStep =
  * because once the transaction cannot commit there is nothing to gain by running
  * more children, and a later owner must never inherit a failed owner's uncommitted
  * work as if it were accepted.
+ *
+ * A `needs_scope` stop is the one that leaves something reusable behind (hardening
+ * plan, Phase 5). The steward's answer to it is to delegate the same work again with
+ * wider targets, so the owners that completed before it get a SECOND patch of their
+ * own — their accepted work alone, without the stopping owner's unfinished half. It
+ * changes nothing about the stop itself: still no promotion, still the cumulative
+ * evidence patch, still a checkout nothing touched.
  */
 export interface SequenceOutcome {
   /** Per-owner results in deterministic dependency order, then owner id. */

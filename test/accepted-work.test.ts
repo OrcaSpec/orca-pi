@@ -417,6 +417,116 @@ describe("a completed owner's governance change stays out of the reusable patch"
   });
 });
 
+/**
+ * The edges of preserving accepted work, driven at the gate's seam.
+ *
+ * Every one of these is a case where the reusable patch cannot be produced, and the
+ * rule for all of them is the same: the promotion record survives. A steward whose
+ * checkout came back unchanged needs the record that explains that far more than they
+ * need a convenience artifact, so nothing here throws and nothing here is silent.
+ */
+describe("when the accepted work cannot be preserved", () => {
+  const webGrant: CompiledGrant = compileGrant(
+    {
+      id: "web",
+      name: "Web",
+      description: "Owns the web application.",
+      ownership: ["apps/web/**"],
+      permissions: { edit: { allow: ["apps/web/**"] } },
+    } satisfies DomainAgent,
+    {},
+  );
+
+  let repo: string;
+  let stateRoot: string;
+  const opened: StagedWorkspace[] = [];
+  beforeEach(() => {
+    repo = makeGitRepo("orca-accepted-edge-");
+    stateRoot = makeStateRoot();
+    mkdirSync(join(repo, "apps", "web"), { recursive: true });
+    writeFileSync(join(repo, "apps", "web", "app.tsx"), "committed app\n");
+    git(repo, "add", "-A");
+    git(repo, "-c", "user.name=F", "-c", "user.email=f@localhost", "commit", "-q", "-m", "seed");
+  });
+  afterEach(() => {
+    for (const workspace of opened.splice(0)) gitWorktreeStaging.close(workspace);
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  function open(): StagedWorkspace {
+    const result = gitWorktreeStaging.open({ cwd: repo, delegationId: "d1", stateRoot });
+    if (!result.ok) throw new Error(`staging refused: ${result.diagnostics.join(" ")}`);
+    opened.push(result.workspace);
+    return result.workspace;
+  }
+
+  function abandoned(workspace: StagedWorkspace): PromotionRecord {
+    return abandonStagedWork(workspace, "Promotion was not attempted: step 'web' ended 'needs_scope'.");
+  }
+
+  it("reports an unwritable state directory without losing the promotion record", () => {
+    const workspace = open();
+    writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "accepted app\n");
+    const staged = commitAuthorizedWork(workspace, webGrant, "web");
+    // The patch directory's path is occupied by a file, so nothing can be written
+    // inside it — a stand-in for any state directory the runtime cannot write to.
+    rmSync(join(stateRoot, "patches"), { recursive: true, force: true });
+    writeFileSync(join(stateRoot, "patches"), "in the way\n");
+
+    const record = preserveAcceptedWork(workspace, [staged], abandoned(workspace));
+
+    expect(record.status).toBe("not_attempted");
+    expect(record.acceptedWork).toBeUndefined();
+    expect(promotionText(record)).toContain("could not write the accepted work of web");
+  });
+
+  it("reports a checkout git can no longer read, rather than throwing", () => {
+    const workspace = open();
+    writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "accepted app\n");
+    const staged = commitAuthorizedWork(workspace, webGrant, "web");
+    const record = abandoned(workspace);
+    // The isolated checkout disappears under the runtime (a crashed cleanup, a full
+    // disk, a user with a wide `rm`). The record of what happened must still come back.
+    rmSync(workspace.dir, { recursive: true, force: true });
+
+    const preserved = preserveAcceptedWork(workspace, [staged], record);
+
+    expect(preserved.status).toBe("not_attempted");
+    expect(preserved.acceptedWork).toBeUndefined();
+    expect(promotionText(preserved)).toContain("could not preserve the accepted work of web");
+  });
+
+  it("treats a staged record with no commit id as nothing to preserve", () => {
+    const workspace = open();
+    writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "accepted app\n");
+    // A record claiming `committed` with no commit id cannot happen through
+    // `commitAuthorizedWork`, and if it ever did there would be no tip to diff against.
+    // Decided: it counts as nothing accepted, not as a reason to guess a commit.
+    const record = preserveAcceptedWork(
+      workspace,
+      [{ status: "committed", label: "web", paths: ["apps/web/app.tsx"], rejectedPaths: [], diagnostics: [] }],
+      abandoned(workspace),
+    );
+
+    expect(record.acceptedWork).toBeUndefined();
+    expect(promotionText(record)).toContain("No owner completed before the sequence stopped");
+  });
+
+  it("preserves binary accepted work byte-for-byte", () => {
+    const workspace = open();
+    const bytes = Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe, 0x00, 0x7f]);
+    writeFileSync(join(workspace.dir, "apps", "web", "logo.bin"), bytes);
+    const staged = commitAuthorizedWork(workspace, webGrant, "web");
+
+    const record = preserveAcceptedWork(workspace, [staged], abandoned(workspace));
+
+    expect(record.acceptedWork!.paths).toEqual(["apps/web/logo.bin"]);
+    git(repo, "apply", record.acceptedWork!.patchPath);
+    expect(readFileSync(join(repo, "apps", "web", "logo.bin"))).toEqual(bytes);
+  });
+});
+
 describe("only a needs_scope stop preserves accepted work", () => {
   let repo: string;
   let stateRoot: string;

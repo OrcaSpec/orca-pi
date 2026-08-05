@@ -60,7 +60,14 @@ import { ORCA_DIR } from "./state";
 /** The subdirectory of the state root holding one isolated checkout per delegation sequence. */
 export const CHECKOUTS_DIR = "worktrees";
 
-/** The subdirectory of the state root holding patches preserved as evidence. */
+/**
+ * The subdirectory of the state root holding preserved patches. Three kinds live
+ * here, distinguished by file name and by what a steward may do with them: the
+ * cumulative EVIDENCE patch of a delegation that did not land (`<id>.patch`), the
+ * GOVERNANCE patch a promotion held for approval (`<id>.governance.patch`, Phase 2),
+ * and the REUSABLE accepted work a `needs_scope` stop left behind
+ * (`<id>.accepted.patch`, Phase 5 — see {@link AcceptedWork}).
+ */
 export const PATCHES_DIR = "patches";
 
 /** The subdirectory of the state root holding preserved validator output. */
@@ -1357,7 +1364,10 @@ export function preserveAcceptedWork(
  * promotion that is its committed paths narrowed to what the cumulative patch
  * actually applied — a path an owner created and a later owner deleted nets out and
  * is not claimed. On any refusal every owner reports the same refusal, because
- * that is what happened to all of them: nothing was applied.
+ * that is what happened to all of them: nothing was applied — including, on a
+ * `needs_scope` stop, the pointer to the reusable accepted work, which every owner's
+ * entry carries because the patch covers the sequence's completed owners rather than
+ * any one of them.
  *
  * The validator runs and any held governance change are carried through unnarrowed,
  * for the same reason: the acceptance gate ran over the whole sequence's work and the
