@@ -1,4 +1,14 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as orcaspec from "orcaspec";
@@ -10,7 +20,14 @@ import {
   type DelegationSession,
   type DelegationSessionConfig,
 } from "../src/delegation";
-import { makeGitRepo, makeStateRoot, snapshotTree, worktreePathsOf } from "./git-fixture";
+import {
+  git,
+  headOf,
+  makeGitRepo,
+  makeStateRoot,
+  snapshotTree,
+  worktreePathsOf,
+} from "./git-fixture";
 
 /**
  * Transactional multi-owner sequences (staged-promotion plan, Phase 3): every
@@ -345,5 +362,240 @@ describe("each owner is held to its own grant inside the shared checkout", () =>
     expect(sequence.stoppedAt).toBe("billing");
     // ...and the attempt is preserved as evidence, naming what it smuggled.
     expect(readFileSync(sequence.promotion.patchPath!, "utf8")).toContain("smuggled by billing");
+  });
+
+  it("promotes only what was committed, never what appeared in the checkout afterwards", async () => {
+    // The child runtime writes into the staged checkout while it is being disposed
+    // of — after the owner's authorized change was already committed. Promotion
+    // diffs COMMITS, so such a change cannot ride along even when the path itself
+    // is inside the owner's grant. (This is also what will keep Phase 4's
+    // validators from smuggling changes into a promotion.)
+    const createSession = async (config: DelegationSessionConfig): Promise<DelegationSession> => ({
+      prompt: async () => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "reviewed\n" });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      },
+      abort: vi.fn(),
+      finish: async () => {
+        writeFileSync(join(config.cwd, "apps", "web", "app.tsx"), "rewritten during teardown\n");
+        writeFileSync(join(config.cwd, "leftover.log"), "teardown noise\n");
+      },
+    });
+
+    const sequence = await runDelegationSequence(orderedFor(repo, ["apps/web/app.tsx"]), {
+      createSession,
+      stateRoot,
+    });
+
+    expect(sequence.promotion.status).toBe("promoted");
+    expect(sequence.promotion.appliedPaths).toEqual(["apps/web/app.tsx"]);
+    // The committed content, not the teardown's version, and no extra file.
+    expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("reviewed\n");
+    expect(existsSync(join(repo, "leftover.log"))).toBe(false);
+  });
+
+  it("lets nobody claim a path a later owner removed again", async () => {
+    // design-system creates a component; web, whose grant also covers it, deletes
+    // it. The sequence's cumulative diff is the NET effect, so the path reaches the
+    // checkout from neither owner and neither owner claims it.
+    const { createSession } = sessions({
+      "design-system": async (config) => {
+        await callTool(config, "write", {
+          path: "apps/web/components/button.tsx",
+          content: "<Button/>\n",
+        });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "added button" });
+      },
+      web: async (config) => {
+        await callTool(config, "bash", { command: "rm apps/web/components/button.tsx" });
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "no button\n" });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "dropped button" });
+      },
+    });
+
+    const sequence = await runDelegationSequence(
+      orderedFor(repo, ["apps/web/app.tsx", "apps/web/components/button.tsx"]),
+      { createSession, stateRoot },
+    );
+
+    expect(sequence.promotion.status).toBe("promoted");
+    expect(sequence.promotion.appliedPaths).toEqual(["apps/web/app.tsx"]);
+    expect(existsSync(join(repo, "apps", "web", "components", "button.tsx"))).toBe(false);
+    const byOwner = new Map(
+      sequence.steps.flatMap((step) =>
+        step.kind === "delegated" ? [[step.outcome.owner, step.outcome.promotion] as const] : [],
+      ),
+    );
+    expect(byOwner.get("design-system")!.appliedPaths).toEqual([]);
+    expect(byOwner.get("web")!.appliedPaths).toEqual(["apps/web/app.tsx"]);
+  });
+});
+
+describe("edges of the staged sequence", () => {
+  let repo: string;
+  let stateRoot: string;
+  beforeEach(() => {
+    repo = makeGitRepo("orca-staged-seq-");
+    stateRoot = makeStateRoot();
+  });
+  afterEach(() => {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  /** Give each owner an assignment that depends on nothing. */
+  function independent(inputs: DelegationInputs[]): DelegationInputs[] {
+    return inputs.map((input) => ({
+      ...input,
+      assignment: {
+        schemaVersion: "1.1" as const,
+        assignmentId: `${input.owner}-step`,
+        owner: input.owner,
+        task: `${input.owner} work`,
+        targets: input.targets,
+        dependencies: [],
+      },
+    }));
+  }
+
+  it("does not run an owner that depends on nothing once the transaction cannot commit", async () => {
+    const { createSession, captured } = sessions({
+      billing: async (config) => {
+        await callTool(config, "orca_checkpoint", { status: "failed", summary: "gave up" });
+      },
+      web: async (config) => {
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "never runs" });
+      },
+    });
+
+    const sequence = await runDelegationSequence(
+      independent(orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"])),
+      { createSession, stateRoot },
+    );
+
+    // Nothing can be promoted any more, so the independent owner is not started
+    // either — it would only add work that has to be thrown away.
+    expect(captured.map((config) => config.owner)).toEqual(["billing"]);
+    expect(sequence.steps[1].kind).toBe("not_run");
+    if (sequence.steps[1].kind === "not_run") {
+      expect(sequence.steps[1].reason).toBe("sequence_stopped");
+    }
+    expect(sequence.promotion.status).toBe("not_attempted");
+  });
+
+  it("preserves the cumulative patch when the sequence dies of an unexpected throw", async () => {
+    const before = snapshotTree(repo);
+    let spawned = 0;
+    const createSession = async (config: DelegationSessionConfig): Promise<DelegationSession> => {
+      spawned += 1;
+      if (config.owner === "web") throw new Error("child runtime exploded");
+      return {
+        prompt: async () => {
+          await callTool(config, "write", {
+            path: "services/billing/x.rb",
+            content: "PROVIDER = 'ready'\n",
+          });
+          await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+        },
+        abort: vi.fn(),
+      };
+    };
+
+    await expect(
+      runDelegationSequence(orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"]), {
+        createSession,
+        stateRoot,
+      }),
+    ).rejects.toThrow(/exploded/);
+
+    expect(spawned).toBe(2);
+    // The checkout is untouched, the shared worktree is gone, and the first owner's
+    // committed work survives the crash as a recoverable patch.
+    expect(snapshotTree(repo)).toEqual(before);
+    expect(worktreePathsOf(repo)).toEqual([repo]);
+    const patches = readdirSync(join(stateRoot, "patches"));
+    expect(patches).toHaveLength(1);
+    expect(readFileSync(join(stateRoot, "patches", patches[0]), "utf8")).toContain(
+      "PROVIDER = 'ready'",
+    );
+  });
+
+  it("reports a conflict without applying anything when HEAD moves mid-sequence", async () => {
+    const stagedFrom = headOf(repo);
+    const { createSession } = sessions({
+      billing: async (config) => {
+        await callTool(config, "write", { path: "services/billing/x.rb", content: "mine\n" });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      },
+      web: async (config) => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "mine\n" });
+        // The user commits in their own checkout while the second owner works.
+        writeFileSync(join(repo, "moved.md"), "a commit landed mid-sequence\n");
+        git(repo, "add", "moved.md");
+        git(
+          repo,
+          "-c",
+          "user.name=Fixture",
+          "-c",
+          "user.email=fixture@localhost",
+          "commit",
+          "-q",
+          "-m",
+          "user commit during sequence",
+        );
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      },
+    });
+
+    const sequence = await runDelegationSequence(
+      orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"]),
+      { createSession, stateRoot },
+    );
+
+    expect(sequence.allCompleted).toBe(true);
+    expect(sequence.promotion.status).toBe("conflict");
+    expect(sequence.promotion.diagnostics.join("\n")).toContain(stagedFrom);
+    expect(existsSync(join(repo, "services", "billing", "x.rb"))).toBe(false);
+    expect(existsSync(join(repo, "apps", "web", "app.tsx"))).toBe(false);
+    // Both owners' work is in the one preserved patch.
+    const patch = readFileSync(sequence.promotion.patchPath!, "utf8");
+    expect(patch).toContain("services/billing/x.rb");
+    expect(patch).toContain("apps/web/app.tsx");
+  });
+
+  it("stages nothing for a sequence with no owners at all", async () => {
+    const { createSession, captured } = sessions({});
+
+    const sequence = await runDelegationSequence([], { createSession, stateRoot });
+
+    expect(captured).toHaveLength(0);
+    expect(sequence.steps).toEqual([]);
+    expect(sequence.allCompleted).toBe(false);
+    expect(sequence.promotion.status).toBe("not_attempted");
+    expect(existsSync(join(stateRoot, "worktrees"))).toBe(false);
+  });
+
+  it("refuses a whole sequence in a repository it cannot stage, without spawning anything", async () => {
+    const plain = realpathSync(mkdtempSync(join(tmpdir(), "orca-seq-nogit-")));
+    try {
+      const { createSession, captured } = sessions({});
+
+      const sequence = await runDelegationSequence(
+        orderedFor(plain, ["apps/web/app.tsx", "services/billing/x.rb"]),
+        { createSession, stateRoot },
+      );
+
+      expect(captured).toHaveLength(0);
+      expect(sequence.steps[0].kind).toBe("build_failed");
+      if (sequence.steps[0].kind === "build_failed") {
+        expect(sequence.steps[0].failureKind).toBe("staging_unavailable");
+        expect(sequence.steps[0].diagnostics.join("\n")).toContain("not inside a git working tree");
+      }
+      expect(sequence.steps[1].kind).toBe("not_run");
+      expect(sequence.promotion.status).toBe("not_attempted");
+      expect(sequence.promotion.patchPath).toBeUndefined();
+    } finally {
+      rmSync(plain, { recursive: true, force: true });
+    }
   });
 });

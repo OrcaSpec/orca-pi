@@ -22,14 +22,23 @@ import {
   type StagedWorkspace,
 } from "../src/staging";
 import { gitWorktreeStaging } from "../src/staging-worktree";
-import { git, headOf, makeGitRepo, makeStateRoot, worktreePathsOf } from "./git-fixture";
+import {
+  git,
+  headOf,
+  makeGitRepo,
+  makeStateRoot,
+  snapshotTree,
+  worktreePathsOf,
+} from "./git-fixture";
 
 /**
- * The staging workspace and the promotion gate on their own (staged-promotion
- * plan, Phase 2). These tests drive the gate DIRECTLY, including states a
- * well-behaved child could never produce — an unauthorized change sitting in the
- * worktree, a patch that cannot apply — because the gate is the last line of
- * defense and has to hold even when the layer above it has already failed.
+ * The staging workspace and the two-part promotion gate on their own
+ * (staged-promotion plan, Phases 2–3). These tests drive the gate DIRECTLY,
+ * including states a well-behaved child could never produce — an unauthorized
+ * change sitting in the worktree, a patch that cannot apply — because the gate is
+ * the last line of defense and has to hold even when the layer above it has
+ * already failed. The multi-owner transaction the gate's two halves exist for
+ * lives in `staged-sequence.test.ts`.
  */
 
 const webGrant: CompiledGrant = compileGrant(
@@ -364,6 +373,48 @@ describe("the promotion gate", () => {
     expect(record.status).toBe("rejected");
     expect(record.appliedPaths).toEqual([]);
     expect(record.diagnostics.join("\n")).toMatch(/could not compute the staged change/);
+  });
+
+  it("promotes nothing when no owner committed anything, uncommitted work included", () => {
+    const { repo, stateRoot } = fixture();
+    const workspace = open(repo, stateRoot);
+    writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "never committed\n");
+
+    // No steps at all: there is nothing authorized to promote, and the change
+    // sitting in the worktree is not a substitute for one.
+    const record = promoteStagedCommits(workspace, []);
+
+    expect(record).toMatchObject({ status: "promoted", appliedPaths: [] });
+    expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("committed\n");
+  });
+
+  it("carries an owner label into the staged commit inertly, whatever it contains", () => {
+    const { repo, stateRoot } = fixture();
+    // Owner and assignment ids come from a repository's spec, so a label can hold
+    // anything. Git runs argv-only (`git.ts`), so a label that looks like a shell
+    // payload or a git flag is just text in a commit message.
+    const before = snapshotTree(repo);
+    const labels = ["web; rm -rf /", "--allow-empty-message", "$(whoami)`id`", "🐙", ""];
+    for (const [index, label] of labels.entries()) {
+      const workspace = open(repo, stateRoot, `labelled-${index}`);
+      writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), `by ${label}\n`);
+
+      const staged = commitAuthorizedWork(workspace, webGrant, label);
+
+      expect(staged, `label ${JSON.stringify(label)} should commit`).toMatchObject({
+        status: "committed",
+        paths: ["apps/web/app.tsx"],
+        label,
+      });
+      expect(
+        git(workspace.dir, "log", "-1", "--pretty=%s").trim(),
+        `label ${JSON.stringify(label)} belongs in the commit subject, uninterpreted`,
+      ).toBe(`orca staged step: ${label}`.trim());
+      // Nothing ran: the repository it staged from is untouched, file for file.
+      expect(snapshotTree(repo), `label ${JSON.stringify(label)} must not touch the repo`).toEqual(
+        before,
+      );
+    }
   });
 });
 

@@ -37,11 +37,10 @@ import { COMMIT_CONFIG, gitFailure, gitRaw, gitText, tryGit } from "./git";
  *   implementation, `git worktree`. A copy-on-write provider (APFS `clonefile`,
  *   btrfs subvolume) is a drop-in alternative — it satisfies the same contract
  *   and nothing below has to change.
- * - WHAT may leave staging is not. The promotion gate here is git-native and
- *   provider-independent: it diffs the checkout against its baseline commit,
- *   authorizes each path, and applies the result with `git apply`. Every provider
- *   funnels through this one gate, so a new provider cannot invent a laxer path
- *   to the user's files.
+ * - WHAT may leave staging is not. The gate here is git-native and
+ *   provider-independent: it authorizes each changed path, commits it, and applies
+ *   the accumulated commits with `git apply`. Every provider funnels through this
+ *   one gate, so a new provider cannot invent a laxer path to the user's files.
  *
  * Two invariants are structural rather than conventional:
  *
@@ -56,7 +55,7 @@ import { COMMIT_CONFIG, gitFailure, gitRaw, gitText, tryGit } from "./git";
  * exists to prevent.
  */
 
-/** The subdirectory of the state root holding one isolated checkout per delegation. */
+/** The subdirectory of the state root holding one isolated checkout per delegation sequence. */
 export const CHECKOUTS_DIR = "worktrees";
 
 /** The subdirectory of the state root holding patches preserved as evidence. */

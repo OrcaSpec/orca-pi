@@ -134,8 +134,8 @@ function scriptedSessions(overrides: Record<string, Script> = {}) {
 // --- Fixtures ----------------------------------------------------------------
 
 let repo: string;
-// Delegations stage into their own worktrees under this root, so the suite never
-// writes into pi's real agent directory.
+// Each delegation sequence stages into a worktree under this root, so the suite
+// never writes into pi's real agent directory.
 let stateRoot: string;
 beforeEach(() => {
   repo = materializeFixtureRepo();

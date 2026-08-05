@@ -612,7 +612,7 @@ export interface DelegationEntry {
   grantId?: string;
   mutationViolations: NonNullable<CheckpointResult["mutationViolations"]>;
   validation: CheckpointResult["validation"];
-  /** What the promotion gate did with this delegation's staged change. */
+  /** This owner's view of its sequence's single promotion (see `staging.ts`). */
   promotion: PromotionRecord;
   sequenceId?: string;
   stepId?: string;
@@ -630,7 +630,11 @@ export interface DelegationOutcome {
   appendEntry: DelegationEntry;
   assignment: OwnerAssignment;
   upstreamHandoffs: UpstreamHandoff[];
-  /** Whether the staged change reached the user's checkout, and why (or why not). */
+  /**
+   * Whether this owner's staged change reached the user's checkout, and why (or why
+   * not). A sequence promotes once, so this is that one promotion seen from this
+   * owner's side: on success it names only the paths this owner contributed.
+   */
   promotion: PromotionRecord;
 }
 
@@ -1324,7 +1328,9 @@ export async function runDelegationSequence(
   let stagingRefusal: string[] | undefined;
   /**
    * Open the sequence's shared checkout on first use, and remember a refusal so a
-   * repository that cannot be staged is diagnosed once rather than per owner.
+   * repository that cannot be staged is diagnosed once rather than per owner. Every
+   * owner in a sequence works on the same repository, so the first one's `cwd`
+   * locates it for all of them.
    */
   const openWorkspace = (): StagedWorkspace | undefined => {
     if (workspace || stagingRefusal) return workspace;

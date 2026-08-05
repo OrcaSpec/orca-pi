@@ -43,6 +43,10 @@ import {
  * `git apply`. Driven offline through the `createSession` seam against real git
  * repositories in temp directories.
  *
+ * Since Phase 3 a single owner is the degenerate SEQUENCE — one authorized staged
+ * commit, then one promotion — so these tests also pin that the multi-owner
+ * transaction did not change what a single owner does.
+ *
  * The last group swaps the staging PROVIDER for a second real implementation (a
  * whole-tree copy, the shape a future copy-on-write provider takes) to pin that
  * the promotion gate is provider-independent — and that the injected provider is

@@ -339,8 +339,8 @@ export interface DelegateDeps extends ToolDeps {
    */
   onProgress?: (progress: DelegationProgress, ctx: ExtensionContext) => void;
   /**
-   * Root of the runtime state directory holding each delegation's staging
-   * worktree and any preserved patch. Defaults to pi's agent directory.
+   * Root of the runtime state directory holding each delegation sequence's shared
+   * staging worktree and any preserved patch. Defaults to pi's agent directory.
    */
   stateRoot?: string;
 }

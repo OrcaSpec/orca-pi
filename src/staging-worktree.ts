@@ -177,7 +177,7 @@ function close(workspace: StagedWorkspace): void {
   tryGit(workspace.repoRoot, ["worktree", "prune"]);
 }
 
-/** The default staging provider: one linked `git worktree` per delegation. */
+/** The default staging provider: one linked `git worktree` per delegation sequence. */
 export const gitWorktreeStaging: StagingProvider = {
   name: "git-worktree",
   open,
