@@ -35,7 +35,9 @@ export type ApprovalOutcome =
   | "already_applied"
   | "does_not_apply"
   | "missing_patch"
-  | "empty_patch";
+  | "empty_patch"
+  | "patch_mismatch"
+  | "unreadable_repository";
 
 /**
  * The outcomes that SETTLE a hold: the change the patch proposes is in the user's
@@ -132,10 +134,35 @@ export function approvalStateOf(approval: GovernanceApproval): string {
   return `${verb} at ${approvalTimestamp(approval)}`;
 }
 
-/** The user's repository root, from any directory inside it. */
-function repoRootOf(cwd: string): string {
+/**
+ * The user's repository root, from any directory inside it, or nothing when this is not a
+ * repository. There is deliberately no fallback to `cwd`: `git apply` outside a repository
+ * patches files relative to the current directory, so a guess here would mean landing a
+ * governance change somewhere that is not the user's checkout.
+ */
+function repoRootOf(cwd: string): string | undefined {
   const toplevel = tryGit(cwd, ["rev-parse", "--show-toplevel"]);
-  return canonicalPath(toplevel.ok ? toplevel.out.toString("utf8").trim() : cwd);
+  if (!toplevel.ok) return undefined;
+  const root = toplevel.out.toString("utf8").trim();
+  return root === "" ? undefined : canonicalPath(root);
+}
+
+/**
+ * The paths a patch actually touches, as git reads them, or nothing when git cannot read
+ * it as a patch at all. `--numstat` parses the patch without applying anything; with `-z`
+ * each record is `added<TAB>deleted<TAB>path`, NUL-terminated, and a binary file reports
+ * `-` for both counts.
+ */
+function patchPathsOf(root: string, patch: Buffer): string[] | undefined {
+  const numstat = tryGit(root, ["apply", "--numstat", "-z", "--whitespace=nowarn"], patch);
+  if (!numstat.ok) return undefined;
+  return numstat.out
+    .toString("utf8")
+    .split("\0")
+    .filter(Boolean)
+    .map((record) => record.split("\t").slice(2).join("\t"))
+    .filter(Boolean)
+    .sort();
 }
 
 /**
@@ -169,6 +196,19 @@ function applyHeldPatch(cwd: string, held: HeldGovernance, now: number): Governa
   if (patch.length === 0) return record("empty_patch");
 
   const root = repoRootOf(cwd);
+  if (root === undefined) return record("unreadable_repository");
+
+  // What the user is agreeing to is the hold the record describes, and the patch file is
+  // the one artifact in this story that lives OUTSIDE the repository and outside
+  // everything that governs a delegation's writes. So the file is checked against the
+  // record before it is offered to git: a patch that no longer touches exactly the
+  // governance paths the gate recorded is refused, which keeps an approval from becoming
+  // a way to land content the gate never authorized or held.
+  const actual = patchPathsOf(root, patch);
+  const expected = [...held.paths].sort();
+  if (actual === undefined || actual.join("\n") !== expected.join("\n")) {
+    return record("patch_mismatch", actual === undefined ? "git cannot read it as a patch" : actual.join(", "));
+  }
 
   const check = tryGit(root, ["apply", "--check", "--whitespace=nowarn"], patch);
   if (!check.ok) {
@@ -219,6 +259,21 @@ function approvalLines(hold: GovernanceHold, approval: GovernanceApproval): stri
           "empty, so there is nothing in it to apply.",
         "Your checkout is unchanged. An empty patch is a damaged artifact, not an approved " +
           "no-op — delegate the change again rather than treating it as landed.",
+      ];
+    case "patch_mismatch":
+      return [
+        "Orca refused to approve that governance change: the held patch at " +
+          `${approval.patchPath} no longer contains what was held.`,
+        `The hold covers ${approval.paths.join(", ")}; the patch now touches ` +
+          `${approval.detail}. Orca applies what the delegation's record says was held and ` +
+          "nothing else, so nothing was applied and your checkout is unchanged.",
+      ];
+    case "unreadable_repository":
+      return [
+        "Orca could not approve that governance change: it could not find the git repository to " +
+          "apply it to.",
+        "Nothing was applied. A held patch lands in your checkout or nowhere — run this from " +
+          "inside the repository the delegation ran in.",
       ];
     case "does_not_apply":
       return [

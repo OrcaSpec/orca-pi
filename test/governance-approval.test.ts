@@ -1,5 +1,6 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as orcaspec from "orcaspec";
 import type { DomainAgent } from "orcaspec";
@@ -27,6 +28,8 @@ import {
 } from "../src/staging";
 import { gitWorktreeStaging } from "../src/staging-worktree";
 import { runApprovalAction, type GovernanceHold } from "../src/approval";
+import { createDelegateTool } from "../src/tools";
+import { detectRepositoryState } from "../src/state";
 import { git, makeGitRepo, makeStateRoot, snapshotTree } from "./git-fixture";
 
 /**
@@ -179,6 +182,73 @@ describe("approving a held governance change", () => {
       at: APPROVED_AT,
     });
     expect(result.lines.join("\n")).toContain(".orca/runtime.yaml");
+  });
+});
+
+/**
+ * Every shape of change a governance patch can carry, approved for real. Binary content
+ * and deletions are the two that git reports differently from an ordinary edit, and both
+ * have to survive the check that the patch still matches the hold.
+ */
+describe("approving every kind of governance change", () => {
+  it("applies a multi-file hold whole", async () => {
+    const { repo, stateRoot } = fixture();
+    const workspace = open(repo, stateRoot);
+    writeFileSync(join(workspace.dir, ".orca", "runtime.yaml"), AGENT_OVERLAY);
+    writeFileSync(join(workspace.dir, ".orca", "orca.yaml"), "rewritten spec\n");
+    const record = await promoteStagedCommits(workspace, [
+      commitAuthorizedWork(workspace, governanceGrant, "governance"),
+    ]);
+    gitWorktreeStaging.close(workspace);
+
+    const result = runApprovalAction({
+      cwd: repo,
+      holds: [pending(record.heldGovernance!)],
+      now: APPROVED_AT,
+    });
+
+    expect(result.approval?.outcome).toBe("applied");
+    expect(readFileSync(join(repo, ".orca", "runtime.yaml"), "utf8")).toBe(AGENT_OVERLAY);
+    expect(readFileSync(join(repo, ".orca", "orca.yaml"), "utf8")).toBe("rewritten spec\n");
+  });
+
+  it("applies a binary governance file byte for byte", async () => {
+    const { repo, stateRoot } = fixture();
+    const bytes = Buffer.from([0x00, 0x01, 0xff, 0xfe, 0x00, 0x7f]);
+    const workspace = open(repo, stateRoot);
+    writeFileSync(join(workspace.dir, ".orca", "seal.bin"), bytes);
+    const record = await promoteStagedCommits(workspace, [
+      commitAuthorizedWork(workspace, governanceGrant, "governance"),
+    ]);
+    gitWorktreeStaging.close(workspace);
+
+    const result = runApprovalAction({
+      cwd: repo,
+      holds: [pending(record.heldGovernance!)],
+      now: APPROVED_AT,
+    });
+
+    expect(result.approval?.outcome).toBe("applied");
+    expect(readFileSync(join(repo, ".orca", "seal.bin"))).toEqual(bytes);
+  });
+
+  it("applies a governance DELETION, removing the file the user still has", async () => {
+    const { repo, stateRoot } = fixture();
+    const workspace = open(repo, stateRoot);
+    rmSync(join(workspace.dir, ".orca", "runtime.yaml"));
+    const record = await promoteStagedCommits(workspace, [
+      commitAuthorizedWork(workspace, governanceGrant, "governance"),
+    ]);
+    gitWorktreeStaging.close(workspace);
+
+    const result = runApprovalAction({
+      cwd: repo,
+      holds: [pending(record.heldGovernance!)],
+      now: APPROVED_AT,
+    });
+
+    expect(result.approval?.outcome).toBe("applied");
+    expect(existsSync(join(repo, ".orca", "runtime.yaml"))).toBe(false);
   });
 });
 
@@ -462,6 +532,121 @@ describe("which held change an approval means", () => {
     expect(result.approval).toBeUndefined();
     expect(result.lines.join("\n")).toMatch(/already approved/i);
     expect(result.lines.join("\n")).toContain(new Date(APPROVED_AT).toISOString());
+  });
+});
+
+/**
+ * Approval is the ONLY runtime path from a held patch to the user's checkout. Two
+ * different kinds of assertion, because the claim has two halves: what the running
+ * system does, and what the code is even able to do.
+ */
+/**
+ * The held patch lives in the runtime state directory, OUTSIDE the repository and
+ * outside everything that governs a delegation's writes. So approval trusts the record,
+ * not the file: what it agrees to apply is the governance paths the gate recorded, and a
+ * patch whose content no longer matches that is refused rather than applied.
+ */
+describe("approving is bounded by what was actually held", () => {
+  it("refuses a patch that touches a path the hold does not name", async () => {
+    const { repo, stateRoot } = fixture();
+    const held = await heldOverlayChange(repo, stateRoot);
+    // A patch file rewritten to reach outside `.orca/**` — the state directory is not
+    // governed, so this is a thing that can happen to the artifact.
+    writeFileSync(
+      held.patchPath,
+      [
+        "diff --git a/apps/web/app.tsx b/apps/web/app.tsx",
+        "index 0000000..1111111 100644",
+        "--- a/apps/web/app.tsx",
+        "+++ b/apps/web/app.tsx",
+        "@@ -1 +1 @@",
+        "-committed app",
+        "+tampered",
+        "",
+      ].join("\n"),
+    );
+    const before = snapshotTree(repo);
+
+    const result = runApprovalAction({ cwd: repo, holds: [pending(held)], now: APPROVED_AT });
+
+    expect(result.approval?.outcome).toBe("patch_mismatch");
+    expect(result.lines.join("\n")).toContain("apps/web/app.tsx");
+    expect(snapshotTree(repo)).toEqual(before);
+  });
+
+  it("refuses when the repository root cannot be found, rather than applying somewhere", async () => {
+    const { repo, stateRoot } = fixture();
+    const held = await heldOverlayChange(repo, stateRoot);
+    const outside = makeStateRoot();
+    cleanups.push(() => rmSync(outside, { recursive: true, force: true }));
+    const before = snapshotTree(repo);
+
+    // `git apply` outside a repository happily patches files relative to the current
+    // directory, which is the one thing an approval must never do: it lands in the
+    // user's checkout or it lands nowhere.
+    const result = runApprovalAction({ cwd: outside, holds: [pending(held)], now: APPROVED_AT });
+
+    expect(result.approval?.outcome).toBe("unreadable_repository");
+    expect(snapshotTree(repo)).toEqual(before);
+    expect(snapshotTree(outside)).toEqual({});
+  });
+});
+
+describe("nothing else applies a held governance patch", () => {
+  it("leaves the governance file untouched through a whole delegation", async () => {
+    const { repo, stateRoot } = fixture();
+    writeFileSync(join(repo, ".orca", "orca.yaml"), orcaspec.loadFixtureSource("root-recursive-owner"));
+    git(repo, "add", "-A");
+    git(repo, "-c", "user.name=F", "-c", "user.email=f@localhost", "commit", "-q", "-m", "spec");
+    const before = snapshotTree(repo);
+    const { createSession } = writesThenCompletes({ ".orca/runtime.yaml": AGENT_OVERLAY });
+
+    // The full steward-facing path: the delegate tool, a real staged worktree, a real
+    // session writing through its grant, the gate, the record, the report.
+    const result = await createDelegateTool({
+      getState: (cwd) => detectRepositoryState(cwd, "enforce"),
+      getThinkingLevel: () => "medium",
+      createSession,
+      stateRoot,
+    }).execute(
+      "d1",
+      { task: "tighten the governance overlay", paths: [".orca/runtime.yaml"] } as never,
+      undefined,
+      undefined,
+      { cwd: repo, model: { id: "fake", provider: "fake" } as unknown as Model<any> } as never,
+    );
+
+    const body = result.content.map((block) => (block.type === "text" ? block.text : "")).join("\n");
+    expect(body).toContain("HELD FOR YOUR APPROVAL");
+    // Byte-identical: not one path in the repository moved, governance or otherwise.
+    expect(snapshotTree(repo)).toEqual(before);
+  });
+
+  it("keeps `git apply` out of every module but the gate and the approval action", () => {
+    const src = fileURLToPath(new URL("../src", import.meta.url));
+    const files = readdirSync(src)
+      .filter((name) => name.endsWith(".ts"))
+      .map((name) => ({ name: `src/${name}`, text: readFileSync(join(src, name), "utf8") }));
+    files.push({
+      name: "index.ts",
+      text: readFileSync(fileURLToPath(new URL("../index.ts", import.meta.url)), "utf8"),
+    });
+
+    // `git apply` writes to the user's checkout, so the set of modules that may run it at
+    // all is part of the design: the promotion gate (the promotable half of a delegation)
+    // and the approval action (a held patch the user asked for). A third one appearing
+    // here is the failure this pins — it means a held patch acquired a second route in.
+    const appliers = files.filter((file) => /"apply"/.test(file.text)).map((file) => file.name);
+    expect(appliers.sort()).toEqual(["src/approval.ts", "src/staging.ts"]);
+
+    // And in the gate, every `git apply` is handed the PROMOTABLE half. The governance
+    // patch is written to disk there and never offered to git.
+    const staging = files.find((file) => file.name === "src/staging.ts")!.text;
+    const applyCalls = staging.match(/tryGit\([^;]*?"apply"[\s\S]*?\);/g) ?? [];
+    expect(applyCalls.length).toBeGreaterThan(0);
+    for (const call of applyCalls) {
+      expect(call, "the gate may only apply the promotable half").toContain("promotable.patch");
+    }
   });
 });
 
