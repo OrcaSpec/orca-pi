@@ -19,6 +19,7 @@ import {
 } from "./delegation";
 import type { CapabilitySummary } from "./enforcement";
 import type {
+  AcceptedWork,
   HeldGovernance,
   PromotionRecord,
   PromotionStatus,
@@ -155,6 +156,13 @@ export interface PersistedPromotion {
    * the only thing that remembers where the patch is once the session ends.
    */
   heldGovernance?: HeldGovernance;
+  /**
+   * The reusable accepted work a `needs_scope` stop preserved (hardening plan, Phase
+   * 5), carried through verbatim like the hold above it and for the same reason: the
+   * patch outlives the session, this record is the only thing that remembers where it
+   * is, and the steward's next delegation may well happen in a later session.
+   */
+  acceptedWork?: AcceptedWork;
   validations: PersistedValidatorRun[];
   /** Where preserved validator output was written; absolute. */
   validatorOutputPath?: string;
@@ -305,6 +313,13 @@ function toPersistedPromotion(promotion: PromotionRecord): PersistedPromotion {
       patchPath: promotion.heldGovernance.patchPath,
       paths: [...promotion.heldGovernance.paths],
       baseCommit: promotion.heldGovernance.baseCommit,
+    },
+    acceptedWork: promotion.acceptedWork && {
+      patchPath: promotion.acceptedWork.patchPath,
+      paths: [...promotion.acceptedWork.paths],
+      owners: [...promotion.acceptedWork.owners],
+      baseCommit: promotion.acceptedWork.baseCommit,
+      excludedGovernancePaths: [...promotion.acceptedWork.excludedGovernancePaths],
     },
     validations: promotion.validations.map((run) => ({
       agent: run.agent,

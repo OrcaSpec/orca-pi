@@ -2,16 +2,30 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as orcaspec from "orcaspec";
+import type { DomainAgent } from "orcaspec";
 import type { Model } from "@earendil-works/pi-ai";
-import { resolve } from "../src/resolver";
+import { compileGrant, resolve, type CompiledGrant } from "../src/resolver";
 import {
   runDelegationSequence,
   type DelegationInputs,
   type DelegationSession,
   type DelegationSessionConfig,
 } from "../src/delegation";
+import {
+  buildDelegationRecord,
+  digestGrants,
+  DelegationHistory,
+  DELEGATION_ENTRY_TYPE,
+} from "../src/delegation-entry";
 import { promotionDetailLines, promotionHeadline } from "../src/render";
-import type { PromotionRecord } from "../src/staging";
+import {
+  abandonStagedWork,
+  commitAuthorizedWork,
+  preserveAcceptedWork,
+  type PromotionRecord,
+  type StagedWorkspace,
+} from "../src/staging";
+import { gitWorktreeStaging } from "../src/staging-worktree";
 import { git, makeGitRepo, makeStateRoot, snapshotTree } from "./git-fixture";
 
 /**
@@ -302,6 +316,265 @@ describe("a needs_scope stop with nothing accepted behind it", () => {
     const text = promotionText(sequence.promotion);
     expect(text).toContain("changed no files, so there is no accepted work to reuse");
     expect(text).not.toContain("REUSABLE");
+  });
+});
+
+/**
+ * The governance boundary, driven at the gate's own seam with real staged commits.
+ *
+ * A completed owner may hold a grant over `.orca/**`, and its change there was
+ * genuinely accepted in staging — but promotion would have HELD it for the user rather
+ * than applying it (hardening plan, Phase 2). A patch offered for reuse therefore may
+ * not carry it: `git apply` of the reusable patch is one unreviewed step, and landing a
+ * governance change that way is exactly what the hold exists to prevent. So the
+ * reusable patch is cut at the same boundary promotion cuts at, and the outcome says
+ * what it left behind instead of dropping it silently.
+ */
+describe("a completed owner's governance change stays out of the reusable patch", () => {
+  const wideGrant: CompiledGrant = compileGrant(
+    {
+      id: "wide",
+      name: "Wide",
+      description: "Owns everything, governance included.",
+      ownership: ["**"],
+      permissions: { edit: { allow: ["**"] } },
+    } satisfies DomainAgent,
+    {},
+  );
+
+  const USER_OVERLAY = "schema_version: 1\nvalidations: {}\n";
+  const AGENT_OVERLAY = "schema_version: 1\nvalidations: {}\n# tightened by the agent\n";
+
+  let repo: string;
+  let stateRoot: string;
+  let workspace: StagedWorkspace;
+  beforeEach(() => {
+    repo = makeGitRepo("orca-accepted-gov-");
+    stateRoot = makeStateRoot();
+    mkdirSync(join(repo, ".orca"), { recursive: true });
+    mkdirSync(join(repo, "apps", "web"), { recursive: true });
+    writeFileSync(join(repo, ".orca", "runtime.yaml"), USER_OVERLAY);
+    writeFileSync(join(repo, "apps", "web", "app.tsx"), "committed app\n");
+    git(repo, "add", "-A");
+    git(repo, "-c", "user.name=F", "-c", "user.email=f@localhost", "commit", "-q", "-m", "seed");
+    const opened = gitWorktreeStaging.open({ cwd: repo, delegationId: "d1", stateRoot });
+    if (!opened.ok) throw new Error(`staging refused: ${opened.diagnostics.join(" ")}`);
+    workspace = opened.workspace;
+  });
+  afterEach(() => {
+    gitWorktreeStaging.close(workspace);
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  /** The abandonment a `needs_scope` stop produces, before the accepted work is added. */
+  function abandoned(): PromotionRecord {
+    return abandonStagedWork(
+      workspace,
+      "Promotion was not attempted: step 'web' ended 'needs_scope'; staged work is promoted only " +
+        "when every step completes.",
+    );
+  }
+
+  it("keeps the governance half out of it, names it, and leaves it in the evidence", () => {
+    writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "accepted app\n");
+    writeFileSync(join(workspace.dir, ".orca", "runtime.yaml"), AGENT_OVERLAY);
+    const staged = commitAuthorizedWork(workspace, wideGrant, "wide");
+    expect(staged.status).toBe("committed");
+    // The stopping owner's work, uncommitted in the shared checkout.
+    writeFileSync(join(workspace.dir, "apps", "web", "half.tsx"), "half-built\n");
+
+    const record = preserveAcceptedWork(workspace, [staged], abandoned());
+
+    const accepted = record.acceptedWork!;
+    expect(accepted.paths).toEqual(["apps/web/app.tsx"]);
+    expect(accepted.excludedGovernancePaths).toEqual([".orca/runtime.yaml"]);
+
+    // Following the hint cannot land the governance change, only the ordinary work.
+    git(repo, "apply", accepted.patchPath);
+    expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("accepted app\n");
+    expect(readFileSync(join(repo, ".orca", "runtime.yaml"), "utf8")).toBe(USER_OVERLAY);
+
+    // Nothing is lost: the evidence patch still has it, and the outcome says where.
+    expect(readFileSync(record.patchPath!, "utf8")).toContain("tightened by the agent");
+    const text = promotionText(record);
+    expect(text).toContain(".orca/runtime.yaml");
+    expect(text).toContain("held those for your approval");
+  });
+
+  it("writes no reusable patch at all when the accepted work is governance only", () => {
+    writeFileSync(join(workspace.dir, ".orca", "runtime.yaml"), AGENT_OVERLAY);
+    const staged = commitAuthorizedWork(workspace, wideGrant, "wide");
+
+    const record = preserveAcceptedWork(workspace, [staged], abandoned());
+
+    expect(record.acceptedWork).toBeUndefined();
+    expect(patchesIn(stateRoot)).toHaveLength(1);
+    const text = promotionText(record);
+    expect(text).toContain("changed only governance path(s)");
+    expect(text).toContain(".orca/runtime.yaml");
+    expect(text).not.toContain("REUSABLE");
+  });
+});
+
+describe("only a needs_scope stop preserves accepted work", () => {
+  let repo: string;
+  let stateRoot: string;
+  beforeEach(() => {
+    repo = makeGitRepo("orca-accepted-");
+    stateRoot = makeStateRoot();
+  });
+  afterEach(() => {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  /** A completed first owner, then a second owner that ends however the test says. */
+  function stoppingAt(status: "failed" | "blocked") {
+    return sessions({
+      billing: async (config) => {
+        await callTool(config, "write", {
+          path: "services/billing/x.rb",
+          content: "PROVIDER = 'ready'\n",
+        });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "provider ready" });
+      },
+      web: async (config) => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "half-built\n" });
+        await callTool(config, "orca_checkpoint", { status, summary: `ended ${status}` });
+      },
+    });
+  }
+
+  for (const status of ["failed", "blocked"] as const) {
+    it(`writes no reusable patch when the sequence stops '${status}'`, async () => {
+      const { createSession } = stoppingAt(status);
+
+      const sequence = await runDelegationSequence(
+        orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"]),
+        { createSession, stateRoot },
+      );
+
+      // A completed owner sits behind this stop too, and its work is still preserved as
+      // evidence — but `failed` and `blocked` say the task itself did not work out, so
+      // there is nothing the steward is about to re-delegate and hand the accepted half
+      // back to. Reuse is a needs_scope affordance on purpose, not a general one.
+      expect(sequence.stoppedAt).toBe("web");
+      expect(sequence.promotion.acceptedWork).toBeUndefined();
+      expect(patchesIn(stateRoot)).toHaveLength(1);
+      expect(readFileSync(sequence.promotion.patchPath!, "utf8")).toContain("PROVIDER = 'ready'");
+      expect(promotionText(sequence.promotion)).not.toContain("REUSABLE");
+    });
+  }
+
+  it("writes no reusable patch when the parent cancels after an owner completed", async () => {
+    const controller = new AbortController();
+    const { createSession } = sessions({
+      billing: async (config) => {
+        await callTool(config, "write", {
+          path: "services/billing/x.rb",
+          content: "PROVIDER = 'ready'\n",
+        });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "provider ready" });
+      },
+      web: async (config) => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "interrupted\n" });
+        controller.abort(); // the parent cancels before this owner checkpoints
+      },
+    });
+
+    const sequence = await runDelegationSequence(
+      orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"]),
+      { createSession, stateRoot, signal: controller.signal },
+    );
+
+    expect(sequence.cancelled).toBe(true);
+    expect(sequence.promotion.acceptedWork).toBeUndefined();
+    expect(patchesIn(stateRoot)).toHaveLength(1);
+  });
+
+  it("writes no reusable patch when every owner completed and the promotion went through", async () => {
+    const { createSession } = sessions({
+      billing: async (config) => {
+        await callTool(config, "write", { path: "services/billing/x.rb", content: "billing\n" });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      },
+      web: async (config) => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "web\n" });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      },
+    });
+
+    const sequence = await runDelegationSequence(
+      orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"]),
+      { createSession, stateRoot },
+    );
+
+    // The work is in the user's files; a patch offering it back would be noise.
+    expect(sequence.promotion.status).toBe("promoted");
+    expect(sequence.promotion.acceptedWork).toBeUndefined();
+    expect(patchesIn(stateRoot)).toEqual([]);
+  });
+});
+
+describe("what the `/orca` history remembers about the two patches", () => {
+  let repo: string;
+  let stateRoot: string;
+  beforeEach(() => {
+    repo = makeGitRepo("orca-accepted-");
+    stateRoot = makeStateRoot();
+  });
+  afterEach(() => {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  it("names both patches and their uses from the durable record alone", async () => {
+    const { createSession } = sessions({
+      billing: async (config) => {
+        await callTool(config, "write", {
+          path: "services/billing/x.rb",
+          content: "PROVIDER = 'ready'\n",
+        });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "provider ready" });
+      },
+      web: async (config) => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "half-built\n" });
+        await callTool(config, "orca_checkpoint", {
+          status: "needs_scope",
+          summary: "needs the shared client",
+          scope_request: ["packages/client/**"],
+        });
+      },
+    });
+    const ordered = orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"]);
+
+    const sequence = await runDelegationSequence(ordered, { createSession, stateRoot });
+    const record = buildDelegationRecord({
+      task: "wire the billing provider into the web app",
+      targets: ["apps/web/app.tsx", "services/billing/x.rb"],
+      grantDigest: digestGrants(ordered.map((inputs) => inputs.grant)),
+      sequence,
+      startedAt: 1,
+      endedAt: 2,
+    });
+
+    // The session may be over by the time the steward looks; history is rebuilt from
+    // entries alone, so the route to both patches has to survive the JSON round trip.
+    const history = new DelegationHistory();
+    history.rebuildFrom([
+      { type: "custom", customType: DELEGATION_ENTRY_TYPE, data: JSON.parse(JSON.stringify(record)) },
+    ]);
+
+    const detail = history.lastDetailLines().join("\n");
+    const accepted = sequence.promotion.acceptedWork!;
+    // Both patches, each with the role that tells the steward which one to use.
+    expect(detail).toContain(`The staged patch is preserved at ${sequence.promotion.patchPath}`);
+    expect(detail).toContain("REUSABLE ACCEPTED WORK");
+    expect(detail).toContain(`git apply ${accepted.patchPath}`);
+    expect(detail).toContain("evidence of the whole attempt");
+    expect(detail).toContain("billing");
+    expect(detail).toContain(accepted.baseCommit);
   });
 });
 
