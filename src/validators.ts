@@ -34,6 +34,15 @@ import type {
  * the promotion. A declared check that did not run is not a check that passed, and
  * the alternative (promote anyway, mention it) is exactly the silent-degradation the
  * plan rules out.
+ *
+ * KNOWN COST of running synchronously (`spawnSync`, like `git.ts`): a validator holds
+ * the event loop for as long as it runs, so a slow suite freezes the TUI at the end
+ * of a delegation and cannot be cancelled mid-run. What it buys is that the gate and
+ * the promotion it guards are one uninterleaved step — nothing else can touch the
+ * checkout between the verdict and the patch. If responsiveness during long
+ * validators matters more, the seam to change is {@link AcceptanceGate}: making it
+ * async is mechanical, and the promotion path it runs on is already async above
+ * `promoteStagedCommits`.
  */
 
 /** How much of each captured stream is kept as evidence. */

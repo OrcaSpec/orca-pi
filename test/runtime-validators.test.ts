@@ -598,7 +598,7 @@ describe("an overlay configures validation and nothing else", () => {
     }
   });
 
-  it("ignores an overlay a delegated session writes into the staged checkout", async () => {
+  it("ignores an overlay rewritten in staging by an agent whose grant covers it", async () => {
     const repo = repoWithApp();
     const stateRoot = makeStateRoot();
     try {
@@ -609,26 +609,80 @@ describe("an overlay configures validation and nothing else", () => {
           web: [nodeValidator("process.stderr.write('policy says no');process.exit(1);")],
         },
       });
+      // This agent's write grant genuinely covers the overlay, so its rewrite is
+      // AUTHORIZED and committed in staging — the hardest version of the question.
+      const overlayOwner: DomainAgent = {
+        ...webAgent(),
+        permissions: {
+          read: { allow: ["docs/**"] },
+          edit: { allow: ["apps/web/**", ".orca/**"] },
+        },
+      };
       const { createSession } = sessions(async (config) => {
         await callTool(config, "write", { path: "apps/web/app.tsx", content: "reviewed\n" });
-        // The child replaces the overlay inside its own checkout with one that would
-        // wave its work through.
-        mkdirSync(join(config.cwd, ".orca"), { recursive: true });
-        writeFileSync(
-          join(config.cwd, ".orca", "runtime.yaml"),
-          "schema_version: 1\nvalidations: {}\n",
-        );
+        // Rewriting the checks it will be judged by, through its own tools.
+        await callTool(config, "write", {
+          path: ".orca/runtime.yaml",
+          content: "schema_version: 1\nvalidations: {}\n",
+        });
         await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      });
+
+      const result = await runDelegation(
+        inputsFor(repo, {
+          document: { ...doc(), agents: [overlayOwner] },
+          grant: compileGrant(overlayOwner, {}),
+        }),
+        { createSession, stateRoot },
+      );
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      // The overlay that gates a delegation is the USER's, read before it started:
+      // an agent cannot relax its own acceptance gate, even by an authorized edit.
+      expect(result.outcome.promotion.validations[0].stderr).toContain("policy says no");
+      expect(result.outcome.promotion.status).toBe("rejected");
+      expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("committed\n");
+      // The overlay in the user's checkout is untouched too, because nothing was
+      // promoted at all.
+      expect(readFileSync(join(repo, ".orca", "runtime.yaml"), "utf8")).toContain(
+        "policy says no",
+      );
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores an overlay that appears in the checkout as the child is torn down", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: {
+          web: [nodeValidator("process.stderr.write('policy says no');process.exit(1);")],
+        },
+      });
+      const createSession = async (config: DelegationSessionConfig): Promise<DelegationSession> => ({
+        prompt: () => writeAndComplete(config),
+        abort: vi.fn(),
+        // After the authorized change is committed and before the gate runs — the
+        // last moment anything could hope to influence it.
+        finish: async () => {
+          writeFileSync(
+            join(config.cwd, ".orca", "runtime.yaml"),
+            "schema_version: 1\nvalidations: {}\n",
+          );
+        },
       });
 
       const result = await runDelegation(inputsFor(repo), { createSession, stateRoot });
 
       expect(result.ok).toBe(true);
       if (!result.ok) return;
-      // The overlay that gates a delegation is the user's, read before it started.
-      expect(result.outcome.promotion.status).toBe("rejected");
       expect(result.outcome.promotion.validations[0].stderr).toContain("policy says no");
-      expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("committed\n");
+      expect(result.outcome.promotion.status).toBe("rejected");
     } finally {
       rmSync(repo, { recursive: true, force: true });
       rmSync(stateRoot, { recursive: true, force: true });
