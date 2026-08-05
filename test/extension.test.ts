@@ -522,6 +522,43 @@ describe("orca-pi extension entry", () => {
     expect(snapshotTree(dir)).toEqual(before);
   });
 
+  it("/orca approve takes the patch path from the report as its argument", async () => {
+    const { pi, registered } = makeApi();
+    installOrca(pi as never, {
+      createSession: writingCreateSession({ ".orca/runtime.yaml": AGENT_OVERLAY }),
+      stateRoot,
+    });
+    writeGovernedRepo();
+    const delegateCtx = makeCtx(dir, true);
+    await delegateGovernanceChange(registered, delegateCtx);
+    const patchPath = (
+      registered.appended.find((e) => e.customType === DELEGATION_ENTRY_TYPE)!.data as {
+        promotion: { heldGovernance: { patchPath: string } };
+      }
+    ).promotion.heldGovernance.patchPath;
+
+    await registered.commands.get("orca")!.handler(`approve ${patchPath}`, makeCtx(dir, true));
+
+    expect(readFileSync(join(dir, ".orca", "runtime.yaml"), "utf8")).toBe(AGENT_OVERLAY);
+  });
+
+  it("/orca approve is silent on a headless run and still lands the change", async () => {
+    const { pi, registered } = makeApi();
+    installOrca(pi as never, {
+      createSession: writingCreateSession({ ".orca/runtime.yaml": AGENT_OVERLAY }),
+      stateRoot,
+    });
+    writeGovernedRepo();
+    await delegateGovernanceChange(registered, makeCtx(dir, false));
+
+    const ctx = makeCtx(dir, false);
+    await registered.commands.get("orca")!.handler("approve", ctx);
+
+    expect(readFileSync(join(dir, ".orca", "runtime.yaml"), "utf8")).toBe(AGENT_OVERLAY);
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+    expect(ctx.ui.setWidget).not.toHaveBeenCalled();
+  });
+
   it("registers a renderer for governance approval entries", () => {
     const { pi, registered } = makeApi();
     orcaPi(pi as never);
