@@ -74,6 +74,18 @@ export const PATCHES_DIR = "patches";
 export const VALIDATOR_OUTPUT_DIR = "validators";
 
 /**
+ * The file-name suffix of each preserved artifact kind, exported because the NAME is
+ * the only thing that distinguishes the three patch kinds on disk. Retention reads
+ * these to classify what it may sweep (`retention.ts`, Phase 6), so the sweeper's idea
+ * of which file is a held governance patch is the same string {@link stagingPaths}
+ * wrote it under, rather than a second spelling that could drift from it.
+ */
+export const EVIDENCE_PATCH_SUFFIX = ".patch";
+export const GOVERNANCE_PATCH_SUFFIX = `.governance${EVIDENCE_PATCH_SUFFIX}`;
+export const ACCEPTED_PATCH_SUFFIX = `.accepted${EVIDENCE_PATCH_SUFFIX}`;
+export const VALIDATOR_OUTPUT_SUFFIX = ".log";
+
+/**
  * The fixed definition of a GOVERNANCE PATH (hardening plan, Phase 2): everything
  * under the directory that holds the documents governing the agents themselves —
  * the OrcaSpec document and the runtime overlay.
@@ -230,10 +242,10 @@ export function stagingPaths(input: OpenStagingInput): {
   return {
     stateRoot,
     dir: join(stateRoot, CHECKOUTS_DIR, segment),
-    patchPath: join(stateRoot, PATCHES_DIR, `${segment}.patch`),
-    governancePatchPath: join(stateRoot, PATCHES_DIR, `${segment}.governance.patch`),
-    acceptedPatchPath: join(stateRoot, PATCHES_DIR, `${segment}.accepted.patch`),
-    validatorOutputPath: join(stateRoot, VALIDATOR_OUTPUT_DIR, `${segment}.log`),
+    patchPath: join(stateRoot, PATCHES_DIR, `${segment}${EVIDENCE_PATCH_SUFFIX}`),
+    governancePatchPath: join(stateRoot, PATCHES_DIR, `${segment}${GOVERNANCE_PATCH_SUFFIX}`),
+    acceptedPatchPath: join(stateRoot, PATCHES_DIR, `${segment}${ACCEPTED_PATCH_SUFFIX}`),
+    validatorOutputPath: join(stateRoot, VALIDATOR_OUTPUT_DIR, `${segment}${VALIDATOR_OUTPUT_SUFFIX}`),
   };
 }
 
