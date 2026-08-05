@@ -26,6 +26,8 @@ import {
   type StagedWorkspace,
 } from "../src/staging";
 import { gitWorktreeStaging } from "../src/staging-worktree";
+import { detectRepositoryState, ORCA_DIR, ORCA_SPEC_FILE } from "../src/state";
+import { createDelegateTool } from "../src/tools";
 import { git, makeGitRepo, makeStateRoot, snapshotTree } from "./git-fixture";
 
 /**
@@ -216,6 +218,64 @@ describe("a sequence that stops at needs_scope after an owner completed", () => 
     expect(reusable).not.toContain("onClick");
     // The evidence patch is the other half of the story and does have the rewrite.
     expect(readFileSync(sequence.promotion.patchPath!, "utf8")).toContain("onClick");
+  });
+});
+
+describe("reusing what a needs_scope stop preserved", () => {
+  let repo: string;
+  let stateRoot: string;
+  beforeEach(() => {
+    repo = makeGitRepo("orca-accepted-");
+    stateRoot = makeStateRoot();
+  });
+  afterEach(() => {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  it("hands the user a patch git takes on the base it was staged from", async () => {
+    // The base a delegation is staged from is `HEAD` PLUS the user's uncommitted work,
+    // so the reusable patch is only real if it applies over that — here the completed
+    // owner edits a file the user already had dirty.
+    mkdirSync(join(repo, "services", "billing"), { recursive: true });
+    writeFileSync(join(repo, "services", "billing", "x.rb"), "PROVIDER = 'draft'\n");
+    writeFileSync(join(repo, "notes.md"), "my uncommitted notes\n");
+    const { createSession } = sessions({
+      billing: async (config) => {
+        await callTool(config, "write", {
+          path: "services/billing/x.rb",
+          content: "PROVIDER = 'draft, finished'\n",
+        });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "finished it" });
+      },
+      web: async (config) => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "half-built\n" });
+        await callTool(config, "orca_checkpoint", {
+          status: "needs_scope",
+          summary: "needs the shared client",
+          scope_request: ["packages/client/**"],
+        });
+      },
+    });
+
+    const sequence = await runDelegationSequence(
+      orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"]),
+      { createSession, stateRoot },
+    );
+
+    const accepted = sequence.promotion.acceptedWork!;
+    // The recovery route the outcome recommends, followed literally: no Orca-specific
+    // tool, no `--3way`, just git on the state the delegation was staged from.
+    expect(promotionText(sequence.promotion)).toContain(`git apply ${accepted.patchPath}`);
+    git(repo, "apply", accepted.patchPath);
+
+    expect(readFileSync(join(repo, "services", "billing", "x.rb"), "utf8")).toBe(
+      "PROVIDER = 'draft, finished'\n",
+    );
+    // Reusing the accepted work brings nothing from the owner that stopped, and leaves
+    // the user's own uncommitted work alone.
+    expect(existsSync(join(repo, "apps", "web", "app.tsx"))).toBe(false);
+    expect(readFileSync(join(repo, "notes.md"), "utf8")).toBe("my uncommitted notes\n");
   });
 });
 
@@ -417,6 +477,106 @@ describe("a completed owner's governance change stays out of the reusable patch"
   });
 });
 
+describe("only a needs_scope stop preserves accepted work", () => {
+  let repo: string;
+  let stateRoot: string;
+  beforeEach(() => {
+    repo = makeGitRepo("orca-accepted-");
+    stateRoot = makeStateRoot();
+  });
+  afterEach(() => {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  /** A completed first owner, then a second owner that ends however the test says. */
+  function stoppingAt(status: "failed" | "blocked") {
+    return sessions({
+      billing: async (config) => {
+        await callTool(config, "write", {
+          path: "services/billing/x.rb",
+          content: "PROVIDER = 'ready'\n",
+        });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "provider ready" });
+      },
+      web: async (config) => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "half-built\n" });
+        await callTool(config, "orca_checkpoint", { status, summary: `ended ${status}` });
+      },
+    });
+  }
+
+  for (const status of ["failed", "blocked"] as const) {
+    it(`writes no reusable patch when the sequence stops '${status}'`, async () => {
+      const { createSession } = stoppingAt(status);
+
+      const sequence = await runDelegationSequence(
+        orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"]),
+        { createSession, stateRoot },
+      );
+
+      // A completed owner sits behind this stop too, and its work is still preserved as
+      // evidence — but `failed` and `blocked` say the task itself did not work out, so
+      // there is nothing the steward is about to re-delegate and hand the accepted half
+      // back to. Reuse is a needs_scope affordance on purpose, not a general one.
+      expect(sequence.stoppedAt).toBe("web");
+      expect(sequence.promotion.acceptedWork).toBeUndefined();
+      expect(patchesIn(stateRoot)).toHaveLength(1);
+      expect(readFileSync(sequence.promotion.patchPath!, "utf8")).toContain("PROVIDER = 'ready'");
+      expect(promotionText(sequence.promotion)).not.toContain("REUSABLE");
+    });
+  }
+
+  it("writes no reusable patch when the parent cancels after an owner completed", async () => {
+    const controller = new AbortController();
+    const { createSession } = sessions({
+      billing: async (config) => {
+        await callTool(config, "write", {
+          path: "services/billing/x.rb",
+          content: "PROVIDER = 'ready'\n",
+        });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "provider ready" });
+      },
+      web: async (config) => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "interrupted\n" });
+        controller.abort(); // the parent cancels before this owner checkpoints
+      },
+    });
+
+    const sequence = await runDelegationSequence(
+      orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"]),
+      { createSession, stateRoot, signal: controller.signal },
+    );
+
+    expect(sequence.cancelled).toBe(true);
+    expect(sequence.promotion.acceptedWork).toBeUndefined();
+    expect(patchesIn(stateRoot)).toHaveLength(1);
+  });
+
+  it("writes no reusable patch when every owner completed and the promotion went through", async () => {
+    const { createSession } = sessions({
+      billing: async (config) => {
+        await callTool(config, "write", { path: "services/billing/x.rb", content: "billing\n" });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      },
+      web: async (config) => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "web\n" });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      },
+    });
+
+    const sequence = await runDelegationSequence(
+      orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"]),
+      { createSession, stateRoot },
+    );
+
+    // The work is in the user's files; a patch offering it back would be noise.
+    expect(sequence.promotion.status).toBe("promoted");
+    expect(sequence.promotion.acceptedWork).toBeUndefined();
+    expect(patchesIn(stateRoot)).toEqual([]);
+  });
+});
+
 /**
  * The edges of preserving accepted work, driven at the gate's seam.
  *
@@ -527,106 +687,6 @@ describe("when the accepted work cannot be preserved", () => {
   });
 });
 
-describe("only a needs_scope stop preserves accepted work", () => {
-  let repo: string;
-  let stateRoot: string;
-  beforeEach(() => {
-    repo = makeGitRepo("orca-accepted-");
-    stateRoot = makeStateRoot();
-  });
-  afterEach(() => {
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(stateRoot, { recursive: true, force: true });
-  });
-
-  /** A completed first owner, then a second owner that ends however the test says. */
-  function stoppingAt(status: "failed" | "blocked") {
-    return sessions({
-      billing: async (config) => {
-        await callTool(config, "write", {
-          path: "services/billing/x.rb",
-          content: "PROVIDER = 'ready'\n",
-        });
-        await callTool(config, "orca_checkpoint", { status: "completed", summary: "provider ready" });
-      },
-      web: async (config) => {
-        await callTool(config, "write", { path: "apps/web/app.tsx", content: "half-built\n" });
-        await callTool(config, "orca_checkpoint", { status, summary: `ended ${status}` });
-      },
-    });
-  }
-
-  for (const status of ["failed", "blocked"] as const) {
-    it(`writes no reusable patch when the sequence stops '${status}'`, async () => {
-      const { createSession } = stoppingAt(status);
-
-      const sequence = await runDelegationSequence(
-        orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"]),
-        { createSession, stateRoot },
-      );
-
-      // A completed owner sits behind this stop too, and its work is still preserved as
-      // evidence — but `failed` and `blocked` say the task itself did not work out, so
-      // there is nothing the steward is about to re-delegate and hand the accepted half
-      // back to. Reuse is a needs_scope affordance on purpose, not a general one.
-      expect(sequence.stoppedAt).toBe("web");
-      expect(sequence.promotion.acceptedWork).toBeUndefined();
-      expect(patchesIn(stateRoot)).toHaveLength(1);
-      expect(readFileSync(sequence.promotion.patchPath!, "utf8")).toContain("PROVIDER = 'ready'");
-      expect(promotionText(sequence.promotion)).not.toContain("REUSABLE");
-    });
-  }
-
-  it("writes no reusable patch when the parent cancels after an owner completed", async () => {
-    const controller = new AbortController();
-    const { createSession } = sessions({
-      billing: async (config) => {
-        await callTool(config, "write", {
-          path: "services/billing/x.rb",
-          content: "PROVIDER = 'ready'\n",
-        });
-        await callTool(config, "orca_checkpoint", { status: "completed", summary: "provider ready" });
-      },
-      web: async (config) => {
-        await callTool(config, "write", { path: "apps/web/app.tsx", content: "interrupted\n" });
-        controller.abort(); // the parent cancels before this owner checkpoints
-      },
-    });
-
-    const sequence = await runDelegationSequence(
-      orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"]),
-      { createSession, stateRoot, signal: controller.signal },
-    );
-
-    expect(sequence.cancelled).toBe(true);
-    expect(sequence.promotion.acceptedWork).toBeUndefined();
-    expect(patchesIn(stateRoot)).toHaveLength(1);
-  });
-
-  it("writes no reusable patch when every owner completed and the promotion went through", async () => {
-    const { createSession } = sessions({
-      billing: async (config) => {
-        await callTool(config, "write", { path: "services/billing/x.rb", content: "billing\n" });
-        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
-      },
-      web: async (config) => {
-        await callTool(config, "write", { path: "apps/web/app.tsx", content: "web\n" });
-        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
-      },
-    });
-
-    const sequence = await runDelegationSequence(
-      orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"]),
-      { createSession, stateRoot },
-    );
-
-    // The work is in the user's files; a patch offering it back would be noise.
-    expect(sequence.promotion.status).toBe("promoted");
-    expect(sequence.promotion.acceptedWork).toBeUndefined();
-    expect(patchesIn(stateRoot)).toEqual([]);
-  });
-});
-
 describe("what the `/orca` history remembers about the two patches", () => {
   let repo: string;
   let stateRoot: string;
@@ -688,60 +748,72 @@ describe("what the `/orca` history remembers about the two patches", () => {
   });
 });
 
-describe("reusing what a needs_scope stop preserved", () => {
+describe("what the steward reads when `orca_delegate` returns", () => {
   let repo: string;
   let stateRoot: string;
   beforeEach(() => {
-    repo = makeGitRepo("orca-accepted-");
+    repo = makeGitRepo("orca-accepted-tool-");
     stateRoot = makeStateRoot();
+    mkdirSync(join(repo, ORCA_DIR), { recursive: true });
+    writeFileSync(
+      join(repo, ORCA_DIR, ORCA_SPEC_FILE),
+      orcaspec.loadFixtureSource("multi-owner"),
+    );
+    git(repo, "add", "-A");
+    git(repo, "-c", "user.name=F", "-c", "user.email=f@localhost", "commit", "-q", "-m", "spec");
   });
   afterEach(() => {
     rmSync(repo, { recursive: true, force: true });
     rmSync(stateRoot, { recursive: true, force: true });
   });
 
-  it("hands the user a patch git takes on the base it was staged from", async () => {
-    // The base a delegation is staged from is `HEAD` PLUS the user's uncommitted work,
-    // so the reusable patch is only real if it applies over that — here the completed
-    // owner edits a file the user already had dirty.
-    mkdirSync(join(repo, "services", "billing"), { recursive: true });
-    writeFileSync(join(repo, "services", "billing", "x.rb"), "PROVIDER = 'draft'\n");
-    writeFileSync(join(repo, "notes.md"), "my uncommitted notes\n");
+  it("offers the reusable patch alongside the recipe for re-delegating", async () => {
     const { createSession } = sessions({
       billing: async (config) => {
         await callTool(config, "write", {
           path: "services/billing/x.rb",
-          content: "PROVIDER = 'draft, finished'\n",
+          content: "PROVIDER = 'ready'\n",
         });
-        await callTool(config, "orca_checkpoint", { status: "completed", summary: "finished it" });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "provider ready" });
       },
       web: async (config) => {
         await callTool(config, "write", { path: "apps/web/app.tsx", content: "half-built\n" });
         await callTool(config, "orca_checkpoint", {
           status: "needs_scope",
-          summary: "needs the shared client",
-          scope_request: ["packages/client/**"],
+          summary: "the shared client is outside my grant",
+          scope_request: ["packages/client/index.ts"],
         });
       },
     });
 
-    const sequence = await runDelegationSequence(
-      orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"]),
-      { createSession, stateRoot },
+    const result = await createDelegateTool({
+      getState: (cwd) => detectRepositoryState(cwd, "enforce"),
+      getThinkingLevel: () => "medium",
+      createSession,
+      stateRoot,
+    }).execute(
+      "d1",
+      {
+        task: "wire the billing provider into the web app",
+        paths: ["apps/web/app.tsx", "services/billing/x.rb"],
+        assignments: [
+          { owner: "billing", task: "expose the provider", paths: ["services/billing/x.rb"], depends_on: [] },
+          { owner: "web", task: "consume it", paths: ["apps/web/app.tsx"], depends_on: ["billing"] },
+        ],
+      } as never,
+      undefined,
+      undefined,
+      { cwd: repo, model: fakeModel } as never,
     );
 
-    const accepted = sequence.promotion.acceptedWork!;
-    // The recovery route the outcome recommends, followed literally: no Orca-specific
-    // tool, no `--3way`, just git on the state the delegation was staged from.
-    expect(promotionText(sequence.promotion)).toContain(`git apply ${accepted.patchPath}`);
-    git(repo, "apply", accepted.patchPath);
-
-    expect(readFileSync(join(repo, "services", "billing", "x.rb"), "utf8")).toBe(
-      "PROVIDER = 'draft, finished'\n",
-    );
-    // Reusing the accepted work brings nothing from the owner that stopped, and leaves
-    // the user's own uncommitted work alone.
-    expect(existsSync(join(repo, "apps", "web", "app.tsx"))).toBe(false);
-    expect(readFileSync(join(repo, "notes.md"), "utf8")).toBe("my uncommitted notes\n");
+    const body = result.content.map((block) => (block.type === "text" ? block.text : "")).join("\n");
+    // The two things a steward does next, in one report: re-delegate with wider
+    // targets, and decide whether to reuse the half that was already accepted.
+    expect(body).toContain("Status: needs_scope");
+    expect(body).toContain("call orca_delegate again with the combined target paths");
+    expect(body).toContain("REUSABLE ACCEPTED WORK");
+    expect(body).toContain("billing");
+    expect(body).toContain(".accepted.patch");
+    expect(body).toContain("evidence of the whole attempt");
   });
 });
