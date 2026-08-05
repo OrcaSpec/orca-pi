@@ -6,15 +6,29 @@ import { checkGrant } from "./grant";
 import { COMMIT_CONFIG, gitFailure, gitRaw, gitText, tryGit } from "./git";
 
 /**
- * The staging seam and the promotion gate (staged-promotion plan, Phase 2; PRD
- * item 2 and the minimal part of item 5).
+ * The staging seam and the promotion gate (staged-promotion plan, Phases 2–3;
+ * PRD items 2, 3 and the minimal part of item 5).
  *
  * A delegated session never edits the user's checkout. It runs instead in an
  * ISOLATED CHECKOUT that a {@link StagingProvider} prepares: the user's `HEAD`
  * plus their materialized dirty overlay, capped by a synthetic baseline commit.
- * Mutation accountability gates writes inside that checkout, and when the
- * delegation completes, {@link promoteStagedWork} authorizes every changed path
- * against the compiled grant before anything reaches the user's files.
+ * Mutation accountability gates writes inside that checkout, and nothing leaves
+ * it except through the two-part gate below.
+ *
+ * The gate is two-part because a delegation SEQUENCE is one transaction over one
+ * shared checkout (Phase 3):
+ *
+ * - {@link commitAuthorizedWork} runs once per owner, as that owner finishes:
+ *   every path the owner changed is authorized against ITS OWN compiled grant and
+ *   the result is committed inside staging. The next owner therefore starts from
+ *   accepted work, and each staged commit is attributable to exactly one grant.
+ * - {@link promoteStagedCommits} runs once per sequence, after the last owner:
+ *   it diffs the baseline against the last staged COMMIT — never the worktree — so
+ *   only content that already passed a per-owner authorization can reach the
+ *   user's files, and it reaches them as one patch or not at all.
+ *
+ * A single-owner delegation is the degenerate case of exactly that: one
+ * authorized staged commit, then one promotion.
  *
  * The split in this module is the point:
  *
@@ -50,6 +64,9 @@ export const PATCHES_DIR = "patches";
 
 /** The commit message of the synthetic baseline the cumulative diff is taken against. */
 export const BASELINE_MESSAGE = "orca staged baseline (HEAD + dirty overlay)";
+
+/** The commit-message prefix of one owner's authorized staged change. */
+export const STEP_MESSAGE_PREFIX = "orca staged step";
 
 /**
  * The runtime state directory for staged checkouts and preserved patches. It
@@ -153,26 +170,27 @@ function safeSegment(id: string): string {
 }
 
 /**
+ * Commit everything currently in the isolated checkout and report the commit id.
+ * The pinned identity and disabled signing keep a staged commit from depending on
+ * (or being broken by) the user's global git configuration: an unset `user.email`
+ * or `commit.gpgsign = true` would otherwise fail an otherwise valid delegation.
+ * Hooks are skipped for the same reason — a repository's own hooks are the user's,
+ * not something a staged commit may run.
+ */
+function commitStagedTree(dir: string, message: string): string {
+  gitRaw(dir, ["add", "-A"]);
+  gitRaw(dir, [...COMMIT_CONFIG, "commit", "-q", "--no-verify", "--allow-empty", "-m", message]);
+  return gitText(dir, ["rev-parse", "HEAD"]).trim();
+}
+
+/**
  * Commit the isolated checkout's current content as its synthetic baseline and
  * report the commit id. Shared by every provider: whatever mechanism produced the
  * checkout, the baseline it will be diffed against is made the same way, so
  * clause 2 of the {@link StagedWorkspace} contract cannot drift between providers.
  */
 export function commitStagedBaseline(dir: string): string {
-  gitRaw(dir, ["add", "-A"]);
-  // The pinned identity and disabled signing keep the baseline from depending on
-  // (or being broken by) the user's global git configuration: an unset user.email
-  // or `commit.gpgsign = true` would otherwise fail an otherwise valid delegation.
-  gitRaw(dir, [
-    ...COMMIT_CONFIG,
-    "commit",
-    "-q",
-    "--no-verify",
-    "--allow-empty",
-    "-m",
-    BASELINE_MESSAGE,
-  ]);
-  return gitText(dir, ["rev-parse", "HEAD"]).trim();
+  return commitStagedTree(dir, BASELINE_MESSAGE);
 }
 
 // --- The promotion gate (provider-independent) --------------------------------
@@ -197,39 +215,52 @@ export interface PromotionRecord {
   diagnostics: string[];
 }
 
-/** The cumulative change of an isolated checkout against its synthetic baseline. */
+/** The change of an isolated checkout against one of its commits. */
 export interface StagedDiff {
-  /** A binary-safe patch, empty when the delegation changed nothing. */
+  /** A binary-safe patch, empty when nothing changed. */
   patch: Buffer;
   /** Every changed repository-relative path, sorted. */
   paths: string[];
 }
 
 /**
- * The cumulative diff of the isolated checkout against its synthetic baseline.
- * Staging everything first (`git add -A`) makes newly created files part of the
- * diff while still honoring `.gitignore` — an ignored file is not repository
- * content and is never promoted. Renames are not detected, so every change is an
- * add, delete, or modify of a single path and can be authorized on its own.
+ * The diff of the isolated checkout's WORKING TREE against `ref`. Staging
+ * everything first (`git add -A`) makes newly created files part of the diff while
+ * still honoring `.gitignore` — an ignored file is not repository content and is
+ * never promoted. Renames are not detected, so every change is an add, delete, or
+ * modify of a single path and can be authorized on its own.
+ */
+function worktreeDiff(dir: string, ref: string): StagedDiff {
+  gitRaw(dir, ["add", "-A"]);
+  const names = gitText(dir, ["diff", "--cached", "--no-renames", "--name-only", "-z", ref]);
+  const patch = gitRaw(dir, ["diff", "--cached", "--binary", "--no-renames", ref]);
+  return { patch, paths: names.split("\0").filter(Boolean).sort() };
+}
+
+/** The diff between two commits inside the isolated checkout. */
+function commitDiff(dir: string, from: string, to: string): StagedDiff {
+  const names = gitText(dir, ["diff", "--no-renames", "--name-only", "-z", from, to]);
+  const patch = gitRaw(dir, ["diff", "--binary", "--no-renames", from, to]);
+  return { patch, paths: names.split("\0").filter(Boolean).sort() };
+}
+
+/**
+ * The cumulative diff of the isolated checkout's working tree against its
+ * synthetic baseline: everything the delegation left behind, authorized or not.
+ * This is the EVIDENCE view — what a preserved patch contains — and deliberately
+ * not what promotion applies (see {@link promoteStagedCommits}).
  */
 export function stagedDiff(workspace: StagedWorkspace): StagedDiff {
-  gitRaw(workspace.dir, ["add", "-A"]);
-  const names = gitText(workspace.dir, [
-    "diff",
-    "--cached",
-    "--no-renames",
-    "--name-only",
-    "-z",
-    workspace.baselineCommit,
-  ]);
-  const patch = gitRaw(workspace.dir, [
-    "diff",
-    "--cached",
-    "--binary",
-    "--no-renames",
-    workspace.baselineCommit,
-  ]);
-  return { patch, paths: names.split("\0").filter(Boolean).sort() };
+  return worktreeDiff(workspace.dir, workspace.baselineCommit);
+}
+
+/** The evidence diff, or nothing when the checkout can no longer be read. */
+function tryStagedDiff(workspace: StagedWorkspace): StagedDiff {
+  try {
+    return stagedDiff(workspace);
+  } catch {
+    return { patch: Buffer.alloc(0), paths: [] };
+  }
 }
 
 /** Write a patch into the state directory as evidence; returns its path. */
@@ -262,30 +293,147 @@ function refused(
   };
 }
 
+/** What the per-owner staging gate did with one owner's change. */
+export type StagedCommitStatus = "committed" | "rejected" | "not_attempted";
+
 /**
- * The promotion gate: authorize the cumulative staged change and apply it to the
- * user's checkout, or refuse and preserve it.
- *
- * The order is deliberate. Authorization comes first, because an unauthorized
- * path must never reach the checkout even if everything else would succeed; a
- * single unauthorized path fails the WHOLE promotion rather than being filtered
- * out, so a partial patch is never invented from a change the grant did not
- * cover. Then the minimal base guard: `HEAD` must still be the commit staging
- * started from, or the patch's base is stale and the outcome is a `conflict`.
- * Only then is the patch offered to `git apply --check` and, if that passes,
- * applied.
- *
- * This never throws: a promotion failure must not destroy the delegation's
- * outcome, so an unexpected git error becomes a `rejected` record with the
- * reason in its diagnostics.
+ * The record of one owner's pass through the per-owner half of the gate. Only a
+ * `committed` record can contribute to a promotion, and {@link commit} is the
+ * staged commit the next owner starts from.
  */
-export function promoteStagedWork(
+export interface StagedCommitRecord {
+  status: StagedCommitStatus;
+  /** Who the staged commit belongs to, for diagnostics and the commit message. */
+  label: string;
+  /** Repository-relative paths this owner changed (sorted). */
+  paths: string[];
+  /** Paths this owner's own grant did not authorize; they fail the step. */
+  rejectedPaths: string[];
+  /** The staged commit id, present exactly when {@link status} is `committed`. */
+  commit?: string;
+  diagnostics: string[];
+}
+
+/**
+ * The per-owner half of the gate: authorize everything this owner changed against
+ * ITS OWN compiled grant and, if all of it is authorized, commit it inside
+ * staging.
+ *
+ * A single unauthorized path fails the whole step rather than being filtered out,
+ * so a partial commit is never invented from a change the grant did not cover —
+ * and because the refusal leaves the change uncommitted, it can never be promoted
+ * (promotion reads commits, not the worktree). The commit is what makes a
+ * multi-owner sequence work: the next owner starts from accepted work, and every
+ * promoted path traces back to the one grant that authorized it.
+ *
+ * Like the rest of the gate this never throws; a git failure becomes a `rejected`
+ * record with the reason in its diagnostics.
+ */
+export function commitAuthorizedWork(
   workspace: StagedWorkspace,
   grant: CompiledGrant,
-): PromotionRecord {
+  label: string,
+): StagedCommitRecord {
   let diff: StagedDiff;
   try {
-    diff = stagedDiff(workspace);
+    diff = worktreeDiff(workspace.dir, "HEAD");
+  } catch (error) {
+    return {
+      status: "rejected",
+      label,
+      paths: [],
+      rejectedPaths: [],
+      diagnostics: [
+        `Orca could not compute the staged change for promotion (${gitFailure(error)}).`,
+      ],
+    };
+  }
+
+  const unauthorized = diff.paths.filter((path) => !checkGrant(grant, "write", path).allowed);
+  if (unauthorized.length > 0) {
+    return {
+      status: "rejected",
+      label,
+      paths: diff.paths,
+      rejectedPaths: unauthorized,
+      diagnostics: [
+        `The staged change made by '${label}' touches path(s) outside its write grant: ` +
+          `${unauthorized.join(", ")}.`,
+      ],
+    };
+  }
+
+  try {
+    const commit = commitStagedTree(workspace.dir, `${STEP_MESSAGE_PREFIX}: ${label}`);
+    return {
+      status: "committed",
+      label,
+      paths: diff.paths,
+      rejectedPaths: [],
+      commit,
+      diagnostics: [
+        diff.paths.length > 0
+          ? `Committed ${diff.paths.length} authorized path(s) in staging for '${label}'.`
+          : `'${label}' changed no files; nothing was committed in staging for it.`,
+      ],
+    };
+  } catch (error) {
+    return {
+      status: "rejected",
+      label,
+      paths: diff.paths,
+      rejectedPaths: [],
+      diagnostics: [
+        `Orca could not commit '${label}'s authorized change in staging (${gitFailure(error)}).`,
+      ],
+    };
+  }
+}
+
+/**
+ * The once-per-sequence half of the gate: apply the accumulated authorized staged
+ * commits to the user's checkout, or refuse and preserve them.
+ *
+ * The order is deliberate. Every step must have committed, because an owner whose
+ * change was not authorized must not have its work reach the checkout inside
+ * somebody else's patch — one refused step fails the WHOLE promotion. Then the
+ * minimal base guard: `HEAD` must still be the commit staging started from, or the
+ * patch's base is stale and the outcome is a `conflict`. Only then is the patch
+ * offered to `git apply --check` and, if that passes, applied.
+ *
+ * The patch is the diff between the synthetic baseline and the LAST STAGED COMMIT,
+ * not the worktree, so anything a session left uncommitted — including a change no
+ * grant authorized — is structurally excluded from what can be promoted. The
+ * preserved evidence patch is the worktree view, because evidence should show
+ * everything that happened.
+ *
+ * This never throws: a promotion failure must not destroy the delegation's
+ * outcome, so an unexpected git error becomes a `rejected` record with the reason
+ * in its diagnostics.
+ */
+export function promoteStagedCommits(
+  workspace: StagedWorkspace,
+  staged: readonly StagedCommitRecord[],
+): PromotionRecord {
+  const refusedSteps = staged.filter((step) => step.status !== "committed");
+  if (refusedSteps.length > 0) {
+    return refused(
+      workspace,
+      "rejected",
+      tryStagedDiff(workspace),
+      [...new Set(refusedSteps.flatMap((step) => step.rejectedPaths))].sort(),
+      [
+        "Orca refused to promote this delegation: not every step's change was authorized and " +
+          "committed in staging.",
+        ...refusedSteps.flatMap((step) => step.diagnostics),
+      ],
+    );
+  }
+
+  let diff: StagedDiff;
+  try {
+    const head = gitText(workspace.dir, ["rev-parse", "HEAD"]).trim();
+    diff = commitDiff(workspace.dir, workspace.baselineCommit, head);
   } catch (error) {
     return {
       status: "rejected",
@@ -296,14 +444,6 @@ export function promoteStagedWork(
           "Nothing was applied; your checkout is unchanged.",
       ],
     };
-  }
-
-  const unauthorized = diff.paths.filter((path) => !checkGrant(grant, "write", path).allowed);
-  if (unauthorized.length > 0) {
-    return refused(workspace, "rejected", diff, unauthorized, [
-      "Orca refused to promote this delegation: the staged change touches path(s) outside the " +
-        `delegation's write grant: ${unauthorized.join(", ")}.`,
-    ]);
   }
 
   const head = tryGit(workspace.repoRoot, ["rev-parse", "HEAD"]);
@@ -358,7 +498,7 @@ export function promoteStagedWork(
  * Record that promotion was never attempted — the delegation did not complete —
  * while still preserving whatever it staged, so a failed or cancelled attempt
  * leaves recoverable evidence instead of discarding the work with the checkout.
- * Like {@link promoteStagedWork} this never throws.
+ * Like {@link promoteStagedCommits} this never throws.
  */
 export function abandonStagedWork(workspace: StagedWorkspace, reason: string): PromotionRecord {
   let diff: StagedDiff;
@@ -383,6 +523,33 @@ export function abandonStagedWork(workspace: StagedWorkspace, reason: string): P
       patchPath
         ? `Your checkout is unchanged. The staged patch is preserved at ${patchPath}.`
         : "Your checkout is unchanged; the delegation staged no change to preserve.",
+    ],
+  };
+}
+
+/**
+ * One owner's view of the sequence's single promotion.
+ *
+ * A sequence promotes once, so no owner has a promotion of its own; what an owner
+ * can honestly report is which of ITS paths the one promotion carried. On a
+ * promotion that is its committed paths narrowed to what the cumulative patch
+ * actually applied — a path an owner created and a later owner deleted nets out and
+ * is not claimed. On any refusal every owner reports the same refusal, because
+ * that is what happened to all of them: nothing was applied.
+ */
+export function stepPromotion(
+  sequence: PromotionRecord,
+  staged: StagedCommitRecord,
+): PromotionRecord {
+  if (sequence.status !== "promoted") return sequence;
+  const applied = staged.paths.filter((path) => sequence.appliedPaths.includes(path));
+  return {
+    status: "promoted",
+    appliedPaths: applied,
+    rejectedPaths: [],
+    diagnostics: [
+      `Promoted ${applied.length} path(s) from this owner to your checkout, as part of the ` +
+        `sequence's single promotion of ${sequence.appliedPaths.length} path(s).`,
     ],
   };
 }

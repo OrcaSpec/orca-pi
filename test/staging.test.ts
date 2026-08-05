@@ -14,9 +14,11 @@ import type { DomainAgent } from "orcaspec";
 import { compileGrant, type CompiledGrant } from "../src/resolver";
 import {
   abandonStagedWork,
+  commitAuthorizedWork,
   defaultStateRoot,
-  promoteStagedWork,
+  promoteStagedCommits,
   stagedDiff,
+  type PromotionRecord,
   type StagedWorkspace,
 } from "../src/staging";
 import { gitWorktreeStaging } from "../src/staging-worktree";
@@ -201,13 +203,24 @@ describe("materializing the dirty overlay", () => {
   });
 });
 
+/**
+ * The gate exactly as a single-owner delegation runs it: authorize this owner's
+ * change against its own grant and commit it in staging, then promote the
+ * accumulated commits. A single-owner delegation IS this composition (see
+ * `delegation.ts`), so driving it this way keeps these tests a specification of
+ * the real path rather than of a test-only shortcut.
+ */
+function gate(workspace: StagedWorkspace, grant: CompiledGrant): PromotionRecord {
+  return promoteStagedCommits(workspace, [commitAuthorizedWork(workspace, grant, "web")]);
+}
+
 describe("the promotion gate", () => {
   it("applies an authorized change to the checkout as an unstaged edit", () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "promoted\n");
 
-    const record = promoteStagedWork(workspace, webGrant);
+    const record = gate(workspace, webGrant);
 
     expect(record).toMatchObject({
       status: "promoted",
@@ -230,7 +243,7 @@ describe("the promotion gate", () => {
     writeFileSync(join(workspace.dir, "apps", "web", "added.tsx"), "brand new\n");
     rmSync(join(workspace.dir, "apps", "web", "old", "gone.tsx"));
 
-    const record = promoteStagedWork(workspace, webGrant);
+    const record = gate(workspace, webGrant);
 
     expect(record.status).toBe("promoted");
     expect(record.appliedPaths).toEqual(["apps/web/added.tsx", "apps/web/old/gone.tsx"]);
@@ -246,7 +259,7 @@ describe("the promotion gate", () => {
     writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "authorized\n");
     writeFileSync(join(workspace.dir, "keep.md"), "smuggled\n");
 
-    const record = promoteStagedWork(workspace, webGrant);
+    const record = gate(workspace, webGrant);
 
     expect(record.status).toBe("rejected");
     expect(record.rejectedPaths).toEqual(["keep.md"]);
@@ -263,7 +276,7 @@ describe("the promotion gate", () => {
     const workspace = open(repo, stateRoot);
     rmSync(join(workspace.dir, "keep.md"));
 
-    const record = promoteStagedWork(workspace, webGrant);
+    const record = gate(workspace, webGrant);
 
     expect(record.status).toBe("rejected");
     expect(record.rejectedPaths).toEqual(["keep.md"]);
@@ -278,7 +291,7 @@ describe("the promotion gate", () => {
     git(repo, "add", "later.md");
     git(repo, "-c", "user.name=F", "-c", "user.email=f@localhost", "commit", "-q", "-m", "moved");
 
-    const record = promoteStagedWork(workspace, webGrant);
+    const record = gate(workspace, webGrant);
 
     expect(record.status).toBe("conflict");
     expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("committed\n");
@@ -293,7 +306,7 @@ describe("the promotion gate", () => {
     // moving HEAD, so the base guard passes but `git apply --check` cannot.
     writeFileSync(join(repo, "apps", "web", "app.tsx"), "user rewrote this entirely\n");
 
-    const record = promoteStagedWork(workspace, webGrant);
+    const record = gate(workspace, webGrant);
 
     expect(record.status).toBe("rejected");
     expect(record.diagnostics.join("\n")).toMatch(/does not apply cleanly/);
@@ -307,7 +320,7 @@ describe("the promotion gate", () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
 
-    const record = promoteStagedWork(workspace, webGrant);
+    const record = gate(workspace, webGrant);
 
     expect(record).toMatchObject({ status: "promoted", appliedPaths: [], rejectedPaths: [] });
     expect(record.patchPath).toBeUndefined();
@@ -323,7 +336,7 @@ describe("the promotion gate", () => {
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "build.log"), "noise\n");
 
-    const record = promoteStagedWork(workspace, webGrant);
+    const record = gate(workspace, webGrant);
 
     expect(record).toMatchObject({ status: "promoted", appliedPaths: [] });
     expect(existsSync(join(repo, "apps", "web", "build.log"))).toBe(false);
@@ -335,7 +348,7 @@ describe("the promotion gate", () => {
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "logo.bin"), bytes);
 
-    const record = promoteStagedWork(workspace, webGrant);
+    const record = gate(workspace, webGrant);
 
     expect(record.status).toBe("promoted");
     expect(readFileSync(join(repo, "apps", "web", "logo.bin"))).toEqual(bytes);
@@ -346,7 +359,7 @@ describe("the promotion gate", () => {
     const workspace = open(repo, stateRoot);
     gitWorktreeStaging.close(workspace);
 
-    const record = promoteStagedWork(workspace, webGrant);
+    const record = gate(workspace, webGrant);
 
     expect(record.status).toBe("rejected");
     expect(record.appliedPaths).toEqual([]);

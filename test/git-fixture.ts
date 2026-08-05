@@ -1,7 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, realpathSync } from "node:fs";
+import {
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  realpathSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 
 /**
  * Real git repositories for the offline suite. Staged promotion is git behavior
@@ -63,6 +70,28 @@ export function makeStateRoot(): string {
 /** The current `HEAD` commit id of a repository. */
 export function headOf(dir: string): string {
   return git(dir, "rev-parse", "HEAD").trim();
+}
+
+/**
+ * Every working-tree file with its bytes and mode, excluding `.git`. Comparing
+ * two of these is what makes "the checkout is byte-identical" an assertion rather
+ * than a claim: a promotion that touched anything at all shows up as a diff.
+ */
+export function snapshotTree(dir: string, current = dir): Record<string, string> {
+  const entries: Record<string, string> = {};
+  for (const entry of readdirSync(current, { withFileTypes: true })) {
+    if (entry.name === ".git") continue;
+    const absolute = join(current, entry.name);
+    if (entry.isDirectory()) Object.assign(entries, snapshotTree(dir, absolute));
+    else {
+      const stat = lstatSync(absolute);
+      const content = entry.isSymbolicLink()
+        ? `symlink:${readlinkSync(absolute)}`
+        : readFileSync(absolute).toString("base64");
+      entries[relative(dir, absolute)] = `${(stat.mode & 0o777).toString(8)}:${content}`;
+    }
+  }
+  return entries;
 }
 
 /** The absolute worktree paths git currently tracks for a repository. */

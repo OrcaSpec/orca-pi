@@ -355,17 +355,26 @@ function manifestLine(paths: string[]): string {
 /**
  * What actually reached the user's files. The delegation ran in a staging
  * worktree, so "the agent changed X" and "X changed in your checkout" are
- * different claims: this line is the second one, and it names the preserved patch
- * whenever the staged change did not land, so nothing is quietly lost.
+ * different claims: these lines are the second one, and they name the preserved
+ * patch whenever the staged change did not land, so nothing is quietly lost.
+ *
+ * A sequence promotes ONCE, so its promotion is reported once under its own label;
+ * a step inside a sequence shows only the headline of its share, because the
+ * diagnostics belong to the sequence and would otherwise repeat per owner.
  */
-function promotionLines(promotion: PromotionRecord): string[] {
+function promotionLines(
+  promotion: PromotionRecord,
+  options: { label?: string; detail?: boolean } = {},
+): string[] {
+  const label = options.label ?? "Promotion";
   const headline: Record<PromotionRecord["status"], string> = {
-    promoted: `Promotion: promoted — ${promotion.appliedPaths.length} path(s) applied to your checkout.`,
-    rejected: "Promotion: REJECTED — nothing was applied; your checkout is unchanged.",
-    conflict: "Promotion: CONFLICT — nothing was applied; your checkout is unchanged.",
-    not_attempted: "Promotion: not attempted — nothing was applied; your checkout is unchanged.",
+    promoted: `${label}: promoted — ${promotion.appliedPaths.length} path(s) applied to your checkout.`,
+    rejected: `${label}: REJECTED — nothing was applied; your checkout is unchanged.`,
+    conflict: `${label}: CONFLICT — nothing was applied; your checkout is unchanged.`,
+    not_attempted: `${label}: not attempted — nothing was applied; your checkout is unchanged.`,
   };
   const lines = [headline[promotion.status]];
+  if (options.detail === false) return lines;
   for (const diagnostic of promotion.diagnostics) lines.push(`  ${diagnostic}`);
   if (promotion.rejectedPaths.length > 0) {
     lines.push(`  Unauthorized paths in the staged change: ${promotion.rejectedPaths.join(", ")}`);
@@ -404,8 +413,10 @@ function scopeExpansionGuidance(outcome: DelegationOutcome): string[] {
  * statuses reads distinctly and actionably: `needs_scope` shows the scope request
  * and the re-delegation recipe; `blocked`/`failed` lead with the summary and any
  * remaining risks alongside the manifest of whatever was already changed.
+ * `promotionDetail` is off inside a sequence, whose one promotion is reported in
+ * the sequence block instead.
  */
-function checkpointBody(outcome: DelegationOutcome): string[] {
+function checkpointBody(outcome: DelegationOutcome, promotionDetail = true): string[] {
   const cp = outcome.checkpoint;
   const synth = cp.synthesized
     ? " (synthesized — the session ended without calling orca_checkpoint)"
@@ -417,7 +428,7 @@ function checkpointBody(outcome: DelegationOutcome): string[] {
     failed: `Status: failed${synth}.`,
   };
   const lines = [headline[cp.status], `Summary: ${cp.summary}`, manifestLine(cp.changedPaths)];
-  lines.push(...promotionLines(outcome.promotion));
+  lines.push(...promotionLines(outcome.promotion, { detail: promotionDetail }));
   lines.push(
     `Validation: ${cp.validation.status}${
       cp.status === "completed" && cp.validation.status !== "passed"
@@ -533,9 +544,10 @@ function allUnmanagedResult(resolution: Resolution): AgentToolResult<ResolveTool
 
 /**
  * The aggregate result for a multi-owner sequence (and any owned+unowned advisory
- * mix). Reports the per-owner status, the completed/not-run split, the early-stop
- * reason, and — when a step needs scope — the re-delegation recipe. Unowned paths
- * are called out as unmanaged advisory work at the end.
+ * mix). Reports the sequence's ONE promotion, the per-owner status, the
+ * completed/not-run split, the early-stop reason, and — when a step needs scope —
+ * the re-delegation recipe. Unowned paths are called out as unmanaged advisory work
+ * at the end.
  */
 function delegationSequenceResult(
   sequence: SequenceOutcome,
@@ -560,18 +572,19 @@ function delegationSequenceResult(
   } else {
     lines.push(
       `Outcome: stopped at '${sequence.stoppedAt}' — ${completed} completed, ${notRun} not run. ` +
-        "Later owners were not started: the plan stops on the first non-completed status because " +
-        "each owner promotes its own change and a sequence is not yet one transaction (ADR 0009). " +
-        "The owner that stopped promoted nothing; owners that completed before it did.",
+        "The sequence is ONE TRANSACTION (ADR 0009): it stops on the first non-completed status, " +
+        "and nothing at all was promoted — not even the work of owners that completed before it.",
     );
   }
+  // The one fact about the user's own files, reported once for the whole sequence.
+  lines.push(...promotionLines(sequence.promotion, { label: "Sequence promotion" }));
 
   let index = 0;
   for (const step of sequence.steps) {
     index += 1;
     if (step.kind === "delegated") {
       lines.push("", `${index}. ${step.outcome.owner}:`);
-      for (const line of checkpointBody(step.outcome)) lines.push(`   ${line}`);
+      for (const line of checkpointBody(step.outcome, false)) lines.push(`   ${line}`);
     } else if (step.kind === "build_failed") {
       lines.push("", `${index}. ${step.owner}: build failed (${step.failureKind}) — not spawned.`);
       for (const diagnostic of step.diagnostics) lines.push(`   - ${diagnostic}`);

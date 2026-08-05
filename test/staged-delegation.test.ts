@@ -1,18 +1,15 @@
 import {
   cpSync,
   existsSync,
-  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
-  readlinkSync,
   realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { Model } from "@earendil-works/pi-ai";
 import type { DomainAgent, OrcaSpecDocument } from "orcaspec";
@@ -24,12 +21,20 @@ import {
   type DelegationSessionConfig,
 } from "../src/delegation";
 import {
+  commitAuthorizedWork,
   commitStagedBaseline,
-  promoteStagedWork,
+  promoteStagedCommits,
   stagingPaths,
   type StagingProvider,
 } from "../src/staging";
-import { git, headOf, makeGitRepo, makeStateRoot, worktreePathsOf } from "./git-fixture";
+import {
+  git,
+  headOf,
+  makeGitRepo,
+  makeStateRoot,
+  snapshotTree,
+  worktreePathsOf,
+} from "./git-fixture";
 
 /**
  * Staged promotion for a single-owner delegation (Phase 2 of the staged-promotion
@@ -103,28 +108,6 @@ function sessions(script: (config: DelegationSessionConfig) => Promise<void>) {
     return { prompt: () => script(config), abort };
   };
   return { createSession, captured, abort };
-}
-
-/**
- * Every working-tree file with its bytes and mode, excluding `.git`. Comparing
- * two of these is what makes "the checkout is byte-identical" an assertion rather
- * than a claim: a promotion that touched anything at all shows up as a diff.
- */
-function snapshotTree(dir: string, current = dir): Record<string, string> {
-  const entries: Record<string, string> = {};
-  for (const entry of readdirSync(current, { withFileTypes: true })) {
-    if (entry.name === ".git") continue;
-    const absolute = join(current, entry.name);
-    if (entry.isDirectory()) Object.assign(entries, snapshotTree(dir, absolute));
-    else {
-      const stat = lstatSync(absolute);
-      const content = entry.isSymbolicLink()
-        ? `symlink:${readlinkSync(absolute)}`
-        : readFileSync(absolute).toString("base64");
-      entries[relative(dir, absolute)] = `${(stat.mode & 0o777).toString(8)}:${content}`;
-    }
-  }
-  return entries;
 }
 
 /** A repository with one committed file and one uncommitted (dirty) edit. */
@@ -426,7 +409,8 @@ describe("staging provider seam", () => {
       if (!opened.ok) return;
       writeFileSync(join(opened.workspace.dir, "docs.md"), "smuggled through a copy\n");
 
-      const record = promoteStagedWork(opened.workspace, inputsFor(repo).grant);
+      const staged = commitAuthorizedWork(opened.workspace, inputsFor(repo).grant, "web");
+      const record = promoteStagedCommits(opened.workspace, [staged]);
 
       expect(record.status).toBe("rejected");
       expect(record.rejectedPaths).toEqual(["docs.md"]);

@@ -72,8 +72,8 @@ function sessions(scripts: Record<string, Script>, fallback?: Script) {
 }
 
 describe("runDelegationSequence", () => {
-  // Real git repositories: each owner runs in a staging worktree and promotes its
-  // authorized change back into this checkout.
+  // Real git repositories: the sequence runs in one shared staging worktree and
+  // promotes its cumulative authorized change back into this checkout once.
   let dir: string;
   let stateRoot: string;
   beforeEach(() => {
@@ -158,12 +158,13 @@ describe("runDelegationSequence", () => {
     expect(sequence.allCompleted).toBe(true);
   });
 
-  it("lets a later owner see an earlier owner's promoted work in its own staging checkout", async () => {
-    // Phase 2 promotes PER OWNER: billing's change lands in the user's checkout,
-    // so web's staging checkout materializes it as part of the dirty overlay.
-    // Dependency ordering therefore still means what it says. (Phase 3 replaces
-    // this with one shared checkout and a single cumulative promotion.)
+  it("hands a later owner the earlier owner's work through staging, not through the checkout", async () => {
+    // One shared staged checkout per sequence (Phase 3): billing's change is
+    // committed IN STAGING, which is where web reads it. Dependency ordering means
+    // what it says without any intermediate state reaching the user's files — the
+    // detailed transaction behavior lives in `staged-sequence.test.ts`.
     let webSawBilling: string | undefined;
+    let checkoutHadItDuringWeb = true;
     const { createSession } = sessions({
       billing: async (config) => {
         await callTool(config, "write", {
@@ -174,6 +175,7 @@ describe("runDelegationSequence", () => {
       },
       web: async (config) => {
         webSawBilling = readFileSync(join(config.cwd, "services", "billing", "x.rb"), "utf8");
+        checkoutHadItDuringWeb = existsSync(join(dir, "services", "billing", "x.rb"));
         await callTool(config, "orca_checkpoint", { status: "completed", summary: "consumed it" });
       },
     });
@@ -185,18 +187,25 @@ describe("runDelegationSequence", () => {
 
     expect(sequence.allCompleted).toBe(true);
     expect(webSawBilling).toBe("PROVIDER = 'ready'\n");
+    expect(checkoutHadItDuringWeb).toBe(false);
+    // The single promotion at the end is what put it in the checkout.
+    expect(sequence.promotion.status).toBe("promoted");
     expect(readFileSync(join(dir, "services", "billing", "x.rb"), "utf8")).toBe(
       "PROVIDER = 'ready'\n",
     );
   });
 
-  it("promotes nothing for the owner that stopped the sequence", async () => {
+  it("promotes nothing at all when an owner stops the sequence, not even the completed owners' work", async () => {
     const { createSession } = sessions({
       billing: async (config) => {
         await callTool(config, "write", {
           path: "services/billing/x.rb",
-          content: "half-done\n",
+          content: "committed in staging\n",
         });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "did my part" });
+      },
+      web: async (config) => {
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "half-done\n" });
         await callTool(config, "orca_checkpoint", { status: "failed", summary: "could not finish" });
       },
     });
@@ -206,12 +215,19 @@ describe("runDelegationSequence", () => {
       { createSession, stateRoot },
     );
 
-    expect(sequence.stoppedAt).toBe("billing");
-    expect(sequence.steps[0].kind).toBe("delegated");
-    if (sequence.steps[0].kind === "delegated") {
-      expect(sequence.steps[0].outcome.promotion.status).toBe("not_attempted");
-    }
+    expect(sequence.stoppedAt).toBe("web");
+    // A sequence is one transaction: the completed owner's work is held back too.
+    expect(sequence.promotion.status).toBe("not_attempted");
+    expect(sequence.promotion.diagnostics.join("\n")).toContain("step 'web' ended 'failed'");
     expect(existsSync(join(dir, "services", "billing", "x.rb"))).toBe(false);
+    expect(existsSync(join(dir, "apps", "web", "app.tsx"))).toBe(false);
+    // Every step reports the one promotion that did not happen.
+    for (const step of sequence.steps) {
+      if (step.kind === "delegated") {
+        expect(step.outcome.promotion.status).toBe("not_attempted");
+        expect(step.outcome.promotion.appliedPaths).toEqual([]);
+      }
+    }
   });
 
   it("rejects a cyclic assignment graph before starting any child session", async () => {

@@ -19,8 +19,11 @@ import { capabilitySummaryFor, type CapabilitySummary } from "./enforcement";
 import { createDelegationTools } from "./delegation-tools";
 import {
   abandonStagedWork,
-  promoteStagedWork,
+  commitAuthorizedWork,
+  promoteStagedCommits,
+  stepPromotion,
   type PromotionRecord,
+  type StagedCommitRecord,
   type StagedWorkspace,
   type StagingProvider,
 } from "./staging";
@@ -706,11 +709,14 @@ function stagingIdFor(inputs: DelegationInputs): string {
  * refuses the delegation (`staging_unavailable`) instead of falling back to an
  * in-place edit.
  *
- * Once the child stops, the terminal checkpoint is whatever the agent called (a
- * session that ends without one gets a synthesized `failed` checkpoint, ADR
- * 0083) and the manifest is always the observed set from the record. A
- * `completed` delegation then goes through the promotion gate; any other status
- * promotes nothing. Either way the worktree is removed on the way out.
+ * A single owner is the DEGENERATE SEQUENCE: it runs the same
+ * {@link runStagedStep} and the same {@link promoteSequence} as a multi-owner
+ * sequence, with a list of one step. Everything Phase 3 says about a sequence
+ * therefore holds here too — the authorized change is committed in staging, then
+ * one cumulative patch either reaches the checkout or is preserved as evidence —
+ * and the only thing this function adds is that it owns the workspace, so an
+ * `orca_delegate` call for a single owner and a direct single delegation stage,
+ * promote, and clean up identically. The worktree is removed on every exit path.
  */
 export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Promise<RunResult> {
   const staging = deps.staging ?? gitWorktreeStaging;
@@ -727,19 +733,64 @@ export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Pr
       warnings: [],
     };
   }
+  const workspace = staged.workspace;
 
   try {
-    return await runInStaging(inputs, deps, staged.workspace);
+    const result = await runStagedStep(inputs, deps, workspace);
+    if (!result.ok) {
+      return { ok: false, kind: result.kind, diagnostics: result.diagnostics, warnings: result.warnings };
+    }
+    const pending: PendingStep[] = [{ kind: "staged", step: result.step }];
+    const promotion = promoteSequence(workspace, pending);
+    return { ok: true, outcome: toOutcome(result.step, stepPromotion(promotion, result.step.staged)) };
+  } catch (error) {
+    preserveOnCrash(workspace, error);
+    throw error;
   } finally {
-    staging.close(staged.workspace);
+    staging.close(workspace);
   }
 }
 
-async function runInStaging(
+/**
+ * One owner's completed pass through a staged workspace: the assembled session,
+ * what it checkpointed, what it spent, and what the per-owner gate did with its
+ * change. A step deliberately carries NO promotion record — a sequence promotes
+ * once, so a step's promotion view can only be derived after the last owner has
+ * run ({@link stepPromotion}).
+ */
+interface StagedStep {
+  config: DelegationSessionConfig;
+  checkpoint: CheckpointResult;
+  usage: DelegationUsage;
+  staged: StagedCommitRecord;
+}
+
+/** A step either ran to a terminal checkpoint or never spawned. */
+type StagedStepResult =
+  | { ok: true; step: StagedStep }
+  | { ok: false; kind: RunFailureKind; diagnostics: string[]; warnings: InjectionWarning[] };
+
+/** How one owner's staged commit is named in staging and in diagnostics. */
+function stagedLabel(config: DelegationSessionConfig): string {
+  const { owner, assignment } = config;
+  return assignment.assignmentId === owner ? owner : `${owner} / ${assignment.assignmentId}`;
+}
+
+/**
+ * Run ONE owner inside an already-open staged workspace, up to and including the
+ * per-owner authorization gate.
+ *
+ * The step's authorized change is committed in staging BEFORE the child runtime is
+ * finalized, for the same reason the promotion gate used to precede it: `finish`
+ * aggregates disposal errors and can throw, and a disposal failure must not cost a
+ * sequence work that was already authorized. Committing here is also what lets the
+ * next owner see this one's accepted work: it starts from this commit.
+ */
+async function runStagedStep(
   inputs: DelegationInputs,
   deps: RunDeps,
   workspace: StagedWorkspace,
-): Promise<RunResult> {
+): Promise<StagedStepResult> {
   const built = buildDelegationSession({ ...inputs, cwd: workspace.dir });
   if (!built.ok) {
     return { ok: false, kind: built.kind, diagnostics: built.diagnostics, warnings: built.warnings };
@@ -781,17 +832,20 @@ async function runInStaging(
 
   const usage = session.usage ? session.usage() : emptyUsage();
 
-  // The promotion gate runs before the child runtime is finalized: `finish` can
-  // throw (it aggregates disposal errors), and a disposal failure must not cost
-  // the user a delegation whose work was already authorized and applicable.
-  const promotion =
+  const label = stagedLabel(config);
+  const staged: StagedCommitRecord =
     checkpoint.status === "completed"
-      ? promoteStagedWork(workspace, inputs.grant)
-      : abandonStagedWork(
-          workspace,
-          `Promotion was not attempted: the delegation ended '${checkpoint.status}', and only a ` +
-            "completed delegation promotes its staged change.",
-        );
+      ? commitAuthorizedWork(workspace, inputs.grant, label)
+      : {
+          status: "not_attempted",
+          label,
+          paths: [],
+          rejectedPaths: [],
+          diagnostics: [
+            `'${label}' ended '${checkpoint.status}', so its staged change was not committed in ` +
+              "staging; only a completed step's change is accepted.",
+          ],
+        };
 
   await session.finish?.({
     status: completionStatus,
@@ -801,19 +855,114 @@ async function runInStaging(
     mutationViolations: checkpoint.mutationViolations ?? [],
   });
 
+  return { ok: true, step: { config, checkpoint, usage, staged } };
+}
+
+/** The steward-facing outcome of one step, once its promotion view is known. */
+function toOutcome(step: StagedStep, promotion: PromotionRecord): DelegationOutcome {
   return {
-    ok: true,
-    outcome: {
-      owner: config.owner,
-      targets: config.targets,
-      checkpoint,
-      warnings: config.warnings,
-      usage,
-      appendEntry: toEntry(config, checkpoint, usage, promotion),
-      assignment: config.assignment,
-      upstreamHandoffs: config.upstreamHandoffs,
-      promotion,
-    },
+    owner: step.config.owner,
+    targets: step.config.targets,
+    checkpoint: step.checkpoint,
+    warnings: step.config.warnings,
+    usage: step.usage,
+    appendEntry: toEntry(step.config, step.checkpoint, step.usage, promotion),
+    assignment: step.config.assignment,
+    upstreamHandoffs: step.config.upstreamHandoffs,
+    promotion,
+  };
+}
+
+/**
+ * A sequence slot before the sequence's single promotion has been decided. It is
+ * exactly {@link SequenceStep} with the delegated case still un-promoted: the
+ * promotion is one decision over ALL the steps, so no step's outcome can be built
+ * until the last one has run.
+ */
+type PendingStep =
+  | { kind: "staged"; step: StagedStep }
+  | Extract<SequenceStep, { kind: "build_failed" } | { kind: "not_run" }>;
+
+/**
+ * Why this sequence must not promote, or `undefined` when every step completed.
+ * Named after the step that stopped it, because that is the first thing the
+ * steward needs to know when a checkout comes back unchanged.
+ */
+function blockerFor(pending: readonly PendingStep[]): string | undefined {
+  const tail = "; staged work is promoted only when every step completes.";
+  if (pending.length === 0) return `Promotion was not attempted: no step ran${tail}`;
+  for (const slot of pending) {
+    switch (slot.kind) {
+      case "staged":
+        if (slot.step.checkpoint.status === "completed") continue;
+        return (
+          `Promotion was not attempted: step '${slot.step.config.owner}' ended ` +
+          `'${slot.step.checkpoint.status}'${tail}`
+        );
+      case "build_failed":
+        return `Promotion was not attempted: step '${slot.owner}' never started (${slot.failureKind})${tail}`;
+      case "not_run":
+        return `Promotion was not attempted: step '${slot.owner}' did not run (${slot.reason})${tail}`;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The sequence's ONE promotion (staged-promotion plan, Phase 3). Every step
+ * completed means the accumulated authorized staged commits are offered to the
+ * user's checkout as a single cumulative patch; anything else means nothing is
+ * applied and the cumulative patch is preserved as evidence instead.
+ */
+function promoteSequence(
+  workspace: StagedWorkspace,
+  pending: readonly PendingStep[],
+): PromotionRecord {
+  const staged = pending.flatMap((slot) => (slot.kind === "staged" ? [slot.step.staged] : []));
+  // An owner whose own change was refused is the sharpest thing that went wrong, so
+  // it is reported as a REJECTION naming the unauthorized paths rather than as the
+  // later owner merely not having run — which is only a consequence of it.
+  if (staged.some((record) => record.status === "rejected")) {
+    return promoteStagedCommits(workspace, staged);
+  }
+  const blocker = blockerFor(pending);
+  if (blocker) return abandonStagedWork(workspace, blocker);
+  return promoteStagedCommits(workspace, staged);
+}
+
+/** Project the pending slots onto their final form, once the promotion is known. */
+function toSequenceSteps(
+  pending: readonly PendingStep[],
+  promotion: PromotionRecord,
+): SequenceStep[] {
+  return pending.map((slot) =>
+    slot.kind === "staged"
+      ? {
+          kind: "delegated",
+          outcome: toOutcome(slot.step, stepPromotion(promotion, slot.step.staged)),
+        }
+      : slot,
+  );
+}
+
+/**
+ * Preserve the cumulative patch when a delegation dies of an unexpected throw.
+ * The workspace is about to be torn down by the caller's `finally`, so without
+ * this the authorized staged commits would go with it; the record is deliberately
+ * discarded — the exception, not a promotion record, is what the caller gets.
+ */
+function preserveOnCrash(workspace: StagedWorkspace, error: unknown): void {
+  const reason = error instanceof Error ? error.message : String(error);
+  abandonStagedWork(workspace, `The delegation ended with an unexpected failure: ${reason}`);
+}
+
+/** A promotion record for a delegation that never reached staging at all. */
+function unstagedPromotion(reason: string): PromotionRecord {
+  return {
+    status: "not_attempted",
+    appliedPaths: [],
+    rejectedPaths: [],
+    diagnostics: [reason, "Your checkout is unchanged; nothing was staged to promote."],
   };
 }
 
@@ -853,21 +1002,23 @@ export type SequenceStep =
 
 /**
  * The aggregate outcome of a multi-owner delegation sequence. A route plan is
- * intended to succeed as a whole (ADR 0009), but promotion is still PER OWNER:
- * each owner stages and promotes its own authorized change, so a sequence has no
- * all-or-nothing transaction yet (that is the next phase of the staged-promotion
- * plan, which gives a sequence one shared worktree and a single cumulative
- * promotion).
+ * intended to succeed as a whole (ADR 0009), and since Phase 3 of the
+ * staged-promotion plan the runtime keeps that promise: the whole sequence is ONE
+ * TRANSACTION over one shared staged checkout. Each completed owner's authorized
+ * change is committed inside staging, so the next owner builds on accepted work,
+ * and the accumulated commits reach the user's checkout as a single cumulative
+ * patch — {@link promotion} — only after every owner has completed.
  *
- * So the honest degradation remains stop-on-first-non-completed:
- * {@link stepCompleted} gates each owner, and the moment one is not `completed`
- * (a `needs_scope` that must return to the steward for re-resolution per ADR
- * 0008, a `blocked`, a `failed`, a synthesized failure, or a pre-spawn build
- * failure) the remaining owners are left `not_run` rather than promoting more
- * work behind a plan already known to be failing. This minimizes blast radius
- * while keeping the completed owners' promoted work reported and intact. An
- * owner that did not complete promotes nothing at all, so a failing sequence
- * leaves strictly less behind than it used to.
+ * Everything else follows from that. A sequence that does not finish promotes
+ * NOTHING: the checkout is byte-identical to what it was before, and the
+ * cumulative patch is preserved as evidence instead, with {@link stoppedAt} and
+ * the promotion diagnostics naming the step that stopped it. Execution still stops
+ * on the first owner that is not `completed` ({@link stepCompleted}) — a
+ * `needs_scope` that must return to the steward for re-resolution per ADR 0008, a
+ * `blocked`, a `failed`, a synthesized failure, or a pre-spawn build failure —
+ * because once the transaction cannot commit there is nothing to gain by running
+ * more children, and a later owner must never inherit a failed owner's uncommitted
+ * work as if it were accepted.
  */
 export interface SequenceOutcome {
   /** Per-owner results in deterministic dependency order, then owner id. */
@@ -878,6 +1029,13 @@ export interface SequenceOutcome {
   stoppedAt?: string;
   /** True when parent cancellation cut the sequence short (ADR 0083). */
   cancelled: boolean;
+  /**
+   * The sequence's single promotion: what the accumulated authorized staged
+   * commits did (or did not) do to the user's checkout, and where the cumulative
+   * patch was preserved when they did nothing. Each step's own
+   * `outcome.promotion` is this record seen from that owner's side.
+   */
+  promotion: PromotionRecord;
   assignmentGraph: AssignmentGraph;
   signals: OrchestrationSignals;
 }
@@ -1090,19 +1248,50 @@ export function stepCompleted(step: SequenceStep): boolean {
 }
 
 /**
- * Run an ordered list of per-owner delegations sequentially (ADR 0006, 0077):
- * each delegation runs only after the previous one terminates — never
- * interleaved. Stops on the first owner that does not `complete` (see
- * {@link SequenceOutcome}); parent cancellation aborts the in-flight session via
- * {@link runDelegation}'s existing seam and leaves every later owner `not_run`
- * (ADR 0083). Each delegation compiles and runs under its OWN grant carried on
- * its {@link DelegationInputs}; this function never merges or mutates grants, so
- * one owner's authority cannot leak into another's.
+ * A stable staging directory name for a whole sequence. The sequence identity is
+ * used when the caller has one; otherwise it is derived from the sequence's own
+ * shape, so a legacy caller still gets a deterministic directory (a repeat run
+ * reclaims its own leftovers) without inventing an identity nothing can explain.
+ */
+function sequenceStagingId(ordered: readonly DelegationInputs[]): string {
+  const first = ordered[0];
+  if (first?.sequenceId) return first.sequenceId;
+  const digest = createHash("sha256")
+    .update(
+      JSON.stringify({
+        owners: ordered.map((inputs) => inputs.owner).sort(),
+        cwd: first?.cwd,
+      }),
+    )
+    .digest("hex")
+    .slice(0, 16);
+  return `legacy_sequence_${digest}`;
+}
+
+/**
+ * Run an ordered list of per-owner delegations sequentially as ONE TRANSACTION
+ * (ADR 0006, 0077; staged-promotion plan, Phase 3).
  *
- * Each owner also stages and promotes independently ({@link runDelegation}), so a
- * later owner reads the earlier owners' promoted work as part of the checkout's
- * dirty overlay — dependency ordering still means what it says — while an owner
- * that fails contributes nothing.
+ * The sequence gets ONE staged checkout, shared by every owner. Each delegation
+ * runs only after the previous one terminates — never interleaved — and each
+ * completed owner's authorized change is committed inside that checkout
+ * ({@link runStagedStep}), so the next owner starts from accepted work rather than
+ * from the user's files. Nothing is applied to the user's checkout until the last
+ * owner is done: then {@link promoteSequence} offers the accumulated commits as one
+ * cumulative patch. If any step did not complete, the checkout is left exactly as
+ * it was and the cumulative patch is preserved as evidence.
+ *
+ * Each delegation compiles and runs under its OWN grant carried on its
+ * {@link DelegationInputs}; this function never merges or mutates grants, and each
+ * staged commit is authorized against only the grant of the owner that made it, so
+ * one owner's authority cannot leak into another's — not even through the shared
+ * checkout.
+ *
+ * Parent cancellation aborts the in-flight session through the session seam and
+ * leaves every later owner `not_run` (ADR 0083); a sequence cancelled at any point
+ * promotes nothing. The checkout is staged lazily, so a sequence that is cancelled
+ * before its first owner starts, or whose repository cannot be staged at all, never
+ * creates one.
  */
 export async function runDelegationSequence(
   ordered: DelegationInputs[],
@@ -1114,14 +1303,39 @@ export async function runDelegationSequence(
     assignmentGraph.assignments.map((assignment) => [assignment.owner, assignment]),
   );
   const executionInputs = assignmentGraph.executionOrder.map((owner) => inputsByOwner.get(owner)!);
-  const steps: SequenceStep[] = [];
+  const pending: PendingStep[] = [];
   let stoppedAt: string | undefined;
   let cancelled = false;
+  let stopped = false;
   const total = executionInputs.length;
-  const stepsByOwner = new Map<string, SequenceStep>();
+  const pendingByOwner = new Map<string, PendingStep>();
 
   const noteStopped = (owner: string): void => {
     stoppedAt ??= owner;
+    stopped = true;
+  };
+  const record = (owner: string, slot: PendingStep): void => {
+    pending.push(slot);
+    pendingByOwner.set(owner, slot);
+  };
+
+  const staging = deps.staging ?? gitWorktreeStaging;
+  let workspace: StagedWorkspace | undefined;
+  let stagingRefusal: string[] | undefined;
+  /**
+   * Open the sequence's shared checkout on first use, and remember a refusal so a
+   * repository that cannot be staged is diagnosed once rather than per owner.
+   */
+  const openWorkspace = (): StagedWorkspace | undefined => {
+    if (workspace || stagingRefusal) return workspace;
+    const opened = staging.open({
+      cwd: executionInputs[0].cwd,
+      delegationId: sequenceStagingId(executionInputs),
+      stateRoot: deps.stateRoot,
+    });
+    if (opened.ok) workspace = opened.workspace;
+    else stagingRefusal = opened.diagnostics;
+    return workspace;
   };
 
   deps.onProgress?.({
@@ -1130,144 +1344,203 @@ export async function runDelegationSequence(
     total,
   });
 
-  let index = 0;
-  for (const baseInputs of executionInputs) {
-    index += 1;
-    const assignment = assignmentsByOwner.get(baseInputs.owner)!;
-    const dependencySteps = assignment.dependencies
-      .map((owner) => [owner, stepsByOwner.get(owner)] as const)
-      .filter((entry): entry is readonly [string, SequenceStep] => entry[1] !== undefined);
-
-    // Parent cancelled before this owner started: do not spawn it at all.
-    if (deps.signal?.aborted) {
-      cancelled = true;
-      noteStopped(baseInputs.owner);
-      const step: SequenceStep = {
-        kind: "not_run",
-        owner: baseInputs.owner,
-        targets: baseInputs.targets,
-        assignment,
-        reason: "cancelled",
-      };
-      steps.push(step);
-      stepsByOwner.set(baseInputs.owner, step);
-      continue;
-    }
-
-    const incompleteDependencies = dependencySteps.filter(([, step]) => !stepCompleted(step));
-    if (incompleteDependencies.length > 0) {
-      const statuses = incompleteDependencies.map(([, step]) =>
-        step.kind === "delegated" ? step.outcome.checkpoint.status : step.kind,
-      );
-      const reason: Extract<SequenceStep, { kind: "not_run" }>["reason"] =
-        statuses.includes("needs_scope")
-          ? "dependency_needs_scope"
-          : statuses.includes("blocked")
-            ? "dependency_blocked"
-            : "dependency_failed";
-      noteStopped(baseInputs.owner);
-      const step: SequenceStep = {
+  try {
+    let index = 0;
+    for (const baseInputs of executionInputs) {
+      index += 1;
+      const assignment = assignmentsByOwner.get(baseInputs.owner)!;
+      const dependencySlots = assignment.dependencies
+        .map((owner) => [owner, pendingByOwner.get(owner)] as const)
+        .filter((entry): entry is readonly [string, PendingStep] => entry[1] !== undefined);
+      const notRun = (
+        reason: Extract<SequenceStep, { kind: "not_run" }>["reason"],
+        blockedBy?: string[],
+      ): PendingStep => ({
         kind: "not_run",
         owner: baseInputs.owner,
         targets: baseInputs.targets,
         assignment,
         reason,
-        blockedBy: incompleteDependencies.map(([owner]) => owner).sort(),
+        blockedBy,
+      });
+
+      // Parent cancelled before this owner started: do not spawn it at all.
+      if (deps.signal?.aborted) {
+        cancelled = true;
+        noteStopped(baseInputs.owner);
+        record(baseInputs.owner, notRun("cancelled"));
+        continue;
+      }
+
+      const incompleteDependencies = dependencySlots.filter(([, slot]) => !pendingCompleted(slot));
+      if (incompleteDependencies.length > 0) {
+        const statuses = incompleteDependencies.map(([, slot]) =>
+          slot.kind === "staged" ? slot.step.checkpoint.status : slot.kind,
+        );
+        const reason: Extract<SequenceStep, { kind: "not_run" }>["reason"] =
+          statuses.includes("needs_scope")
+            ? "dependency_needs_scope"
+            : statuses.includes("blocked")
+              ? "dependency_blocked"
+              : "dependency_failed";
+        noteStopped(baseInputs.owner);
+        record(
+          baseInputs.owner,
+          notRun(reason, incompleteDependencies.map(([owner]) => owner).sort()),
+        );
+        continue;
+      }
+
+      // An earlier owner already made the transaction uncommittable, and this one
+      // does not depend on it: running it would only add work nothing can promote,
+      // on top of an abandoned owner's uncommitted changes.
+      if (stopped) {
+        record(baseInputs.owner, notRun("sequence_stopped"));
+        continue;
+      }
+
+      const upstreamHandoffs: UpstreamHandoff[] = dependencySlots.flatMap(([, slot]) =>
+        slot.kind === "staged"
+          ? [
+              {
+                assignmentId: slot.step.config.assignment.assignmentId,
+                owner: slot.step.config.owner,
+                summary: slot.step.checkpoint.summary,
+                changedPaths: [...slot.step.checkpoint.changedPaths],
+                validationStatus: slot.step.checkpoint.validation.status,
+                remainingRisks: slot.step.checkpoint.remainingRisks ?? [],
+              },
+            ]
+          : [],
+      );
+      const inputs: DelegationInputs = {
+        ...baseInputs,
+        task: assignment.task,
+        assignment,
+        upstreamHandoffs,
       };
-      steps.push(step);
-      stepsByOwner.set(baseInputs.owner, step);
-      continue;
-    }
 
-    const upstreamHandoffs: UpstreamHandoff[] = dependencySteps.flatMap(([, step]) =>
-      step.kind === "delegated"
-        ? [
-            {
-              assignmentId: step.outcome.assignment.assignmentId,
-              owner: step.outcome.owner,
-              summary: step.outcome.checkpoint.summary,
-              changedPaths: [...step.outcome.checkpoint.changedPaths],
-              validationStatus: step.outcome.checkpoint.validation.status,
-              remainingRisks: step.outcome.checkpoint.remainingRisks ?? [],
-            },
-          ]
-        : [],
-    );
-    const inputs: DelegationInputs = {
-      ...baseInputs,
-      task: assignment.task,
-      assignment,
-      upstreamHandoffs,
-    };
+      deps.onProgress?.({
+        kind: "step_start",
+        owner: inputs.owner,
+        assignmentId: assignment.assignmentId,
+        index,
+        total,
+      });
+      // Scope this owner's activity notes with its position so the widget/onUpdate
+      // stream can attribute streaming activity to the right in-flight delegation.
+      const stepDeps: RunDeps = {
+        ...deps,
+        onActivity: (note) =>
+          deps.onProgress?.({
+            kind: "step_activity",
+            owner: inputs.owner,
+            assignmentId: assignment.assignmentId,
+            index,
+            total,
+            note,
+          }),
+      };
 
-    deps.onProgress?.({
-      kind: "step_start",
-      owner: inputs.owner,
-      assignmentId: assignment.assignmentId,
-      index,
-      total,
-    });
-    // Scope this owner's activity notes with its position so the widget/onUpdate
-    // stream can attribute streaming activity to the right in-flight delegation.
-    const stepDeps: RunDeps = {
-      ...deps,
-      onActivity: (note) =>
+      const shared = openWorkspace();
+      const result: StagedStepResult = shared
+        ? await runStagedStep(inputs, stepDeps, shared)
+        : {
+            ok: false,
+            kind: "staging_unavailable",
+            diagnostics: stagingRefusal ?? [],
+            warnings: [],
+          };
+      // A cancellation observed during this delegation (its session was aborted and
+      // it ended with a synthesized failure) marks the whole sequence cancelled.
+      if (deps.signal?.aborted) cancelled = true;
+
+      if (!result.ok) {
+        record(inputs.owner, {
+          kind: "build_failed",
+          owner: inputs.owner,
+          targets: inputs.targets,
+          assignment,
+          failureKind: result.kind,
+          diagnostics: result.diagnostics,
+          warnings: result.warnings,
+        });
         deps.onProgress?.({
-          kind: "step_activity",
+          kind: "step_end",
           owner: inputs.owner,
           assignmentId: assignment.assignmentId,
           index,
           total,
-          note,
-        }),
-    };
-    const result = await runDelegation(inputs, stepDeps);
-    // A cancellation observed during this delegation (its session was aborted and
-    // it ended with a synthesized failure) marks the whole sequence cancelled.
-    if (deps.signal?.aborted) cancelled = true;
+          status: "build_failed",
+          changedPaths: 0,
+        });
+        noteStopped(inputs.owner);
+        continue;
+      }
 
-    if (!result.ok) {
-      steps.push({
-        kind: "build_failed",
-        owner: inputs.owner,
-        targets: inputs.targets,
-        assignment,
-        failureKind: result.kind,
-        diagnostics: result.diagnostics,
-        warnings: result.warnings,
-      });
+      record(inputs.owner, { kind: "staged", step: result.step });
       deps.onProgress?.({
         kind: "step_end",
         owner: inputs.owner,
         assignmentId: assignment.assignmentId,
         index,
         total,
-        status: "build_failed",
-        changedPaths: 0,
+        status: result.step.checkpoint.status,
+        changedPaths: result.step.checkpoint.changedPaths.length,
       });
-      const step = steps[steps.length - 1];
-      stepsByOwner.set(inputs.owner, step);
-      noteStopped(inputs.owner);
-      continue;
+      // A refused staged commit stops the sequence just as firmly as a
+      // non-completed checkpoint, and for a sharper reason: the refusal leaves that
+      // owner's unauthorized change sitting uncommitted in the SHARED checkout, and
+      // a later owner whose grant does cover those paths would otherwise commit
+      // them as its own — laundering authority through the transaction.
+      if (
+        result.step.checkpoint.status !== "completed" ||
+        result.step.staged.status !== "committed"
+      ) {
+        noteStopped(inputs.owner);
+      }
     }
 
-    const delegatedStep: SequenceStep = { kind: "delegated", outcome: result.outcome };
-    steps.push(delegatedStep);
-    stepsByOwner.set(inputs.owner, delegatedStep);
-    deps.onProgress?.({
-      kind: "step_end",
-      owner: inputs.owner,
-      assignmentId: assignment.assignmentId,
-      index,
+    // The single promotion for the whole sequence, decided once every owner is done.
+    const promotion = workspace
+      ? promoteSequence(workspace, pending)
+      : unstagedPromotion(blockerFor(pending) ?? "Promotion was not attempted.");
+    const steps = toSequenceSteps(pending, promotion);
+    return finishSequence(steps, promotion, {
+      assignmentGraph,
       total,
-      status: result.outcome.checkpoint.status,
-      changedPaths: result.outcome.checkpoint.changedPaths.length,
+      stoppedAt,
+      cancelled,
+      onProgress: deps.onProgress,
     });
-    if (result.outcome.checkpoint.status !== "completed") noteStopped(inputs.owner);
+  } catch (error) {
+    if (workspace) preserveOnCrash(workspace, error);
+    throw error;
+  } finally {
+    if (workspace) staging.close(workspace);
   }
+}
 
+/** A pending slot counts as completed only when its session returned `completed`. */
+function pendingCompleted(slot: PendingStep): boolean {
+  return slot.kind === "staged" && slot.step.checkpoint.status === "completed";
+}
+
+/** Emit the closing progress event and derive the sequence's orchestration signals. */
+function finishSequence(
+  steps: SequenceStep[],
+  promotion: PromotionRecord,
+  context: {
+    assignmentGraph: AssignmentGraph;
+    total: number;
+    stoppedAt: string | undefined;
+    cancelled: boolean;
+    onProgress: RunDeps["onProgress"];
+  },
+): SequenceOutcome {
+  const { assignmentGraph, total, stoppedAt, cancelled, onProgress } = context;
   const allCompleted = steps.length > 0 && steps.every(stepCompleted);
-  deps.onProgress?.({
+  onProgress?.({
     kind: "sequence_end",
     total,
     completed: steps.filter(stepCompleted).length,
@@ -1306,5 +1579,5 @@ export async function runDelegationSequence(
       .sort((left, right) => left.name.localeCompare(right.name)),
   };
 
-  return { steps, allCompleted, stoppedAt, cancelled, assignmentGraph, signals };
+  return { steps, allCompleted, stoppedAt, cancelled, promotion, assignmentGraph, signals };
 }

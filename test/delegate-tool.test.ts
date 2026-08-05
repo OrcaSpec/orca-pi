@@ -423,6 +423,21 @@ describe("orca_delegate full lifecycle", () => {
     expect(textOf(result)).toContain("not run");
   });
 
+  it("tells the steward that a stopped sequence promoted nothing, including the completed owner's work", async () => {
+    writeSpec("multi-owner");
+    const { createSession } = sessions({ billing: complete, web: ends("failed") });
+    const result = await run(["apps/web/app.tsx", "services/billing/x.rb"], createSession);
+
+    const body = textOf(result);
+    // The sequence-level promotion is reported once, for the whole transaction.
+    expect(body).toContain("Sequence promotion: not attempted");
+    expect(body).toContain("step 'web' ended 'failed'");
+    // And it is the truth: billing completed, but its work is not in the checkout.
+    expect(existsSync(join(dir, "services", "billing", "x.rb"))).toBe(false);
+    if (result.details?.kind !== "delegation_sequence") return;
+    expect(result.details.sequence.promotion.status).toBe("not_attempted");
+  });
+
   it("stops on needs_scope mid-sequence and shows the stopping owner's re-delegation recipe", async () => {
     writeSpec("multi-owner");
     const { createSession } = sessions({
