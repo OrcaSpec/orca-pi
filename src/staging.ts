@@ -330,7 +330,8 @@ export interface BaseDrift {
  *
  * Overlap is compared by exact path, not by prefix. A structural collision that
  * exact paths cannot see — the user creating a DIRECTORY where the patch creates a
- * file — is caught by `git apply --check` instead, which is what that gate is for.
+ * file — is left to git, which refuses it when the patch is offered; that refusal is
+ * a `rejected`, because nothing the user did to a BOUND path moved.
  *
  * A base that cannot be read at all is drift too, not a pass: an unverifiable base
  * is indistinguishable from a moved one, and the fail-closed reading is the only

@@ -325,6 +325,23 @@ describe("what the overlay digest does and does not count as drift", () => {
     expect(record.diagnostics.join("\n")).toContain("no change to preserve");
   });
 
+  it("binds paths a repository may legally contain but an object cannot hold", () => {
+    const { repo, stateRoot } = fixture();
+    // `__proto__` is a legal filename; in a plain object it would collide with
+    // `Object.prototype` and the binding would silently stop describing it. It is a
+    // `Map` for exactly this reason, and a repository is where such a file shows up.
+    writeFileSync(join(repo, "__proto__"), "legal filename\n");
+    writeFileSync(join(repo, "a file with spaces 'and quotes'.md"), "also legal\n");
+    const workspace = open(repo, stateRoot);
+    writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "delegated work\n");
+    writeFileSync(join(repo, "__proto__"), "edited by the user\n");
+
+    const record = gate(workspace);
+
+    expect(record.status).toBe("conflict");
+    expect(record.driftedPaths).toEqual(["__proto__"]);
+  });
+
   it("treats a base it cannot read as drift, never as a pass", () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
