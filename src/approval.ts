@@ -205,9 +205,9 @@ function applyHeldPatch(cwd: string, held: HeldGovernance, now: number): Governa
   // governance paths the gate recorded is refused, which keeps an approval from becoming
   // a way to land content the gate never authorized or held.
   const actual = patchPathsOf(root, patch);
-  const expected = [...held.paths].sort();
-  if (actual === undefined || actual.join("\n") !== expected.join("\n")) {
-    return record("patch_mismatch", actual === undefined ? "git cannot read it as a patch" : actual.join(", "));
+  if (actual === undefined) return record("patch_mismatch", "git can no longer read it as a patch");
+  if (actual.join("\n") !== [...held.paths].sort().join("\n")) {
+    return record("patch_mismatch", `it now touches ${actual.join(", ")}`);
   }
 
   const check = tryGit(root, ["apply", "--check", "--whitespace=nowarn"], patch);
@@ -264,9 +264,9 @@ function approvalLines(hold: GovernanceHold, approval: GovernanceApproval): stri
       return [
         "Orca refused to approve that governance change: the held patch at " +
           `${approval.patchPath} no longer contains what was held.`,
-        `The hold covers ${approval.paths.join(", ")}; the patch now touches ` +
-          `${approval.detail}. Orca applies what the delegation's record says was held and ` +
-          "nothing else, so nothing was applied and your checkout is unchanged.",
+        `The hold covers ${approval.paths.join(", ")}; ${approval.detail}. Orca applies what the ` +
+          "delegation's record says was held and nothing else, so nothing was applied and your " +
+          "checkout is unchanged.",
       ];
     case "unreadable_repository":
       return [
@@ -277,7 +277,7 @@ function approvalLines(hold: GovernanceHold, approval: GovernanceApproval): stri
       ];
     case "does_not_apply":
       return [
-        `Orca did NOT approve that governance change: its patch does not apply to your checkout ` +
+        "Orca did NOT approve that governance change: its patch does not apply to your checkout " +
           `any more (git apply --check failed: ${approval.detail}).`,
         `Your checkout is unchanged and the patch is still held at ${approval.patchPath}. It was ` +
           `generated against ${hold.held.baseCommit}; \`git apply --3way ${approval.patchPath}\` can ` +
