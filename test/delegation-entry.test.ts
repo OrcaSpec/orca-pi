@@ -22,6 +22,7 @@ import {
   parseDelegationEntry,
   recordSummaryLine,
   renderRecordLines,
+  type PersistedPromotion,
   type PersistedDelegationRecord,
 } from "../src/delegation-entry";
 
@@ -460,5 +461,109 @@ describe("renderRecordLines (transcript + last-delegation detail)", () => {
     expect(text).toContain(
       "Repeated validation/investigation: inspect provider aliases [billing, web]",
     );
+  });
+});
+
+/**
+ * What "a retained delegation entry references this file" means concretely (hardening
+ * plan, Phase 6). Retention deletes files, so this projection is the whole safety
+ * property: every artifact path any VISIBLE history entry can print has to come out of
+ * it, or a sweep can leave the `/orca` surface pointing at a file that is gone.
+ *
+ * Plain record literals rather than real delegations here, deliberately: no single
+ * delegation produces all four artifact pointers at once — a hold and a `needs_scope`
+ * reusable patch are mutually exclusive outcomes — and the record is plain JSON, so the
+ * literal IS the real collaborator.
+ */
+describe("the artifacts a retained history entry points at", () => {
+  function recordWith(promotion: Partial<PersistedPromotion>): PersistedDelegationRecord {
+    return {
+      v: DELEGATION_ENTRY_VERSION,
+      task: "widen the billing scope",
+      owners: ["billing"],
+      targets: ["services/billing/x.rb"],
+      grantDigest: "abc123",
+      steps: [],
+      usage: { available: false, totalTokens: 0, costUsd: 0 } as DelegationUsage,
+      startedAt: 1,
+      endedAt: 2,
+      promotion: {
+        status: "conflict",
+        appliedPaths: [],
+        rejectedPaths: [],
+        driftedPaths: [],
+        validations: [],
+        diagnostics: [],
+        ...promotion,
+      },
+    };
+  }
+
+  it("collects every artifact pointer one record carries", () => {
+    const history = new DelegationHistory();
+    history.add(
+      recordWith({
+        patchPath: "/state/patches/seq.patch",
+        validatorOutputPath: "/state/validators/seq.log",
+        heldGovernance: { patchPath: "/state/patches/seq.governance.patch", paths: [".orca/orca.yaml"], baseCommit: "aaa" },
+        acceptedWork: {
+          patchPath: "/state/patches/seq.accepted.patch",
+          paths: ["services/billing/x.rb"],
+          owners: ["billing"],
+          baseCommit: "aaa",
+          excludedGovernancePaths: [],
+        },
+      }),
+    );
+
+    expect(history.referencedArtifacts(), "all four artifact kinds are pointed at").toEqual([
+      "/state/patches/seq.accepted.patch",
+      "/state/patches/seq.governance.patch",
+      "/state/patches/seq.patch",
+      "/state/validators/seq.log",
+    ]);
+  });
+
+  it("counts a patch an approval entry references even with no delegation record", () => {
+    const history = new DelegationHistory();
+    history.recordApproval({
+      patchPath: "/state/patches/settled.governance.patch",
+      paths: [".orca/runtime.yaml"],
+      outcome: "applied",
+      at: 10,
+    });
+
+    expect(
+      history.referencedArtifacts(),
+      "an approval is the record of what was landed and names its patch",
+    ).toEqual(["/state/patches/settled.governance.patch"]);
+  });
+
+  it("says nothing about a record written before promotions were persisted", () => {
+    const history = new DelegationHistory();
+    const legacy = recordWith({});
+    delete legacy.promotion;
+    history.add(legacy);
+
+    expect(history.referencedArtifacts(), "a record with no promotion points at nothing").toEqual(
+      [],
+    );
+  });
+
+  it("drops the artifacts of a record evicted past the history's capacity", () => {
+    // The boundary of "retained": the history keeps a bounded number of records and
+    // every surface — the summary list, the last-delegation detail, the pending-hold
+    // list — reads that bounded set. A record beyond it can no longer print a pointer,
+    // so its orphaned artifacts are exactly what age is allowed to reclaim.
+    const history = new DelegationHistory(2);
+    history.add(recordWith({ patchPath: "/state/patches/first.patch" }));
+    history.add(recordWith({ patchPath: "/state/patches/second.patch" }));
+    history.add(recordWith({ patchPath: "/state/patches/third.patch" }));
+
+    expect(history.count(), "the capacity is what bounds retention").toBe(2);
+    expect(history.referencedArtifacts(), "the evicted record's patch is an orphan now").toEqual([
+      "/state/patches/second.patch",
+      "/state/patches/third.patch",
+    ]);
   });
 });

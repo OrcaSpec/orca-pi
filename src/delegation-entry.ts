@@ -627,6 +627,45 @@ export class DelegationHistory {
   }
 
   /**
+   * Every preserved artifact this history can still point a user at (hardening plan,
+   * Phase 6): the absolute paths retention must not sweep however old the files are.
+   *
+   * This is the operative definition of a RETAINED reference, and it is deliberately
+   * "whatever the visible history can print" rather than "whatever a session entry ever
+   * said". The two differ at {@link capacity}: the records beyond it are evicted, so no
+   * `/orca` surface — the summary list, the last-delegation detail, the pending-hold
+   * list — can name their artifacts any more, and those files are precisely the orphans
+   * age is meant to reclaim. Everything the surfaces CAN name is here, which is what
+   * makes "sweeping never leaves a dangling pointer in visible history" checkable rather
+   * than hoped for.
+   *
+   * Approvals count as references too, and not only for tidiness: an approved hold's
+   * patch is the record of what was landed in the user's `.orca/**`, which is the one
+   * thing they may need to read back long after the delegation scrolled away.
+   *
+   * Paths are compared by the sweeper as EXACT strings, so what is collected here is
+   * what the promotion record stored — absolute by construction, since `stagingPaths`
+   * builds every one of them from an absolute state root.
+   */
+  referencedArtifacts(): string[] {
+    const paths = new Set<string>();
+    for (const record of this.records) {
+      const promotion = record.promotion;
+      if (!promotion) continue;
+      for (const path of [
+        promotion.patchPath,
+        promotion.validatorOutputPath,
+        promotion.heldGovernance?.patchPath,
+        promotion.acceptedWork?.patchPath,
+      ]) {
+        if (path) paths.add(path);
+      }
+    }
+    for (const patchPath of this.approvals.keys()) paths.add(patchPath);
+    return [...paths].sort();
+  }
+
+  /**
    * Every governance change a delegation in this history proposed, NEWEST FIRST, each
    * carrying whatever the user has decided about it. This is the list `/orca approve`
    * selects from, so the ordering is part of the command's contract: position 1 is the
