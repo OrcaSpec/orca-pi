@@ -3,6 +3,7 @@ import { formatDiagnostic } from "./diagnostics";
 import type { OperatingMode } from "./mode";
 import { matchesAny } from "./paths";
 import { resolve } from "./resolver";
+import { describeProtectionSalvage } from "./salvage";
 import type { BrokenSpecState } from "./state";
 
 /**
@@ -29,7 +30,9 @@ import type { BrokenSpecState } from "./state";
  * - **Broken specs** ({@link classifyBrokenSpec}, ADR 0028): a present but
  *   unusable spec blocks every write in both modes, because there is no validated
  *   ownership map to authorize against. Only `unmanaged` (no spec at all) is
- *   pass-through.
+ *   pass-through. Discovery stays open there for diagnosis, minus the protected
+ *   read denies salvaged from the unusable document — the one thing honored from
+ *   an invalid spec, and a pure narrowing of that regime.
  *
  * Symlink traversal follows the mode split explicitly per ADR 0032 (enforce
  * blocks, advisory reports).
@@ -111,9 +114,13 @@ function diagnosticLines(state: BrokenSpecState): string[] {
  * one of the four discovery tools blocks, so a governed tool added later fails
  * closed here by default rather than slipping through unnoticed.
  */
-export function classifyBrokenSpec(state: BrokenSpecState, tool: GovernedTool): GovernanceDecision {
+export function classifyBrokenSpec(
+  state: BrokenSpecState,
+  tool: GovernedTool,
+  target: DiscoveryTarget | null,
+): GovernanceDecision {
   if (DISCOVERY_TOOLS.includes(tool)) {
-    return { verdict: "allow", reason: "", owner: null };
+    return classifySalvagedRead(state, target);
   }
 
   const problem =
@@ -134,11 +141,67 @@ export function classifyBrokenSpec(state: BrokenSpecState, tool: GovernedTool): 
       `Orca governance is blocked: \`${state.specPath}\` ${problem}. This \`${tool}\` is blocked in ` +
         "advisory and enforce modes alike — with no validated ownership map there is nothing to " +
         "authorize a write against, so a broken spec fails closed rather than reverting to ungoverned " +
-        "writes (ADR 0028).",
+        "writes (ADR 0028). Nothing in the document authorizes this write: an ownership scope or " +
+        "grant covering this path does not take effect while the spec is unusable.",
       `${remedy} Discovery reads (read, grep, find, ls) still work, so you can inspect the spec; ` +
         "`/orca` shows the full state. Delegation is blocked for the same reason.",
+      describeProtectionSalvage(state.protections),
       ...diagnosticLines(state),
     ].join("\n"),
+  };
+}
+
+/**
+ * Decide a discovery call while the spec is broken, honoring the protected read
+ * denies salvaged from the unusable document (`salvage.ts`, ADR 0015/0068).
+ *
+ * Reads stay open for diagnosis — that is the broken-spec regime — and this layer
+ * only ever NARROWS it: a target under a salvaged scope is refused in advisory and
+ * enforce alike, exactly as a protected deny behaves under a healthy spec, and via
+ * the same {@link matchesAny} so a scope means one thing in both regimes. When
+ * nothing was salvaged the protections have lapsed and every read proceeds; the
+ * lapse is stated wherever the state is described, never passed off as safety.
+ *
+ * `target` is null when the call has no discovery target — what a write passes.
+ * A discovery tool arriving without one is a caller bug; while a salvaged set is
+ * in force the safe answer is to refuse rather than read blind, and when there is
+ * no set to enforce diagnosis stays open.
+ */
+function classifySalvagedRead(
+  state: BrokenSpecState,
+  target: DiscoveryTarget | null,
+): GovernanceDecision {
+  const salvaged = state.protections.read;
+  const allow: GovernanceDecision = { verdict: "allow", reason: "", owner: null };
+  if (salvaged.length === 0) return allow;
+
+  if (target === null) {
+    return {
+      verdict: "block",
+      owner: null,
+      reason:
+        "This discovery call arrived with no target to check against the protected read denies " +
+        `salvaged from \`${state.specPath}\`, so it is refused rather than read unchecked. ` +
+        describeProtectionSalvage(state.protections),
+    };
+  }
+
+  // The resolved (symlink-followed) path is what is checked, so a link cannot
+  // launder a read of a protected path. A target outside the repository matches no
+  // repository-relative scope and stays open, like every other read here.
+  const { path } = target;
+  if (path === null || !matchesAny(path, salvaged)) return allow;
+
+  return {
+    verdict: "block",
+    owner: null,
+    reason:
+      `\`${path}\` is under a protected deny (read) salvaged from \`${state.specPath}\`, which is ` +
+      "present but unusable. Protected denies are non-overridable and keep sensitive assets out of " +
+      "all discovery — a spec too broken to validate cannot weaken them, so the refusal holds in " +
+      "advisory and enforce modes alike (ADR 0015, 0028, 0068). Every other discovery read is still " +
+      "open so you can inspect the document and fix it.\n" +
+      describeProtectionSalvage(state.protections),
   };
 }
 

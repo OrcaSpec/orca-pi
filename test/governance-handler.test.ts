@@ -425,6 +425,146 @@ describe("steward governance handlers", () => {
     }
   });
 
+  // --- Salvaged read protections on a broken spec (Phase 4) ----------------
+
+  /** Write a hand-broken document, for damage no fixture carries. */
+  function writeSpecSource(source: string): void {
+    mkdirSync(join(dir, ".orca"), { recursive: true });
+    writeFileSync(join(dir, ".orca", "orca.yaml"), source);
+  }
+
+  /** The multi-owner fixture (protected read deny `secrets/**`) broken far from its protections. */
+  function brokenElsewhere(): string {
+    return `${orcaspec.loadFixtureSource("multi-owner")}\nnot_a_section:\n  anything: true\n`;
+  }
+
+  /** The same fixture with its protections section itself made unreadable. */
+  function brokenProtections(): string {
+    return orcaspec
+      .loadFixtureSource("multi-owner")
+      .replace("protected_denies:\n  read:\n    - secrets/**", "protected_denies: 3\n#");
+  }
+
+  async function statusText(registered: Registered): Promise<string> {
+    const ctx = makeCtx(dir);
+    await registered.commands.get("orca")!.handler("", ctx);
+    return (ctx.ui.setWidget.mock.calls[0]?.[1] as string[]).join("\n");
+  }
+
+  it("refuses a read of a salvaged protected path in BOTH requested modes", async () => {
+    for (const requested of ["advisory", "enforce"] as const) {
+      const { pi, registered } = makeApi();
+      orcaPi(pi as never);
+      writeSpecSource(brokenElsewhere());
+      if (requested === "enforce") {
+        await registered.commands.get("orca")!.handler("mode enforce", makeCtx(dir));
+      }
+      const ctx = makeCtx(dir);
+      const result = (await only(registered, "tool_call")(
+        { type: "tool_call", toolName: "read", toolCallId: "p", input: { path: "secrets/prod.key" } },
+        ctx,
+      )) as { block?: boolean; reason?: string };
+      expect(result?.block, `${requested}: refused`).toBe(true);
+      expect(result?.reason, `${requested}: names the path`).toContain("secrets/prod.key");
+      expect(result?.reason, `${requested}: names the salvaged scope`).toContain("secrets/**");
+      expect(result?.reason, `${requested}: names the protection`).toContain("protected deny");
+      expect(ctx.ui.notify, `${requested}: notifies the human`).toHaveBeenCalled();
+    }
+  });
+
+  it("keeps every other discovery read open on that same broken spec", async () => {
+    const { pi, registered } = makeApi();
+    orcaPi(pi as never);
+    writeSpecSource(brokenElsewhere());
+    const handler = only(registered, "tool_call");
+    for (const event of [
+      { type: "tool_call", toolName: "read", toolCallId: "r", input: { path: ".orca/orca.yaml" } },
+      { type: "tool_call", toolName: "grep", toolCallId: "g", input: { pattern: "x", path: "." } },
+      { type: "tool_call", toolName: "find", toolCallId: "f", input: { pattern: "*", path: "apps" } },
+      { type: "tool_call", toolName: "ls", toolCallId: "l", input: {} },
+    ]) {
+      expect(await handler(event, makeCtx(dir)), event.toolName).toBeUndefined();
+    }
+  });
+
+  it("refuses a protected path a symlink resolves onto, not the link that reached it", async () => {
+    const { pi, registered } = makeApi();
+    orcaPi(pi as never);
+    writeSpecSource(brokenElsewhere());
+    mkdirSync(join(dir, "secrets"), { recursive: true });
+    writeFileSync(join(dir, "secrets", "prod.key"), "shhh");
+    mkdirSync(join(dir, "apps", "web"), { recursive: true });
+    symlinkSync(join(dir, "secrets", "prod.key"), join(dir, "apps", "web", "innocent.txt"));
+
+    const result = (await only(registered, "tool_call")(
+      { type: "tool_call", toolName: "read", toolCallId: "sym", input: { path: "apps/web/innocent.txt" } },
+      makeCtx(dir),
+    )) as { block?: boolean; reason?: string };
+    expect(result?.block, "the resolved target is what is checked").toBe(true);
+    expect(result?.reason).toContain("protected deny");
+    expect(result?.reason).toContain("secrets/prod.key");
+  });
+
+  it("leaves reads open and reports the lapse when the protections themselves are unrecoverable", async () => {
+    const { pi, registered } = makeApi();
+    orcaPi(pi as never);
+    writeSpecSource(brokenProtections());
+    const result = await only(registered, "tool_call")(
+      { type: "tool_call", toolName: "read", toolCallId: "l", input: { path: "secrets/prod.key" } },
+      makeCtx(dir),
+    );
+    expect(result, "a lapse cannot be enforced, only stated").toBeUndefined();
+
+    const status = await statusText(registered);
+    expect(status).toContain("invalid_spec");
+    expect(status, "the lapse is stated where the user reads the state").toContain("LAPSED");
+    expect(status).toContain("protections_lapsed");
+  });
+
+  it("blocks a write the broken document's own grant covers, salvage or no salvage", async () => {
+    // Only protections are honored from an unusable document; `infra/**` is the infra
+    // agent's ownership and edit grant in this very file, and it authorizes nothing.
+    const { pi, registered } = makeApi();
+    orcaPi(pi as never);
+    writeSpecSource(brokenElsewhere());
+    const result = (await only(registered, "tool_call")(writeEvent("infra/main.tf"), makeCtx(dir))) as {
+      block?: boolean;
+      reason?: string;
+    };
+    expect(result?.block).toBe(true);
+    expect(result?.reason).toContain("does not take effect");
+  });
+
+  it("agrees between /orca status and the refusal it just enforced", async () => {
+    const { pi, registered } = makeApi();
+    orcaPi(pi as never);
+    writeSpecSource(brokenElsewhere());
+    await only(registered, "tool_call")(
+      { type: "tool_call", toolName: "read", toolCallId: "p", input: { path: "secrets/prod.key" } },
+      makeCtx(dir),
+    );
+    const status = await statusText(registered);
+    expect(status, "names the regime the block enforced").toContain("ENFORCING 1");
+    expect(status).toContain("secrets/**");
+    expect(status, "and the refusal is on the record").toContain("blocked read");
+  });
+
+  it("tells the session which read-protection regime is in force before it starts", async () => {
+    for (const [label, source, expected] of [
+      ["salvaged", brokenElsewhere(), "ENFORCING 1"],
+      ["lapsed", brokenProtections(), "LAPSED"],
+    ] as const) {
+      const { pi, registered } = makeApi();
+      orcaPi(pi as never);
+      writeSpecSource(source);
+      const result = (await only(registered, "before_agent_start")(
+        { systemPrompt: "base" },
+        makeCtx(dir),
+      )) as { systemPrompt?: string };
+      expect(result?.systemPrompt, `${label}: states the regime`).toContain(expected);
+    }
+  });
+
   it("records a broken-spec block under /orca so status and enforcement agree", async () => {
     const { pi, registered } = makeApi();
     orcaPi(pi as never);

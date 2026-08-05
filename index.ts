@@ -367,8 +367,14 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
     // diagnostics, discovery reads proceed so the user can fix the document
     // (ADR 0028). The recorded mode is the requested one — there is no effective
     // mode without a validated spec, and the block does not depend on it.
+    //
+    // A read is reduced to its real target first, exactly as under an active spec,
+    // so the protected read denies salvaged from the unusable document are checked
+    // against the path a symlink actually resolves onto (Phase 4). A write needs no
+    // target: it is blocked whatever it points at.
     if (state.kind !== "active") {
-      const decision = classifyBrokenSpec(state, governed.tool);
+      const target = read ? resolveDiscoveryTarget(read.raw, ctx.cwd) : null;
+      const decision = classifyBrokenSpec(state, governed.tool, target);
       return applyDecision(
         ctx,
         event.toolCallId,
