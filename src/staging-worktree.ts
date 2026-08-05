@@ -8,10 +8,13 @@ import {
   symlinkSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { canonicalPath, gitFailure, gitText, tryGit } from "./git";
+import { canonicalPath, gitFailure, tryGit } from "./git";
 import {
+  captureOverlayBinding,
   commitStagedBaseline,
+  dirtyOverlayPaths,
   stagingPaths,
+  type OverlayBinding,
   type OpenStagingInput,
   type OpenStagingResult,
   type StagedWorkspace,
@@ -69,24 +72,20 @@ function materializeOverlayPath(repoRoot: string, worktree: string, path: string
 
 /**
  * Materialize the user's whole dirty overlay — staged, unstaged, and non-ignored
- * untracked files — into a fresh `HEAD` worktree. Ignored files are deliberately
- * excluded: they are not repository content, so they neither enter the baseline
- * nor can be promoted out of it.
+ * untracked files — into a fresh `HEAD` worktree, and report the base binding for
+ * what was staged. Ignored files are deliberately excluded: they are not repository
+ * content, so they neither enter the baseline nor can be promoted out of it.
+ *
+ * The overlay is enumerated ONCE (`dirtyOverlayPaths`) and both copied and digested
+ * from that one enumeration, so the set of files the delegation is bound to is
+ * exactly the set it was staged from. The digests are taken from the USER's checkout
+ * rather than from the copies: the binding's question is whether the user's state has
+ * moved, so both sides of that comparison are measured on the user's own tree.
  */
-function materializeOverlay(repoRoot: string, worktree: string): void {
-  const status = gitText(repoRoot, [
-    "status",
-    "--porcelain",
-    "-z",
-    "--untracked-files=all",
-    "--no-renames",
-  ]);
-  // Porcelain v1 records are `XY <path>`, NUL-terminated; `--no-renames` keeps
-  // every record single-pathed so no second path can be mistaken for a status.
-  for (const entry of status.split("\0")) {
-    if (entry.length < 4) continue;
-    materializeOverlayPath(repoRoot, worktree, entry.slice(3));
-  }
+function materializeOverlay(repoRoot: string, worktree: string): OverlayBinding {
+  const paths = dirtyOverlayPaths(repoRoot);
+  for (const path of paths) materializeOverlayPath(repoRoot, worktree, path);
+  return captureOverlayBinding(repoRoot, paths);
 }
 
 function open(input: OpenStagingInput): OpenStagingResult {
@@ -142,6 +141,7 @@ function open(input: OpenStagingInput): OpenStagingResult {
     repoRoot,
     dir: canonicalPath(dir),
     baseCommit,
+    overlayBinding: new Map(),
     baselineCommit: baseCommit,
     patchPath,
     validatorOutputPath,
@@ -149,7 +149,7 @@ function open(input: OpenStagingInput): OpenStagingResult {
   };
 
   try {
-    materializeOverlay(repoRoot, workspace.dir);
+    workspace.overlayBinding = materializeOverlay(repoRoot, workspace.dir);
     workspace.baselineCommit = commitStagedBaseline(workspace.dir);
   } catch (error) {
     close(workspace);

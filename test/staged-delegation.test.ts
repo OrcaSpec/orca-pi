@@ -21,8 +21,10 @@ import {
   type DelegationSessionConfig,
 } from "../src/delegation";
 import {
+  captureOverlayBinding,
   commitAuthorizedWork,
   commitStagedBaseline,
+  dirtyOverlayPaths,
   promoteStagedCommits,
   stagingPaths,
   type StagingProvider,
@@ -312,6 +314,9 @@ const copyStaging: StagingProvider = {
         repoRoot,
         dir: realpathSync(dir),
         baseCommit: headOf(repoRoot),
+        // The base binding is part of the contract, not of one provider's mechanism:
+        // the shared helpers digest the same overlay set for any provider.
+        overlayBinding: captureOverlayBinding(repoRoot, dirtyOverlayPaths(repoRoot)),
         baselineCommit: commitStagedBaseline(realpathSync(dir)),
         patchPath,
         validatorOutputPath,

@@ -1,4 +1,5 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { lstatSync, mkdirSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { CompiledGrant } from "./resolver";
@@ -6,8 +7,8 @@ import { checkGrant } from "./grant";
 import { COMMIT_CONFIG, gitFailure, gitRaw, gitText, tryGit } from "./git";
 
 /**
- * The staging seam and the promotion gate (staged-promotion plan, Phases 2–3;
- * PRD items 2, 3 and the minimal part of item 5).
+ * The staging seam and the promotion gate (staged-promotion plan, Phases 2–5;
+ * PRD items 2, 3, 5).
  *
  * A delegated session never edits the user's checkout. It runs instead in an
  * ISOLATED CHECKOUT that a {@link StagingProvider} prepares: the user's `HEAD`
@@ -94,7 +95,10 @@ export function defaultStateRoot(): string {
  * 2. Its `HEAD` is {@link baselineCommit}, a commit whose tree is exactly that
  *    content — so a diff of {@link dir} against {@link baselineCommit} is the
  *    delegation's cumulative change and nothing else.
- * 3. {@link baseCommit} is the user's `HEAD` at the moment staging began.
+ * 3. {@link baseCommit} is the user's `HEAD` at the moment staging began, and
+ *    {@link overlayBinding} digests the dirty overlay it staged from. Together they
+ *    are the BASE BINDING (Phase 5): the complete description of the state the
+ *    delegation's patch will be computed against, re-verified before promotion.
  *
  * Given those three, promotion works identically for any provider.
  */
@@ -103,8 +107,14 @@ export interface StagedWorkspace {
   repoRoot: string;
   /** Canonical isolated checkout; the child session's `cwd`. */
   dir: string;
-  /** `HEAD` at staging time; re-verified before promotion (minimal base guard). */
+  /** `HEAD` at staging time; half of the base binding (see {@link overlayBinding}). */
   baseCommit: string;
+  /**
+   * The other half: one digest per dirty-overlay path, as the user's checkout held
+   * it when staging began. Produced by {@link captureOverlayBinding} so every
+   * provider measures the same thing the same way.
+   */
+  overlayBinding: OverlayBinding;
   /** The synthetic baseline commit inside the checkout; the diff's left side. */
   baselineCommit: string;
   /** Where a patch is preserved when it is not promoted. */
@@ -199,6 +209,170 @@ export function commitStagedBaseline(dir: string): string {
   return commitStagedTree(dir, BASELINE_MESSAGE);
 }
 
+// --- The base binding (staged-promotion plan, Phase 5) ------------------------
+
+/**
+ * One digest per dirty-overlay path: what the user's uncommitted state contained
+ * when staging began.
+ *
+ * A `Map` rather than an object because the keys are repository paths and a
+ * repository may contain a file called `__proto__`; a plain object would let that
+ * path collide with `Object.prototype`. It is held IN MEMORY on the workspace and
+ * never persisted: the binding is meaningful only for the life of the one sequence
+ * that staged it, so persisting it would create a second source of truth and a
+ * stale-file problem. What outlives the sequence is the {@link PromotionRecord} —
+ * the drifted paths and the preserved patch — which is what a later session and the
+ * `/orca` history actually need.
+ */
+export type OverlayBinding = ReadonlyMap<string, string>;
+
+/**
+ * Every path the user's dirty overlay covers: staged, unstaged, and non-ignored
+ * untracked files, one record per path.
+ *
+ * This is THE definition of the overlay set, shared by the two things that must
+ * agree about it: the provider materializing the overlay into the isolated checkout
+ * (`staging-worktree.ts`) and {@link captureOverlayBinding} digesting it. If they
+ * enumerated separately, a delegation could be bound to a set of files different
+ * from the set it was staged from, which is the exact class of bug the binding
+ * exists to catch.
+ */
+export function dirtyOverlayPaths(repoRoot: string): string[] {
+  const status = gitText(repoRoot, [
+    "status",
+    "--porcelain",
+    "-z",
+    "--untracked-files=all",
+    "--no-renames",
+  ]);
+  // Porcelain v1 records are `XY <path>`, NUL-terminated; `--no-renames` keeps
+  // every record single-pathed so no second path can be mistaken for a status.
+  return status
+    .split("\0")
+    .filter((entry) => entry.length >= 4)
+    .map((entry) => entry.slice(3));
+}
+
+/**
+ * The digest of one overlay path as it exists on disk.
+ *
+ * What is digested is CONTENT plus the two things git itself tracks about a
+ * working-tree file — whether it is a symlink, and whether it is executable — so a
+ * `chmod +x` counts as drift while a `chmod g-r` does not. What is deliberately NOT
+ * digested is the INDEX: promotion applies its patch to the working tree, so a
+ * `git add` of unchanged bytes moves nothing the patch depends on, and treating it
+ * as drift would cost the user a promotion for staging a file they had already
+ * edited before the delegation started.
+ *
+ * `sha256` over content rather than a size/mtime pair: mtime is unreliable across
+ * editors and filesystems, and size collides on any same-length edit. The cost is
+ * bounded by the overlay — the same files staging already copies once.
+ */
+function overlayDigest(absolute: string): string {
+  try {
+    const stat = lstatSync(absolute);
+    if (stat.isSymbolicLink()) return `symlink:${digestOf(Buffer.from(readlinkSync(absolute)))}`;
+    // Anything that is neither a file nor a symlink is a dirty submodule, which the
+    // MVP does not stage and therefore does not bind (see `staging-worktree.ts`).
+    if (!stat.isFile()) return "other";
+    return `${(stat.mode & 0o111) !== 0 ? "exec" : "file"}:${digestOf(readFileSync(absolute))}`;
+  } catch {
+    // Gone, or no longer readable. Symmetric on both sides of the comparison: a
+    // path that is absent when the binding is captured and still absent when it is
+    // verified has not drifted (an uncommitted deletion is a normal overlay state),
+    // while one that was readable and now is not has.
+    return "absent";
+  }
+}
+
+function digestOf(content: Buffer): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+/**
+ * Digest `paths` as they exist under `root`. The caller supplies the enumeration
+ * (from {@link dirtyOverlayPaths}) so the set that is bound is exactly the set that
+ * was staged, taken from ONE `git status`.
+ */
+export function captureOverlayBinding(root: string, paths: readonly string[]): OverlayBinding {
+  return new Map(paths.map((path) => [path, overlayDigest(join(root, path))]));
+}
+
+/**
+ * How the user's checkout has moved away from the base a workspace was staged
+ * from. Any of the three fields being present means the staged patch's base no
+ * longer exists, so nothing may be applied.
+ */
+export interface BaseDrift {
+  /** The user's `HEAD` now, when it is no longer the commit staging began from. */
+  head?: string;
+  /** Paths whose content the user changed since staging began (sorted). */
+  paths: string[];
+  /** Why the base could not be re-read at all, when that is what happened. */
+  unreadable?: string;
+}
+
+/**
+ * Re-verify the base binding against the user's checkout, and report the drift, or
+ * `undefined` when the base is exactly what the delegation was staged from.
+ *
+ * Two classes of path are checked, and the difference matters:
+ *
+ * - Every path in the binding, by re-digesting it. This catches an edit, a
+ *   revert, a deletion, a restoration, and a `chmod +x` of a file the user already
+ *   had uncommitted work in — the patch was computed against that content.
+ * - Paths NOT in the binding, but only where the staged patch touches them and the
+ *   user has since made them dirty. At staging time such a path matched `HEAD`, so
+ *   "dirty now" means the user has touched it; that is the plan's "added
+ *   overlapping files". A path the user made dirty that the patch does NOT touch is
+ *   ignored on purpose: refusing a promotion because the user edited an unrelated
+ *   file would make every long delegation a coin flip.
+ *
+ * Overlap is compared by exact path, not by prefix. A structural collision that
+ * exact paths cannot see — the user creating a DIRECTORY where the patch creates a
+ * file — is caught by `git apply --check` instead, which is what that gate is for.
+ *
+ * A base that cannot be read at all is drift too, not a pass: an unverifiable base
+ * is indistinguishable from a moved one, and the fail-closed reading is the only
+ * safe one.
+ */
+export function detectBaseDrift(
+  workspace: StagedWorkspace,
+  patchPaths: readonly string[],
+): BaseDrift | undefined {
+  const head = tryGit(workspace.repoRoot, ["rev-parse", "HEAD"]);
+  if (!head.ok) {
+    return { paths: [], unreadable: `your repository's HEAD could not be read (${head.reason})` };
+  }
+  const currentHead = head.out.toString("utf8").trim();
+
+  let dirtyNow: Set<string>;
+  try {
+    dirtyNow = new Set(dirtyOverlayPaths(workspace.repoRoot));
+  } catch (error) {
+    return {
+      paths: [],
+      unreadable: `your working state could not be re-read (${gitFailure(error)})`,
+    };
+  }
+
+  const drifted = new Set<string>();
+  for (const [path, digest] of workspace.overlayBinding) {
+    if (overlayDigest(join(workspace.repoRoot, path)) !== digest) drifted.add(path);
+  }
+  for (const path of patchPaths) {
+    if (workspace.overlayBinding.has(path)) continue;
+    if (dirtyNow.has(path)) drifted.add(path);
+  }
+
+  const moved = currentHead !== workspace.baseCommit;
+  if (!moved && drifted.size === 0) return undefined;
+  return {
+    head: moved ? currentHead : undefined,
+    paths: [...drifted].sort(),
+  };
+}
+
 // --- The promotion gate (provider-independent) --------------------------------
 
 /** What the promotion gate did with the staged change. */
@@ -277,6 +451,13 @@ export interface PromotionRecord {
   appliedPaths: string[];
   /** Changed paths the grant did not authorize; they fail the whole promotion. */
   rejectedPaths: string[];
+  /**
+   * Paths in the user's own checkout that moved while the delegation ran, on a
+   * `conflict`. Non-empty only there, and distinct from {@link rejectedPaths}: a
+   * rejected path is something the DELEGATION was not allowed to change, a drifted
+   * path is something the USER changed under it.
+   */
+  driftedPaths: string[];
   /** Absolute path of the preserved patch, when one was written. */
   patchPath?: string;
   /**
@@ -362,7 +543,6 @@ function preservePatch(workspace: StagedWorkspace, patch: Buffer): string | unde
 
 function refused(
   workspace: StagedWorkspace,
-  status: Exclude<PromotionStatus, "promoted">,
   diff: StagedDiff,
   rejectedPaths: string[],
   diagnostics: string[],
@@ -370,9 +550,10 @@ function refused(
 ): PromotionRecord {
   const patchPath = preservePatch(workspace, diff.patch);
   return {
-    status,
+    status: "rejected",
     appliedPaths: [],
     rejectedPaths,
+    driftedPaths: [],
     patchPath,
     validations: acceptance?.validations ?? [],
     validatorOutputPath: acceptance?.validatorOutputPath,
@@ -386,6 +567,64 @@ function refused(
 }
 
 /**
+ * The refusal for a base that moved: the delegation's work is sound, but the state
+ * it was built on is gone, so applying it would silently interleave the staged
+ * change with whatever the user did meanwhile.
+ *
+ * This is the one refusal that comes with a RECOVERY ROUTE rather than a fix. There
+ * is nothing for the delegation to do differently — the user moved — so the record
+ * names what moved, where the work is, and the two ways to get it: apply the
+ * preserved patch by hand (which is why the patch is a real `git apply` input, not a
+ * summary), or delegate again so the work is re-staged on the current base.
+ */
+function conflicted(
+  workspace: StagedWorkspace,
+  diff: StagedDiff,
+  drift: BaseDrift,
+  acceptance?: AcceptanceResult,
+): PromotionRecord {
+  const patchPath = preservePatch(workspace, diff.patch);
+  const diagnostics = [
+    "Orca refused to promote this delegation: your checkout moved while it was running, so the " +
+      "staged change is no longer based on the state it was made from.",
+  ];
+  if (drift.head) {
+    diagnostics.push(
+      `HEAD moved: the delegation was staged from ${workspace.baseCommit}, your checkout is now at ` +
+        `${drift.head}.`,
+    );
+  }
+  if (drift.paths.length > 0) {
+    diagnostics.push(
+      `Changed in your checkout since the delegation started (${drift.paths.length}): ` +
+        `${drift.paths.join(", ")}.`,
+    );
+  }
+  if (drift.unreadable) diagnostics.push(`Orca could not verify your base: ${drift.unreadable}.`);
+  diagnostics.push(
+    patchPath
+      ? `Nothing was applied; your checkout is unchanged. The staged patch is preserved at ${patchPath}.`
+      : "Nothing was applied; the delegation produced no change to preserve.",
+  );
+  if (patchPath) {
+    diagnostics.push(
+      `To recover the work: apply it yourself with \`git apply ${patchPath}\` (add \`--3way\` to merge ` +
+        "it into your current state), or delegate the task again so it is re-staged on your current base.",
+    );
+  }
+  return {
+    status: "conflict",
+    appliedPaths: [],
+    rejectedPaths: [],
+    driftedPaths: drift.paths,
+    patchPath,
+    validations: acceptance?.validations ?? [],
+    validatorOutputPath: acceptance?.validatorOutputPath,
+    diagnostics,
+  };
+}
+
+/**
  * The refusal for a staged change git can no longer read. Nothing is applied, and
  * nothing is preserved either — the patch is exactly what could not be computed.
  */
@@ -394,6 +633,7 @@ function unreadableStagedChange(reason: string, acceptance?: AcceptanceResult): 
     status: "rejected",
     appliedPaths: [],
     rejectedPaths: [],
+    driftedPaths: [],
     validations: acceptance?.validations ?? [],
     validatorOutputPath: acceptance?.validatorOutputPath,
     diagnostics: [
@@ -506,10 +746,19 @@ export function commitAuthorizedWork(
  *
  * The order is deliberate. Every step must have committed, because an owner whose
  * change was not authorized must not have its work reach the checkout inside
- * somebody else's patch — one refused step fails the WHOLE promotion. Then the
- * minimal base guard: `HEAD` must still be the commit staging started from, or the
- * patch's base is stale and the outcome is a `conflict`. Only then is the patch
- * offered to `git apply --check` and, if that passes, applied.
+ * somebody else's patch — one refused step fails the WHOLE promotion. Then the base
+ * binding: the user's `HEAD` and their dirty overlay must both still be what staging
+ * began from, or the patch's base is stale and the outcome is a `conflict`. Only
+ * then is the patch offered to `git apply --check` and, if that passes, applied.
+ *
+ * The binding is verified TWICE, bracketing the acceptance gate (Phase 5). Once
+ * before, so a stale base is discovered without first spending minutes of the user's
+ * time running validators on work nothing can promote; once immediately before the
+ * patch is applied, because the gate is arbitrary programs taking arbitrary time and
+ * the user is editing their own files throughout. The second check is the one the
+ * plan means by "immediately before promotion": it leaves no window wider than
+ * `git apply --check` itself, which is the last thing that can catch a base moving
+ * out from under the patch.
  *
  * The patch is the diff between the synthetic baseline and the LAST STAGED COMMIT,
  * not the worktree, so anything a session left uncommitted — including a change no
@@ -537,7 +786,6 @@ export function promoteStagedCommits(
   if (refusedSteps.length > 0) {
     return refused(
       workspace,
-      "rejected",
       tryStagedDiff(workspace),
       [...new Set(refusedSteps.flatMap((step) => step.rejectedPaths))].sort(),
       [
@@ -561,15 +809,8 @@ export function promoteStagedCommits(
   const beforeGate = tryCommitDiff(workspace.dir, workspace.baselineCommit, stagedTip);
   if (!beforeGate.ok) return unreadableStagedChange(beforeGate.reason);
 
-  const head = tryGit(workspace.repoRoot, ["rev-parse", "HEAD"]);
-  const currentHead = head.ok ? head.out.toString("utf8").trim() : undefined;
-  if (currentHead !== workspace.baseCommit) {
-    return refused(workspace, "conflict", beforeGate.diff, [], [
-      "Orca refused to promote this delegation: HEAD moved while it was running " +
-        `(staged from ${workspace.baseCommit}, now ${currentHead ?? "unreadable"}), so the staged ` +
-        "change is no longer based on your current commit.",
-    ]);
-  }
+  const staleBeforeGate = detectBaseDrift(workspace, beforeGate.diff.paths);
+  if (staleBeforeGate) return conflicted(workspace, beforeGate.diff, staleBeforeGate);
 
   const gate = acceptance?.(workspace);
 
@@ -585,7 +826,6 @@ export function promoteStagedCommits(
   if (gate && !gate.ok) {
     return refused(
       workspace,
-      "rejected",
       diff,
       [],
       [
@@ -597,11 +837,19 @@ export function promoteStagedCommits(
     );
   }
 
+  // The base binding again, now that the gate has finished and the next statement
+  // would touch the user's files. Everything the acceptance gate did happened inside
+  // this window: the programs it ran took real time, and they are arbitrary code that
+  // could itself have written into the user's checkout.
+  const staleNow = detectBaseDrift(workspace, diff.paths);
+  if (staleNow) return conflicted(workspace, diff, staleNow, gate);
+
   if (diff.patch.length === 0) {
     return {
       status: "promoted",
       appliedPaths: [],
       rejectedPaths: [],
+      driftedPaths: [],
       validations: gate?.validations ?? [],
       diagnostics: ["The delegation changed no files, so there was nothing to promote."],
     };
@@ -615,7 +863,6 @@ export function promoteStagedCommits(
   if (!check.ok) {
     return refused(
       workspace,
-      "rejected",
       diff,
       [],
       [
@@ -630,7 +877,6 @@ export function promoteStagedCommits(
   if (!applied.ok) {
     return refused(
       workspace,
-      "rejected",
       diff,
       [],
       [`Orca could not apply the staged patch to your checkout (${applied.reason}).`],
@@ -642,6 +888,7 @@ export function promoteStagedCommits(
     status: "promoted",
     appliedPaths: diff.paths,
     rejectedPaths: [],
+    driftedPaths: [],
     validations: gate?.validations ?? [],
     diagnostics: [
       `Promoted ${diff.paths.length} authorized path(s) to your checkout as unstaged changes.`,
@@ -665,6 +912,7 @@ export function abandonStagedWork(workspace: StagedWorkspace, reason: string): P
       status: "not_attempted",
       appliedPaths: [],
       rejectedPaths: [],
+      driftedPaths: [],
       validations: [],
       diagnostics: [reason, `The staged change could not be read (${gitFailure(error)}).`],
     };
@@ -674,6 +922,7 @@ export function abandonStagedWork(workspace: StagedWorkspace, reason: string): P
     status: "not_attempted",
     appliedPaths: [],
     rejectedPaths: [],
+    driftedPaths: [],
     patchPath,
     validations: [],
     diagnostics: [
@@ -709,6 +958,7 @@ export function stepPromotion(
     status: "promoted",
     appliedPaths: applied,
     rejectedPaths: [],
+    driftedPaths: [],
     validations: sequence.validations,
     validatorOutputPath: sequence.validatorOutputPath,
     diagnostics: [

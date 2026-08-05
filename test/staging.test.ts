@@ -307,20 +307,25 @@ describe("the promotion gate", () => {
     expect(readFileSync(record.patchPath!, "utf8")).toContain("staged work");
   });
 
-  it("rejects and preserves when the patch cannot apply to the checkout", () => {
+  it("rejects and preserves when the patch cannot apply, with no drift to blame", () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
-    writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "child version\n");
-    // The user edits the same file's context out from under the patch, without
-    // moving HEAD, so the base guard passes but `git apply --check` cannot.
-    writeFileSync(join(repo, "apps", "web", "app.tsx"), "user rewrote this entirely\n");
+    writeFileSync(join(workspace.dir, "apps", "web", "added.tsx"), "a new file\n");
+    // A structural collision the base binding cannot see: the user occupies the
+    // patch's new path with a DIRECTORY, so no bound path drifted (the binding
+    // compares exact paths — see `detectBaseDrift`) and git is what has to catch it,
+    // here when it tries to write. The distinction is deliberate: a stale base is a
+    // `conflict`, a patch that simply cannot land is a `rejected`.
+    mkdirSync(join(repo, "apps", "web", "added.tsx"), { recursive: true });
+    writeFileSync(join(repo, "apps", "web", "added.tsx", "note.md"), "occupied\n");
 
     const record = gate(workspace, webGrant);
 
     expect(record.status).toBe("rejected");
-    expect(record.diagnostics.join("\n")).toMatch(/does not apply cleanly/);
-    expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe(
-      "user rewrote this entirely\n",
+    expect(record.driftedPaths).toEqual([]);
+    expect(record.diagnostics.join("\n")).toMatch(/could not apply the staged patch/);
+    expect(readFileSync(join(repo, "apps", "web", "added.tsx", "note.md"), "utf8")).toBe(
+      "occupied\n",
     );
     expect(existsSync(record.patchPath!)).toBe(true);
   });

@@ -1022,6 +1022,7 @@ function unstagedPromotion(reason: string): PromotionRecord {
     status: "not_attempted",
     appliedPaths: [],
     rejectedPaths: [],
+    driftedPaths: [],
     validations: [],
     diagnostics: [reason, "Your checkout is unchanged; nothing was staged to promote."],
   };
