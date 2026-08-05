@@ -1,11 +1,24 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as orcaspec from "orcaspec";
 import orcaPi, { installOrca } from "../index";
 import { git, makeGitRepo, makeStateRoot, snapshotTree } from "./git-fixture";
-import { APPROVAL_ENTRY_TYPE, DELEGATION_ENTRY_TYPE } from "../src/delegation-entry";
+import {
+  APPROVAL_ENTRY_TYPE,
+  DELEGATION_ENTRY_TYPE,
+  type PersistedDelegationRecord,
+} from "../src/delegation-entry";
 import type { DelegationSession, DelegationSessionConfig } from "../src/delegation";
 
 // A minimal ExtensionAPI double that captures registrations. The extension's
@@ -590,5 +603,209 @@ describe("orca-pi extension entry", () => {
     expect(ctx.ui.notify).not.toHaveBeenCalled();
     expect(ctx.ui.setStatus).not.toHaveBeenCalled();
     expect(ctx.ui.setWidget).not.toHaveBeenCalled();
+  });
+  // --- Phase 6: age-based evidence retention -------------------------------
+
+  /** Backdate one file so a sweep sees it as past the window. */
+  function backdate(path: string, ageDays: number): string {
+    const when = new Date(Date.now() - ageDays * 86_400_000);
+    utimesSync(path, when, when);
+    return path;
+  }
+
+  /** Fire `session_start` with `branch` as the session's prior entries. */
+  async function activate(
+    registered: Registered,
+    branch: unknown[] = [],
+  ): Promise<ReturnType<typeof makeCtx>> {
+    const ctx = makeCtx(dir, true, branch);
+    await registered.events.get("session_start")!({ reason: "startup" }, ctx);
+    return ctx;
+  }
+
+  /**
+   * A session whose owner asks for wider scope: the sequence stops at `needs_scope`,
+   * nothing is promoted, and the cumulative patch is preserved as evidence — which is
+   * exactly the artifact a retained history entry has to keep pointing at.
+   */
+  function scopeRequestingSession() {
+    return async (config: DelegationSessionConfig): Promise<DelegationSession> => ({
+      prompt: async () => {
+        const write = config.tools.find((t) => t.name === "write")!;
+        await write.execute(
+          "t",
+          { path: "apps/web/app.tsx", content: "half done\n" } as never,
+          undefined,
+          undefined,
+          { cwd: config.cwd } as never,
+        );
+        const checkpoint = config.tools.find((t) => t.name === "orca_checkpoint")!;
+        await checkpoint.execute(
+          "t",
+          {
+            status: "needs_scope",
+            summary: "needs the billing service too",
+            scope_request: ["services/billing/x.rb"],
+          } as never,
+          undefined,
+          undefined,
+          { cwd: config.cwd } as never,
+        );
+      },
+      abort: () => {},
+    });
+  }
+
+  it("expires an orphaned artifact at activation but keeps one the history still names", async () => {
+    const { pi, registered } = makeApi();
+    installOrca(pi as never, { createSession: scopeRequestingSession(), stateRoot });
+    writeSpec("multi-owner");
+
+    await registered.tools.get("orca_delegate")!.execute(
+      "d1",
+      { task: "restyle the button", paths: ["apps/web/app.tsx"] },
+      undefined,
+      undefined,
+      makeCtx(dir, true),
+    );
+
+    const entry = registered.appended.find((e) => e.customType === DELEGATION_ENTRY_TYPE)!;
+    const record = entry.data as PersistedDelegationRecord;
+    const preserved = record.promotion!.patchPath!;
+    expect(existsSync(preserved), "the stopped sequence preserved its evidence").toBe(true);
+
+    // Both are far past the window; only one of them is still pointed at.
+    backdate(preserved, 400);
+    const orphan = join(stateRoot, "patches", "crashed_run.patch");
+    writeFileSync(orphan, "orphaned evidence\n");
+    backdate(orphan, 400);
+
+    // A resumed session: the history is rebuilt from this branch, and the sweep runs
+    // against exactly what that rebuild can still point a user at.
+    await activate(registered, [
+      { type: "custom", customType: DELEGATION_ENTRY_TYPE, data: record },
+    ]);
+
+    expect(existsSync(preserved), "age never sweeps what visible history references").toBe(true);
+    expect(existsSync(orphan), "an artifact no entry names is what age reclaims").toBe(false);
+
+    // The pointer `/orca` prints is the whole reason the file was kept, so the AC is
+    // that the surface names it AND the named file is there — a dangling pointer would
+    // satisfy neither half on its own.
+    const statusCtx = makeCtx(dir, true);
+    await registered.commands.get("orca")!.handler("", statusCtx);
+    const status = orcaText(statusCtx);
+    expect(status, "history still offers the preserved patch").toContain(preserved);
+    expect(existsSync(preserved)).toBe(true);
+  });
+
+  it("keeps a held governance patch at activation however old it is", async () => {
+    const { pi, registered } = makeApi();
+    installOrca(pi as never, {
+      createSession: writingCreateSession({ ".orca/runtime.yaml": AGENT_OVERLAY }),
+      stateRoot,
+    });
+    writeGovernedRepo();
+    await delegateGovernanceChange(registered, makeCtx(dir, true));
+
+    const entry = registered.appended.find((e) => e.customType === DELEGATION_ENTRY_TYPE)!;
+    const record = entry.data as PersistedDelegationRecord;
+    const held = record.promotion!.heldGovernance!.patchPath;
+    backdate(held, 900);
+
+    // Activation with NO history at all: the sweep cannot know a hold is outstanding,
+    // which is precisely why the exemption is by artifact kind rather than by lookup.
+    await activate(registered, []);
+    expect(existsSync(held), "an outstanding proposal is never evidence to expire").toBe(true);
+
+    // And with the history present, the hold is still listed and still approvable.
+    await activate(registered, [
+      { type: "custom", customType: DELEGATION_ENTRY_TYPE, data: record },
+    ]);
+    const statusCtx = makeCtx(dir, true);
+    await registered.commands.get("orca")!.handler("", statusCtx);
+    expect(orcaText(statusCtx)).toContain("Governance changes awaiting your approval (1)");
+  });
+
+  it("runs a delegation normally after a sweep that could not read the patches directory", async () => {
+    const { pi, registered } = makeApi();
+    installOrca(pi as never, { createSession: scriptedCreateSession(), stateRoot });
+    writeSpec("multi-owner");
+
+    const patches = join(stateRoot, "patches");
+    mkdirSync(patches, { recursive: true });
+    chmodSync(patches, 0o000);
+    try {
+      // Activation must survive it, and the delegation after it must be untouched by it.
+      await activate(registered, []);
+
+      await registered.tools.get("orca_delegate")!.execute(
+        "d1",
+        { task: "restyle the button", paths: ["apps/web/app.tsx"] },
+        undefined,
+        undefined,
+        makeCtx(dir, true),
+      );
+    } finally {
+      chmodSync(patches, 0o755);
+    }
+
+    const appended = registered.appended.filter((e) => e.customType === DELEGATION_ENTRY_TYPE);
+    expect(appended, "housekeeping is never a reason a delegation does not run").toHaveLength(1);
+    expect((appended[0].data as PersistedDelegationRecord).promotion!.status).toBe("promoted");
+  });
+
+  it("sweeps nothing at all when the spec is missing or broken", async () => {
+    // The window is configured in the runtime overlay, and an overlay is only
+    // interpretable against the document it governs — so with no usable document there
+    // is no window to trust. Both states also refuse every delegation, so nothing is
+    // accumulating that would justify guessing one.
+    const ancientFor = (): string => {
+      mkdirSync(join(stateRoot, "patches"), { recursive: true });
+      const path = join(stateRoot, "patches", "ancient.patch");
+      writeFileSync(path, "x\n");
+      return backdate(path, 900);
+    };
+
+    const unmanaged = makeApi();
+    installOrca(unmanaged.pi as never, { createSession: scriptedCreateSession(), stateRoot });
+    const noSpec = ancientFor();
+    await activate(unmanaged.registered, []);
+    expect(existsSync(noSpec), "an unmanaged repository is not governed, so nothing expires").toBe(
+      true,
+    );
+
+    const broken = makeApi();
+    installOrca(broken.pi as never, { createSession: scriptedCreateSession(), stateRoot });
+    mkdirSync(join(dir, ".orca"), { recursive: true });
+    writeFileSync(join(dir, ".orca", "orca.yaml"), "not: a valid spec\n");
+    await activate(broken.registered, []);
+    expect(existsSync(noSpec), "a broken spec sweeps nothing rather than guessing a window").toBe(
+      true,
+    );
+  });
+
+  it("mentions an expired artifact in /orca once, and says nothing when nothing expired", async () => {
+    const { pi, registered } = makeApi();
+    installOrca(pi as never, { createSession: scriptedCreateSession(), stateRoot });
+    writeSpec("multi-owner");
+
+    const quietCtx = makeCtx(dir, true);
+    await registered.events.get("session_start")!({ reason: "startup" }, quietCtx);
+    const quiet = makeCtx(dir, true);
+    await registered.commands.get("orca")!.handler("", quiet);
+    expect(orcaText(quiet), "a sweep with no work is not news").not.toContain("Retention:");
+
+    mkdirSync(join(stateRoot, "patches"), { recursive: true });
+    backdate(
+      (writeFileSync(join(stateRoot, "patches", "old.patch"), "x\n"),
+      join(stateRoot, "patches", "old.patch")),
+      400,
+    );
+    await registered.events.get("session_start")!({ reason: "startup" }, makeCtx(dir, true));
+
+    const loud = makeCtx(dir, true);
+    await registered.commands.get("orca")!.handler("", loud);
+    expect(orcaText(loud)).toContain("Retention: expired 1 preserved artifact(s)");
   });
 });
