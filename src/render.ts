@@ -1,3 +1,4 @@
+import type { GovernanceApproval, GovernanceHold } from "./approval";
 import type { ResolvedDelegation, Resolution, TargetReasoning } from "./resolver";
 import { GOVERNANCE_SCOPE, type HeldGovernance, type PromotionStatus } from "./staging";
 
@@ -97,6 +98,31 @@ export function promotionDetailLines(promotion: PromotionView, indent = "  "): s
     lines.push(`${indent}Unauthorized paths in the staged change: ${promotion.rejectedPaths.join(", ")}`);
   }
   return lines;
+}
+
+/** When an approval happened, in a form that reads the same in every timezone. */
+export function approvalTimestamp(approval: GovernanceApproval): string {
+  return new Date(approval.at).toISOString();
+}
+
+/**
+ * One held governance change as every surface lists it (hardening plan, Phase 3): the
+ * `/orca` pending-approval section, and the approval action's own listing when it needs
+ * the user to say which hold they meant.
+ *
+ * `position` is the selector `/orca approve <n>` takes, so the list a user reads and the
+ * list the selector counts through are the same list. A settled hold has no position
+ * because there is nothing left to approve about it.
+ */
+export function governanceHoldLine(hold: GovernanceHold, position?: number): string {
+  const marker = position === undefined ? "  -" : `  ${position}.`;
+  const state = hold.approval
+    ? ` — ${hold.approval.outcome === "applied" ? "approved" : hold.approval.outcome} ` +
+      approvalTimestamp(hold.approval)
+    : "";
+  return (
+    `${marker} ${hold.held.paths.join(", ")} — "${hold.task}"${state} — patch: ${hold.held.patchPath}`
+  );
 }
 
 function delegationHeader(delegation: ResolvedDelegation): string {
