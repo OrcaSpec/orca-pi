@@ -304,7 +304,8 @@ const copyStaging: StagingProvider = {
   name: "full-copy",
   open(input) {
     const repoRoot = realpathSync(input.cwd);
-    const { dir, patchPath, governancePatchPath, validatorOutputPath } = stagingPaths(input);
+    const { dir, patchPath, governancePatchPath, acceptedPatchPath, validatorOutputPath } =
+      stagingPaths(input);
     rmSync(dir, { recursive: true, force: true });
     mkdirSync(dirname(dir), { recursive: true });
     cpSync(repoRoot, dir, { recursive: true, verbatimSymlinks: true });
@@ -320,6 +321,7 @@ const copyStaging: StagingProvider = {
         baselineCommit: commitStagedBaseline(realpathSync(dir)),
         patchPath,
         governancePatchPath,
+        acceptedPatchPath,
         validatorOutputPath,
         provider: "full-copy",
       },

@@ -20,6 +20,7 @@ import { createDelegationTools } from "./delegation-tools";
 import {
   abandonStagedWork,
   commitAuthorizedWork,
+  preserveAcceptedWork,
   promoteStagedCommits,
   stepPromotion,
   type AcceptanceGate,
@@ -942,6 +943,17 @@ type PendingStep =
   | Extract<SequenceStep, { kind: "build_failed" } | { kind: "not_run" }>;
 
 /**
+ * The slot that stopped this sequence — the first one that is not a completed step —
+ * or `undefined` when every step completed. One definition, because two things now
+ * depend on which slot it is: the blocker sentence below, and whether the stop was a
+ * `needs_scope` (see {@link promoteSequence}). Reading them off the same slot is what
+ * keeps the outcome text and the preserved artifacts describing the same stop.
+ */
+function stoppingSlot(pending: readonly PendingStep[]): PendingStep | undefined {
+  return pending.find((slot) => !pendingCompleted(slot));
+}
+
+/**
  * Why this sequence must not promote, or `undefined` when every step completed.
  * Named after the step that stopped it, because that is the first thing the
  * steward needs to know when a checkout comes back unchanged.
@@ -949,21 +961,19 @@ type PendingStep =
 function blockerFor(pending: readonly PendingStep[]): string | undefined {
   const tail = "; staged work is promoted only when every step completes.";
   if (pending.length === 0) return `Promotion was not attempted: no step ran${tail}`;
-  for (const slot of pending) {
-    switch (slot.kind) {
-      case "staged":
-        if (slot.step.checkpoint.status === "completed") continue;
-        return (
-          `Promotion was not attempted: step '${slot.step.config.owner}' ended ` +
-          `'${slot.step.checkpoint.status}'${tail}`
-        );
-      case "build_failed":
-        return `Promotion was not attempted: step '${slot.owner}' never started (${slot.failureKind})${tail}`;
-      case "not_run":
-        return `Promotion was not attempted: step '${slot.owner}' did not run (${slot.reason})${tail}`;
-    }
+  const slot = stoppingSlot(pending);
+  if (!slot) return undefined;
+  switch (slot.kind) {
+    case "staged":
+      return (
+        `Promotion was not attempted: step '${slot.step.config.owner}' ended ` +
+        `'${slot.step.checkpoint.status}'${tail}`
+      );
+    case "build_failed":
+      return `Promotion was not attempted: step '${slot.owner}' never started (${slot.failureKind})${tail}`;
+    case "not_run":
+      return `Promotion was not attempted: step '${slot.owner}' did not run (${slot.reason})${tail}`;
   }
-  return undefined;
 }
 
 /**
@@ -992,7 +1002,19 @@ async function promoteSequence(
     return promoteStagedCommits(workspace, staged);
   }
   const blocker = blockerFor(pending);
-  if (blocker) return abandonStagedWork(workspace, blocker);
+  if (blocker) {
+    const abandoned = abandonStagedWork(workspace, blocker);
+    // `needs_scope` is the one stop that is not a failure: the assignment was sound and
+    // the grant was too narrow, so the steward's next move is to delegate the SAME work
+    // again with wider targets (ADR 0008). That is the only stop where the owners that
+    // did finish have work worth handing back, so it is the only one that preserves it
+    // — a `failed` or `blocked` owner leaves the sequence with nothing anybody wants to
+    // reuse, and a second patch there would just be another file to explain.
+    const stopped = stoppingSlot(pending);
+    return stopped?.kind === "staged" && stopped.step.checkpoint.status === "needs_scope"
+      ? preserveAcceptedWork(workspace, staged, abandoned)
+      : abandoned;
+  }
   // The parent's cancellation goes only to the gate, and only here: it is the one
   // stage of promotion that runs programs, and a cancellation during it must kill
   // them rather than wait for them (hardening plan, Phase 1). A cancellation this

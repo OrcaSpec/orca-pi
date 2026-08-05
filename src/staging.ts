@@ -158,6 +158,14 @@ export interface StagedWorkspace {
    * a proposal awaiting a decision.
    */
   governancePatchPath: string;
+  /**
+   * Where the accepted work of the owners that completed before a `needs_scope` stop
+   * is preserved (hardening plan, Phase 5). The third distinct file for the third
+   * distinct meaning: {@link patchPath} is evidence of everything a delegation did,
+   * {@link governancePatchPath} is a proposal awaiting a decision, and this one is a
+   * REUSABLE subset — the part of the attempt that was authorized and accepted.
+   */
+  acceptedPatchPath: string;
   /** Where validator output is preserved when the acceptance gate refuses. */
   validatorOutputPath: string;
   /** Which provider produced this workspace, for diagnostics. */
@@ -207,6 +215,7 @@ export function stagingPaths(input: OpenStagingInput): {
   dir: string;
   patchPath: string;
   governancePatchPath: string;
+  acceptedPatchPath: string;
   validatorOutputPath: string;
 } {
   const stateRoot = input.stateRoot ?? defaultStateRoot();
@@ -216,6 +225,7 @@ export function stagingPaths(input: OpenStagingInput): {
     dir: join(stateRoot, CHECKOUTS_DIR, segment),
     patchPath: join(stateRoot, PATCHES_DIR, `${segment}.patch`),
     governancePatchPath: join(stateRoot, PATCHES_DIR, `${segment}.governance.patch`),
+    acceptedPatchPath: join(stateRoot, PATCHES_DIR, `${segment}.accepted.patch`),
     validatorOutputPath: join(stateRoot, VALIDATOR_OUTPUT_DIR, `${segment}.log`),
   };
 }
@@ -542,6 +552,56 @@ export interface HeldGovernance {
 }
 
 /**
+ * The accepted work of the owners that completed before a sequence stopped at
+ * `needs_scope` (hardening plan, Phase 5), preserved as a patch of its own.
+ *
+ * It exists because `needs_scope` is the one stop that is not a failure. The
+ * sequence ends so the STEWARD can re-resolve ownership and delegate again with a
+ * wider target set (ADR 0008), and the owners that finished before it had their
+ * change authorized against their own grant and accepted into a staged commit. The
+ * cumulative evidence patch cannot serve that purpose: it is the whole attempt,
+ * including the half-finished work of the owner that could not continue, and
+ * applying it would land exactly the part nobody accepted.
+ *
+ * So this is a strict subset, cut where staging already cut it — at the last staged
+ * COMMIT — and it carries no promise beyond that. Orca never applies it; there is no
+ * stale-base machinery around it and no automatic reseeding of a follow-up
+ * delegation. It is a `git apply` input the user may choose to use, under ordinary
+ * git semantics, against whatever their checkout holds when they decide.
+ *
+ * Plain strings and string arrays, like {@link HeldGovernance}, because the durable
+ * record persists this shape unchanged and the `/orca` history is the only thing that
+ * remembers where the patch is.
+ */
+export interface AcceptedWork {
+  /** Absolute path of the reusable patch. */
+  patchPath: string;
+  /** The paths it carries, repository-relative and sorted. */
+  paths: string[];
+  /** The owners whose staged commits it contains, in execution order. */
+  owners: string[];
+  /**
+   * The user's `HEAD` when the delegation was staged — the base the patch was
+   * generated against, recorded for the same reason {@link HeldGovernance} records it:
+   * the patch outlives the session, and whoever applies it later needs to know what it
+   * expects to find.
+   */
+  baseCommit: string;
+  /**
+   * Governance paths a completed owner changed that were deliberately LEFT OUT of the
+   * patch (sorted); empty in the ordinary case.
+   *
+   * Such a change was authorized and accepted in staging, but promotion would have HELD
+   * it rather than applying it ({@link GOVERNANCE_SCOPE}), so a patch offered for reuse
+   * must not carry it: `git apply` of a reusable patch would land, in one unreviewed
+   * step, the change that the whole held-for-approval rule exists to keep out of the
+   * checkout. It stays in the cumulative evidence patch, and the outcome names it here
+   * rather than dropping it silently.
+   */
+  excludedGovernancePaths: string[];
+}
+
+/**
  * The steward-facing record of one promotion attempt. {@link appliedPaths} is
  * non-empty only for `promoted`; {@link patchPath} points at the preserved patch
  * whenever a non-empty change was not applied, so the work is recoverable.
@@ -568,6 +628,12 @@ export interface PromotionRecord {
    * this phase existed.
    */
   heldGovernance?: HeldGovernance;
+  /**
+   * The reusable accepted work preserved when a sequence stopped at `needs_scope`
+   * ({@link AcceptedWork}). Present only on that stop, and only when an owner actually
+   * completed and left something outside the governance directory behind.
+   */
+  acceptedWork?: AcceptedWork;
   /**
    * Every declared validator that ran as the acceptance gate, in the order they
    * ran. Empty when the repository declared none, or when the promotion was
@@ -1194,6 +1260,92 @@ export function abandonStagedWork(workspace: StagedWorkspace, reason: string): P
           ? `Your checkout is unchanged. The staged patch could NOT be preserved (${preserved.failure}).`
           : "Your checkout is unchanged; the delegation staged no change to preserve.",
     ],
+  };
+}
+
+/**
+ * Add the reusable accepted work to an abandoned sequence's record (hardening plan,
+ * Phase 5): the completed owners' staged commits, diffed against the synthetic
+ * baseline and written to their own patch.
+ *
+ * A DECORATOR over {@link abandonStagedWork}'s record rather than a branch inside it,
+ * because whether this artifact belongs is not a fact about staging: it is the
+ * caller's reading of WHY the sequence stopped (`needs_scope` and nothing else), and
+ * that decision stays visible at the call site in `delegation.ts`. What lives here is
+ * everything that must not: which commit the accepted work ends at, where the
+ * governance boundary falls, and the words for each way there is nothing to preserve.
+ *
+ * The cut is the last staged COMMIT of the completed owners, exactly as promotion's
+ * would be. That is what makes the patch trustworthy without inspecting it: the
+ * stopping owner never committed — {@link commitAuthorizedWork} runs only for a
+ * completed step — so its work is uncommitted in the shared checkout and is excluded
+ * structurally, not by filtering. The evidence patch, which diffs the WORKING TREE, is
+ * unaffected and still contains everything.
+ *
+ * Like everything else in the gate this never throws: a patch that cannot be written
+ * is a worse day for the steward, not a reason to lose the record that explains what
+ * happened to their files.
+ */
+export function preserveAcceptedWork(
+  workspace: StagedWorkspace,
+  staged: readonly StagedCommitRecord[],
+  abandoned: PromotionRecord,
+): PromotionRecord {
+  const also = (line: string): PromotionRecord => ({
+    ...abandoned,
+    diagnostics: [...abandoned.diagnostics, line],
+  });
+
+  const completed = staged.filter((step) => step.status === "committed" && step.commit);
+  // The LAST completed owner's commit is the accumulated tip: the owners ran in
+  // sequence in one checkout, each committing on top of the previous one.
+  const tip = completed[completed.length - 1]?.commit;
+  if (!tip) {
+    return also(
+      "No owner completed before the sequence stopped, so there is no accepted work to reuse: the " +
+        "preserved patch is evidence of the attempt and nothing in it was accepted.",
+    );
+  }
+  const owners = completed.map((step) => step.label);
+
+  const split = trySplitAtGovernance(workspace.dir, workspace.baselineCommit, tip);
+  if (!split.ok) {
+    return also(
+      `Orca could not preserve the accepted work of ${owners.join(", ")} as its own patch ` +
+        `(${split.reason}); that work is still inside the cumulative patch above.`,
+    );
+  }
+  if (split.promotable.patch.length === 0) {
+    return also(
+      split.governance.paths.length > 0
+        ? `The owner(s) that completed (${owners.join(", ")}) changed only governance path(s) under ` +
+            `\`${GOVERNANCE_SCOPE}\` (${split.governance.paths.join(", ")}), which a reusable patch may ` +
+            "not carry; that change stays in the cumulative patch above and no reusable patch was written."
+        : `The owner(s) that completed (${owners.join(", ")}) changed no files, so there is no accepted ` +
+            "work to reuse.",
+    );
+  }
+
+  try {
+    mkdirSync(dirname(workspace.acceptedPatchPath), { recursive: true });
+    writeFileSync(workspace.acceptedPatchPath, split.promotable.patch);
+  } catch (error) {
+    return also(
+      `Orca could not write the accepted work of ${owners.join(", ")} to ` +
+        `${workspace.acceptedPatchPath} (${error instanceof Error ? error.message : String(error)}); ` +
+        "that work is still inside the cumulative patch above.",
+    );
+  }
+
+  return {
+    ...abandoned,
+    acceptedWork: {
+      patchPath: workspace.acceptedPatchPath,
+      paths: split.promotable.paths,
+      owners,
+      baseCommit: workspace.baseCommit,
+      excludedGovernancePaths: split.governance.paths,
+    },
   };
 }
 
