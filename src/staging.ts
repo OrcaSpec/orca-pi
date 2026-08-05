@@ -392,10 +392,12 @@ export type PromotionStatus = "promoted" | "rejected" | "conflict" | "not_attemp
 /**
  * How one declared validator ended. `unavailable` covers a validator that could
  * not be started at all (a program that is not on this machine, a declared `cwd`
- * that does not exist in the checkout); like the other two failures it refuses the
- * promotion, because a declared check that did not run is not a check that passed.
+ * that does not exist in the checkout); `cancelled` covers one the runtime killed
+ * because the delegation was cancelled under it (hardening plan, Phase 1). Like the
+ * other failures they refuse the promotion, because a declared check that did not run
+ * is not a check that passed.
  */
-export type ValidatorStatus = "passed" | "failed" | "timed_out" | "unavailable";
+export type ValidatorStatus = "passed" | "failed" | "timed_out" | "unavailable" | "cancelled";
 
 /**
  * One run of one declared validator (`runtime.yaml`, see `validators.ts`).
@@ -448,8 +450,17 @@ export interface AcceptanceResult {
  * A gate may write into the checkout (a test run leaves caches; a formatter
  * rewrites files) and it does not matter: promotion applies the diff between
  * COMMITS, so nothing a gate does to the working tree can ride along.
+ *
+ * A gate is AWAITED, and it is handed the delegation's cancellation signal (hardening
+ * plan, Phase 1). The signal arrives at invocation rather than at construction
+ * because cancellation is a fact about this one run, while a gate is built once from
+ * the repository's overlay; a gate that honors it must stop running programs and
+ * report what it had, which is one more refusal and not a path of its own.
  */
-export type AcceptanceGate = (workspace: StagedWorkspace) => AcceptanceResult;
+export type AcceptanceGate = (
+  workspace: StagedWorkspace,
+  signal?: AbortSignal,
+) => Promise<AcceptanceResult>;
 
 /**
  * The steward-facing record of one promotion attempt. {@link appliedPaths} is
@@ -784,15 +795,24 @@ export function commitAuthorizedWork(
  * honestly on a delegation that changed nothing. Without a gate this function
  * behaves exactly as it did before the phase.
  *
+ * `signal` is the delegation's cancellation, and it exists for the gate alone
+ * (hardening plan, Phase 1): everything else here is git on local files, measured in
+ * milliseconds, while the gate is arbitrary programs taking arbitrary time. A
+ * cancellation reaching the gate comes back as a refusal with the killed run
+ * recorded, which is why this function needs no cancellation branch of its own — the
+ * work is refused, the patch is preserved, and the checkout is untouched, exactly as
+ * for a validator that failed.
+ *
  * This never throws: a promotion failure must not destroy the delegation's
  * outcome, so an unexpected git error becomes a `rejected` record with the reason
  * in its diagnostics.
  */
-export function promoteStagedCommits(
+export async function promoteStagedCommits(
   workspace: StagedWorkspace,
   staged: readonly StagedCommitRecord[],
   acceptance?: AcceptanceGate,
-): PromotionRecord {
+  signal?: AbortSignal,
+): Promise<PromotionRecord> {
   const refusedSteps = staged.filter((step) => step.status !== "committed");
   if (refusedSteps.length > 0) {
     return refused(
@@ -823,7 +843,7 @@ export function promoteStagedCommits(
   const staleBeforeGate = detectBaseDrift(workspace, beforeGate.diff.paths);
   if (staleBeforeGate) return conflicted(workspace, beforeGate.diff, staleBeforeGate);
 
-  const gate = acceptance?.(workspace);
+  const gate = await acceptance?.(workspace, signal);
 
   // Re-diff AFTER the gate: what is offered to the user's files is computed once the
   // validators have finished doing whatever they do, and it is still only the pinned
@@ -835,13 +855,20 @@ export function promoteStagedCommits(
   const diff = afterGate.diff;
 
   if (gate && !gate.ok) {
+    // A cancelled run is read off the evidence rather than off the signal: the signal
+    // can fire in the moment AFTER a validator genuinely failed, and blaming the
+    // cancellation for a red suite would send the steward looking in the wrong place.
+    const cancelled = gate.validations.some((run) => run.status === "cancelled");
     return refused(
       workspace,
       diff,
       [],
       [
-        "Orca refused to promote this delegation: a validator this repository declares in " +
-          "`.orca/runtime.yaml` did not pass.",
+        cancelled
+          ? "Orca refused to promote this delegation: it was cancelled while the validators this " +
+            "repository declares in `.orca/runtime.yaml` were running."
+          : "Orca refused to promote this delegation: a validator this repository declares in " +
+            "`.orca/runtime.yaml` did not pass.",
         ...gate.diagnostics,
       ],
       gate,

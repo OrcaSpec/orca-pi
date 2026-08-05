@@ -403,7 +403,7 @@ describe("staging provider seam", () => {
     }
   });
 
-  it("applies the same authorization gate to a non-worktree provider's checkout", () => {
+  it("applies the same authorization gate to a non-worktree provider's checkout", async () => {
     const repo = repoWithDirtyOverlay();
     const stateRoot = makeStateRoot();
     try {
@@ -420,7 +420,7 @@ describe("staging provider seam", () => {
       writeFileSync(join(opened.workspace.dir, "docs.md"), "smuggled through a copy\n");
 
       const staged = commitAuthorizedWork(opened.workspace, inputsFor(repo).grant, "web");
-      const record = promoteStagedCommits(opened.workspace, [staged]);
+      const record = await promoteStagedCommits(opened.workspace, [staged]);
 
       expect(record.status).toBe("rejected");
       expect(record.rejectedPaths).toEqual(["docs.md"]);

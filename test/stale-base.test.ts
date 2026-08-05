@@ -92,12 +92,12 @@ function open(repo: string, stateRoot: string, delegationId = "d1"): StagedWorks
 }
 
 /** The gate exactly as a single-owner delegation runs it (see `staging.ts`). */
-function gate(workspace: StagedWorkspace, grant: CompiledGrant = webGrant): PromotionRecord {
+async function gate(workspace: StagedWorkspace, grant: CompiledGrant = webGrant): Promise<PromotionRecord> {
   return promoteStagedCommits(workspace, [commitAuthorizedWork(workspace, grant, "web")]);
 }
 
 describe("a user who keeps working during a delegation", () => {
-  it("gets a conflict, not a merge, when they edit a file that was dirty at staging time", () => {
+  it("gets a conflict, not a merge, when they edit a file that was dirty at staging time", async () => {
     const { repo, stateRoot } = fixture();
     writeFileSync(join(repo, "keep.md"), "my uncommitted draft\n");
     const workspace = open(repo, stateRoot);
@@ -106,7 +106,7 @@ describe("a user who keeps working during a delegation", () => {
     // The user keeps typing in their own checkout while the child works.
     writeFileSync(join(repo, "keep.md"), "my uncommitted draft, revised\n");
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record.status).toBe("conflict");
     expect(record.driftedPaths).toEqual(["keep.md"]);
@@ -121,7 +121,7 @@ describe("a user who keeps working during a delegation", () => {
     expect(record.diagnostics.join("\n")).toContain(record.patchPath!);
   });
 
-  it("gets a conflict when they rewrite a committed file the delegation also changed", () => {
+  it("gets a conflict when they rewrite a committed file the delegation also changed", async () => {
     const { repo, stateRoot } = fixture();
     // `apps/web/app.tsx` is committed and clean when staging begins, so it is not in
     // the binding at all. The user making it dirty is drift only because the staged
@@ -131,7 +131,7 @@ describe("a user who keeps working during a delegation", () => {
     writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "delegated work\n");
     writeFileSync(join(repo, "apps", "web", "app.tsx"), "the user rewrote this entirely\n");
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record.status).toBe("conflict");
     expect(record.driftedPaths).toEqual(["apps/web/app.tsx"]);
@@ -141,7 +141,7 @@ describe("a user who keeps working during a delegation", () => {
     expect(readFileSync(record.patchPath!, "utf8")).toContain("delegated work");
   });
 
-  it("promotes anyway when the file they touched is not one the delegation changed", () => {
+  it("promotes anyway when the file they touched is not one the delegation changed", async () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "delegated work\n");
@@ -150,7 +150,7 @@ describe("a user who keeps working during a delegation", () => {
     // path the staged patch does not touch.
     writeFileSync(join(repo, "notes.md"), "thinking out loud\n");
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record).toMatchObject({
       status: "promoted",
@@ -161,7 +161,7 @@ describe("a user who keeps working during a delegation", () => {
     expect(readFileSync(join(repo, "notes.md"), "utf8")).toBe("thinking out loud\n");
   });
 
-  it("holds a file that was already dirty to its digest, whatever the patch touches", () => {
+  it("holds a file that was already dirty to its digest, whatever the patch touches", async () => {
     const { repo, stateRoot } = fixture();
     writeFileSync(join(repo, "keep.md"), "my uncommitted draft\n");
     const workspace = open(repo, stateRoot);
@@ -170,7 +170,7 @@ describe("a user who keeps working during a delegation", () => {
     // content: the child read it, and its work may depend on what it said.
     writeFileSync(join(repo, "keep.md"), "second thoughts\n");
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record.status).toBe("conflict");
     expect(record.driftedPaths).toEqual(["keep.md"]);
@@ -178,7 +178,7 @@ describe("a user who keeps working during a delegation", () => {
 });
 
 describe("a user who leaves their checkout alone", () => {
-  it("gets the promotion Phase 3 gave them, dirty overlay and all", () => {
+  it("gets the promotion Phase 3 gave them, dirty overlay and all", async () => {
     const { repo, stateRoot } = fixture();
     // A working checkout is normally dirty. The overlay is the state the delegation
     // is staged FROM, so it must never read as drift against itself — the binding is
@@ -188,7 +188,7 @@ describe("a user who leaves their checkout alone", () => {
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "delegated work\n");
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record).toMatchObject({
       status: "promoted",
@@ -205,20 +205,20 @@ describe("a user who leaves their checkout alone", () => {
 });
 
 describe("what the overlay digest does and does not count as drift", () => {
-  it("counts a revert: the file is back to HEAD, which is not what was staged", () => {
+  it("counts a revert: the file is back to HEAD, which is not what was staged", async () => {
     const { repo, stateRoot } = fixture();
     writeFileSync(join(repo, "keep.md"), "my uncommitted draft\n");
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "delegated work\n");
     git(repo, "checkout", "--", "keep.md");
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record.status).toBe("conflict");
     expect(record.driftedPaths).toEqual(["keep.md"]);
   });
 
-  it("counts an edit that changes no file size", () => {
+  it("counts an edit that changes no file size", async () => {
     const { repo, stateRoot } = fixture();
     writeFileSync(join(repo, "keep.md"), "ship the blue button\n");
     const workspace = open(repo, stateRoot);
@@ -227,13 +227,13 @@ describe("what the overlay digest does and does not count as drift", () => {
     // file's size or timestamp can stand in for reading it.
     writeFileSync(join(repo, "keep.md"), "ship the green butto\n");
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record.status).toBe("conflict");
     expect(record.driftedPaths).toEqual(["keep.md"]);
   });
 
-  it("counts restoring a file the user had deleted uncommitted", () => {
+  it("counts restoring a file the user had deleted uncommitted", async () => {
     const { repo, stateRoot } = fixture();
     rmSync(join(repo, "keep.md"));
     // The delegation is staged from a checkout where `keep.md` does not exist; the
@@ -242,26 +242,26 @@ describe("what the overlay digest does and does not count as drift", () => {
     writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "delegated work\n");
     writeFileSync(join(repo, "keep.md"), "on reflection, I want it back\n");
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record.status).toBe("conflict");
     expect(record.driftedPaths).toEqual(["keep.md"]);
   });
 
-  it("counts a chmod +x, which git itself tracks", () => {
+  it("counts a chmod +x, which git itself tracks", async () => {
     const { repo, stateRoot } = fixture();
     writeFileSync(join(repo, "keep.md"), "my uncommitted draft\n");
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "delegated work\n");
     chmodSync(join(repo, "keep.md"), 0o755);
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record.status).toBe("conflict");
     expect(record.driftedPaths).toEqual(["keep.md"]);
   });
 
-  it("ignores a permission change git does not track", () => {
+  it("ignores a permission change git does not track", async () => {
     const { repo, stateRoot } = fixture();
     writeFileSync(join(repo, "keep.md"), "my uncommitted draft\n");
     chmodSync(join(repo, "keep.md"), 0o644);
@@ -271,12 +271,12 @@ describe("what the overlay digest does and does not count as drift", () => {
     // patch stale.
     chmodSync(join(repo, "keep.md"), 0o600);
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record).toMatchObject({ status: "promoted", appliedPaths: ["apps/web/app.tsx"] });
   });
 
-  it("counts a symlink that now points somewhere else", () => {
+  it("counts a symlink that now points somewhere else", async () => {
     const { repo, stateRoot } = fixture();
     symlinkSync("keep.md", join(repo, "link.md"));
     const workspace = open(repo, stateRoot);
@@ -284,13 +284,13 @@ describe("what the overlay digest does and does not count as drift", () => {
     rmSync(join(repo, "link.md"));
     symlinkSync("apps/web/app.tsx", join(repo, "link.md"));
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record.status).toBe("conflict");
     expect(record.driftedPaths).toEqual(["link.md"]);
   });
 
-  it("ignores staging a file whose bytes never changed", () => {
+  it("ignores staging a file whose bytes never changed", async () => {
     const { repo, stateRoot } = fixture();
     writeFileSync(join(repo, "keep.md"), "my uncommitted draft\n");
     const workspace = open(repo, stateRoot);
@@ -300,7 +300,7 @@ describe("what the overlay digest does and does not count as drift", () => {
     // deliberately outside the binding.
     git(repo, "add", "keep.md");
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record).toMatchObject({ status: "promoted", appliedPaths: ["apps/web/app.tsx"] });
     expect(readFileSync(join(repo, "keep.md"), "utf8")).toBe("my uncommitted draft\n");
@@ -308,7 +308,7 @@ describe("what the overlay digest does and does not count as drift", () => {
     expect(git(repo, "diff", "--cached", "--name-only").trim()).toBe("keep.md");
   });
 
-  it("reports a conflict, not a vacuous promotion, when a drifted base carried no change", () => {
+  it("reports a conflict, not a vacuous promotion, when a drifted base carried no change", async () => {
     const { repo, stateRoot } = fixture();
     writeFileSync(join(repo, "keep.md"), "my uncommitted draft\n");
     const workspace = open(repo, stateRoot);
@@ -317,7 +317,7 @@ describe("what the overlay digest does and does not count as drift", () => {
     // a conflict rather than dressed up as a promotion of nothing.
     writeFileSync(join(repo, "keep.md"), "second thoughts\n");
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record.status).toBe("conflict");
     expect(record.driftedPaths).toEqual(["keep.md"]);
@@ -325,7 +325,7 @@ describe("what the overlay digest does and does not count as drift", () => {
     expect(record.diagnostics.join("\n")).toContain("no change to preserve");
   });
 
-  it("binds paths a repository may legally contain but an object cannot hold", () => {
+  it("binds paths a repository may legally contain but an object cannot hold", async () => {
     const { repo, stateRoot } = fixture();
     // `__proto__` is a legal filename; in a plain object it would collide with
     // `Object.prototype` and the binding would silently stop describing it. It is a
@@ -336,7 +336,7 @@ describe("what the overlay digest does and does not count as drift", () => {
     writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "delegated work\n");
     writeFileSync(join(repo, "__proto__"), "edited by the user\n");
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record.status).toBe("conflict");
     expect(record.driftedPaths).toEqual(["__proto__"]);
@@ -357,7 +357,7 @@ describe("what the overlay digest does and does not count as drift", () => {
 });
 
 describe("the window the acceptance gate opens", () => {
-  it("catches a checkout that moved while the validators were running", () => {
+  it("catches a checkout that moved while the validators were running", async () => {
     const { repo, stateRoot } = fixture();
     writeFileSync(join(repo, "keep.md"), "my uncommitted draft\n");
     const workspace = open(repo, stateRoot);
@@ -366,12 +366,12 @@ describe("the window the acceptance gate opens", () => {
     // Declared validators are arbitrary programs taking arbitrary time, and the user
     // keeps working the whole while. This gate stands in for that elapsed time: the
     // base was intact when it started and is not when it returns.
-    const slowGate: AcceptanceGate = () => {
+    const slowGate: AcceptanceGate = async () => {
       writeFileSync(join(repo, "keep.md"), "edited while the tests ran\n");
       return { ok: true, validations: [], diagnostics: ["type-check passed"] };
     };
 
-    const record = promoteStagedCommits(
+    const record = await promoteStagedCommits(
       workspace,
       [commitAuthorizedWork(workspace, webGrant, "web")],
       slowGate,
@@ -385,18 +385,18 @@ describe("the window the acceptance gate opens", () => {
     expect(readFileSync(record.patchPath!, "utf8")).toContain("delegated work");
   });
 
-  it("does not run the validators at all once the base is already stale", () => {
+  it("does not run the validators at all once the base is already stale", async () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "delegated work\n");
     writeFileSync(join(repo, "apps", "web", "app.tsx"), "the user got there first\n");
     let ran = 0;
-    const countingGate: AcceptanceGate = () => {
+    const countingGate: AcceptanceGate = async () => {
       ran += 1;
       return { ok: true, validations: [], diagnostics: [] };
     };
 
-    const record = promoteStagedCommits(
+    const record = await promoteStagedCommits(
       workspace,
       [commitAuthorizedWork(workspace, webGrant, "web")],
       countingGate,
@@ -410,7 +410,7 @@ describe("the window the acceptance gate opens", () => {
 });
 
 describe("recovering the work a conflict preserved", () => {
-  it("preserves a patch that applies with plain `git apply` on the base it was staged from", () => {
+  it("preserves a patch that applies with plain `git apply` on the base it was staged from", async () => {
     const { repo, stateRoot } = fixture();
     writeFileSync(join(repo, "keep.md"), "my uncommitted draft\n");
     const workspace = open(repo, stateRoot);
@@ -419,7 +419,7 @@ describe("recovering the work a conflict preserved", () => {
     // The user drifts, so nothing is promoted and the patch is all that survives.
     writeFileSync(join(repo, "keep.md"), "second thoughts\n");
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
     expect(record.status).toBe("conflict");
 
     // The recovery route the conflict recommends, followed literally: put the base
@@ -435,14 +435,14 @@ describe("recovering the work a conflict preserved", () => {
     expect(readFileSync(join(repo, "keep.md"), "utf8")).toBe("my uncommitted draft\n");
   });
 
-  it("preserves a binary change the user can recover byte-for-byte", () => {
+  it("preserves a binary change the user can recover byte-for-byte", async () => {
     const { repo, stateRoot } = fixture();
     const bytes = Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe, 0x00, 0x7f]);
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "logo.bin"), bytes);
     writeFileSync(join(repo, "apps", "web", "logo.bin"), Buffer.from([0x09]));
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
     expect(record.status).toBe("conflict");
     expect(record.driftedPaths).toEqual(["apps/web/logo.bin"]);
 
@@ -454,7 +454,7 @@ describe("recovering the work a conflict preserved", () => {
 });
 
 describe("a user who commits during a delegation", () => {
-  it("gets a conflict naming the commit their checkout moved to", () => {
+  it("gets a conflict naming the commit their checkout moved to", async () => {
     const { repo, stateRoot } = fixture();
     const stagedFrom = headOf(repo);
     const workspace = open(repo, stateRoot);
@@ -462,7 +462,7 @@ describe("a user who commits during a delegation", () => {
     writeFileSync(join(repo, "later.md"), "unrelated work of my own\n");
     commit(repo, "a commit landed mid-delegation");
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record.status).toBe("conflict");
     expect(record.diagnostics.join("\n")).toContain(stagedFrom);
@@ -471,7 +471,7 @@ describe("a user who commits during a delegation", () => {
     expect(readFileSync(record.patchPath!, "utf8")).toContain("delegated work");
   });
 
-  it("gets a conflict from an amend, which moves HEAD without changing a file", () => {
+  it("gets a conflict from an amend, which moves HEAD without changing a file", async () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "delegated work\n");
@@ -492,7 +492,7 @@ describe("a user who commits during a delegation", () => {
       "seed, reworded",
     );
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record.status).toBe("conflict");
     expect(record.driftedPaths).toEqual([]);
@@ -500,7 +500,7 @@ describe("a user who commits during a delegation", () => {
     expect(snapshotTree(repo)).toEqual(before);
   });
 
-  it("counts committing the very file it staged from as drift on both halves", () => {
+  it("counts committing the very file it staged from as drift on both halves", async () => {
     const { repo, stateRoot } = fixture();
     writeFileSync(join(repo, "keep.md"), "my uncommitted draft\n");
     const workspace = open(repo, stateRoot);
@@ -509,7 +509,7 @@ describe("a user who commits during a delegation", () => {
     // so the overlay digest no longer describes a working-tree state at all.
     commit(repo, "I committed my draft");
 
-    const record = gate(workspace);
+    const record = await gate(workspace);
 
     expect(record.status).toBe("conflict");
     expect(record.diagnostics.join("\n")).toMatch(/HEAD moved/);

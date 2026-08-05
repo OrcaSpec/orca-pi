@@ -794,7 +794,12 @@ export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Pr
       return { ok: false, kind: result.kind, diagnostics: result.diagnostics, warnings: result.warnings };
     }
     const pending: PendingStep[] = [{ kind: "staged", step: result.step }];
-    const promotion = promoteSequence(workspace, pending, acceptance.acceptance);
+    const promotion = await promoteSequence(
+      workspace,
+      pending,
+      acceptance.acceptance,
+      deps.signal,
+    );
     return { ok: true, outcome: toOutcome(result.step, stepPromotion(promotion, result.step.staged)) };
   } catch (error) {
     preserveOnCrash(workspace, error);
@@ -973,11 +978,12 @@ function blockerFor(pending: readonly PendingStep[]): string | undefined {
  * they would answer a question nobody asked, on top of work that is being thrown
  * away either way.
  */
-function promoteSequence(
+async function promoteSequence(
   workspace: StagedWorkspace,
   pending: readonly PendingStep[],
   acceptance?: AcceptanceGate,
-): PromotionRecord {
+  signal?: AbortSignal,
+): Promise<PromotionRecord> {
   const staged = pending.flatMap((slot) => (slot.kind === "staged" ? [slot.step.staged] : []));
   // An owner whose own change was refused is the sharpest thing that went wrong, so
   // it is reported as a REJECTION naming the unauthorized paths rather than as the
@@ -987,7 +993,10 @@ function promoteSequence(
   }
   const blocker = blockerFor(pending);
   if (blocker) return abandonStagedWork(workspace, blocker);
-  return promoteStagedCommits(workspace, staged, acceptance);
+  // The parent's cancellation goes only to the gate, and only here: it is the one
+  // stage of promotion that runs programs, and a cancellation during it must kill
+  // them rather than wait for them (hardening plan, Phase 1).
+  return promoteStagedCommits(workspace, staged, acceptance, signal);
 }
 
 /** Project the pending slots onto their final form, once the promotion is known. */
@@ -1585,7 +1594,7 @@ export async function runDelegationSequence(
 
     // The single promotion for the whole sequence, decided once every owner is done.
     const promotion = workspace
-      ? promoteSequence(workspace, pending, acceptance)
+      ? await promoteSequence(workspace, pending, acceptance, deps.signal)
       : unstagedPromotion(blockerFor(pending) ?? "Promotion was not attempted.");
     const steps = toSequenceSteps(pending, promotion);
     return finishSequence(steps, promotion, {

@@ -219,17 +219,17 @@ describe("materializing the dirty overlay", () => {
  * `delegation.ts`), so driving it this way keeps these tests a specification of
  * the real path rather than of a test-only shortcut.
  */
-function gate(workspace: StagedWorkspace, grant: CompiledGrant): PromotionRecord {
+async function gate(workspace: StagedWorkspace, grant: CompiledGrant): Promise<PromotionRecord> {
   return promoteStagedCommits(workspace, [commitAuthorizedWork(workspace, grant, "web")]);
 }
 
 describe("the promotion gate", () => {
-  it("applies an authorized change to the checkout as an unstaged edit", () => {
+  it("applies an authorized change to the checkout as an unstaged edit", async () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "promoted\n");
 
-    const record = gate(workspace, webGrant);
+    const record = await gate(workspace, webGrant);
 
     expect(record).toMatchObject({
       status: "promoted",
@@ -241,7 +241,7 @@ describe("the promotion gate", () => {
     expect(git(repo, "diff", "--cached", "--name-only").trim()).toBe("");
   });
 
-  it("promotes an authorized new file and an authorized deletion", () => {
+  it("promotes an authorized new file and an authorized deletion", async () => {
     const { repo, stateRoot } = fixture();
     mkdirSync(join(repo, "apps", "web", "old"), { recursive: true });
     writeFileSync(join(repo, "apps", "web", "old", "gone.tsx"), "delete me\n");
@@ -252,7 +252,7 @@ describe("the promotion gate", () => {
     writeFileSync(join(workspace.dir, "apps", "web", "added.tsx"), "brand new\n");
     rmSync(join(workspace.dir, "apps", "web", "old", "gone.tsx"));
 
-    const record = gate(workspace, webGrant);
+    const record = await gate(workspace, webGrant);
 
     expect(record.status).toBe("promoted");
     expect(record.appliedPaths).toEqual(["apps/web/added.tsx", "apps/web/old/gone.tsx"]);
@@ -260,7 +260,7 @@ describe("the promotion gate", () => {
     expect(existsSync(join(repo, "apps", "web", "old", "gone.tsx"))).toBe(false);
   });
 
-  it("rejects the WHOLE promotion when any staged path is outside the grant", () => {
+  it("rejects the WHOLE promotion when any staged path is outside the grant", async () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
     // Both an authorized and an unauthorized change, written straight into the
@@ -268,7 +268,7 @@ describe("the promotion gate", () => {
     writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "authorized\n");
     writeFileSync(join(workspace.dir, "keep.md"), "smuggled\n");
 
-    const record = gate(workspace, webGrant);
+    const record = await gate(workspace, webGrant);
 
     expect(record.status).toBe("rejected");
     expect(record.rejectedPaths).toEqual(["keep.md"]);
@@ -280,19 +280,19 @@ describe("the promotion gate", () => {
     expect(readFileSync(record.patchPath!, "utf8")).toContain("keep.md");
   });
 
-  it("rejects an unauthorized DELETION, not only an unauthorized write", () => {
+  it("rejects an unauthorized DELETION, not only an unauthorized write", async () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
     rmSync(join(workspace.dir, "keep.md"));
 
-    const record = gate(workspace, webGrant);
+    const record = await gate(workspace, webGrant);
 
     expect(record.status).toBe("rejected");
     expect(record.rejectedPaths).toEqual(["keep.md"]);
     expect(readFileSync(join(repo, "keep.md"), "utf8")).toBe("committed keep\n");
   });
 
-  it("reports a conflict without applying when HEAD moved since staging", () => {
+  it("reports a conflict without applying when HEAD moved since staging", async () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "staged work\n");
@@ -300,14 +300,14 @@ describe("the promotion gate", () => {
     git(repo, "add", "later.md");
     git(repo, "-c", "user.name=F", "-c", "user.email=f@localhost", "commit", "-q", "-m", "moved");
 
-    const record = gate(workspace, webGrant);
+    const record = await gate(workspace, webGrant);
 
     expect(record.status).toBe("conflict");
     expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("committed\n");
     expect(readFileSync(record.patchPath!, "utf8")).toContain("staged work");
   });
 
-  it("rejects and preserves when the patch cannot apply, with no drift to blame", () => {
+  it("rejects and preserves when the patch cannot apply, with no drift to blame", async () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "added.tsx"), "a new file\n");
@@ -319,7 +319,7 @@ describe("the promotion gate", () => {
     mkdirSync(join(repo, "apps", "web", "added.tsx"), { recursive: true });
     writeFileSync(join(repo, "apps", "web", "added.tsx", "note.md"), "occupied\n");
 
-    const record = gate(workspace, webGrant);
+    const record = await gate(workspace, webGrant);
 
     expect(record.status).toBe("rejected");
     expect(record.driftedPaths).toEqual([]);
@@ -330,18 +330,18 @@ describe("the promotion gate", () => {
     expect(existsSync(record.patchPath!)).toBe(true);
   });
 
-  it("promotes nothing, and preserves nothing, when the delegation changed no files", () => {
+  it("promotes nothing, and preserves nothing, when the delegation changed no files", async () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
 
-    const record = gate(workspace, webGrant);
+    const record = await gate(workspace, webGrant);
 
     expect(record).toMatchObject({ status: "promoted", appliedPaths: [], rejectedPaths: [] });
     expect(record.patchPath).toBeUndefined();
     expect(existsSync(join(stateRoot, "patches", "d1.patch"))).toBe(false);
   });
 
-  it("never promotes a change to an ignored path, authorized or not", () => {
+  it("never promotes a change to an ignored path, authorized or not", async () => {
     const { repo, stateRoot } = fixture();
     writeFileSync(join(repo, ".gitignore"), "apps/web/build.log\n");
     git(repo, "add", "-A");
@@ -350,44 +350,44 @@ describe("the promotion gate", () => {
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "build.log"), "noise\n");
 
-    const record = gate(workspace, webGrant);
+    const record = await gate(workspace, webGrant);
 
     expect(record).toMatchObject({ status: "promoted", appliedPaths: [] });
     expect(existsSync(join(repo, "apps", "web", "build.log"))).toBe(false);
   });
 
-  it("promotes a binary change byte-for-byte", () => {
+  it("promotes a binary change byte-for-byte", async () => {
     const { repo, stateRoot } = fixture();
     const bytes = Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe, 0x00, 0x7f]);
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "logo.bin"), bytes);
 
-    const record = gate(workspace, webGrant);
+    const record = await gate(workspace, webGrant);
 
     expect(record.status).toBe("promoted");
     expect(readFileSync(join(repo, "apps", "web", "logo.bin"))).toEqual(bytes);
   });
 
-  it("does not throw when the worktree is gone; it reports the refusal", () => {
+  it("does not throw when the worktree is gone; it reports the refusal", async () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
     gitWorktreeStaging.close(workspace);
 
-    const record = gate(workspace, webGrant);
+    const record = await gate(workspace, webGrant);
 
     expect(record.status).toBe("rejected");
     expect(record.appliedPaths).toEqual([]);
     expect(record.diagnostics.join("\n")).toMatch(/could not compute the staged change/);
   });
 
-  it("promotes nothing when no owner committed anything, uncommitted work included", () => {
+  it("promotes nothing when no owner committed anything, uncommitted work included", async () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
     writeFileSync(join(workspace.dir, "apps", "web", "app.tsx"), "never committed\n");
 
     // No steps at all: there is nothing authorized to promote, and the change
     // sitting in the worktree is not a substitute for one.
-    const record = promoteStagedCommits(workspace, []);
+    const record = await promoteStagedCommits(workspace, []);
 
     expect(record).toMatchObject({ status: "promoted", appliedPaths: [] });
     expect(readFileSync(join(repo, "apps", "web", "app.tsx"), "utf8")).toBe("committed\n");
