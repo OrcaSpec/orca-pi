@@ -11,9 +11,12 @@
  * Which validation stage produced a diagnostic. `yaml`, `structural`, and
  * `semantic` are the OrcaSpec load phases; `overlay` is Orca's own runtime
  * overlay (`.orca/runtime.yaml`, see `runtime-overlay.ts`), which is not part of
- * OrcaSpec and therefore carries its own `overlay.*` reason codes.
+ * OrcaSpec and therefore carries its own `overlay.*` reason codes; `salvage` is
+ * the best-effort recovery of protected read denies from an already-unusable
+ * document (see `salvage.ts`), whose `salvage.*` codes report what could not be
+ * recovered rather than why the document is invalid.
  */
-export type DiagnosticPhase = "yaml" | "structural" | "semantic" | "overlay";
+export type DiagnosticPhase = "yaml" | "structural" | "semantic" | "overlay" | "salvage";
 
 /**
  * A single actionable validation problem.
