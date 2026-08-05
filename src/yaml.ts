@@ -17,11 +17,30 @@ import type { Diagnostic } from "./diagnostics";
  *
  * A violation is never a crash: malformed or restricted YAML surfaces as an
  * `invalid_spec` diagnostic (ADR 0028).
+ *
+ * The restricted profile is a property of Orca's configuration format, not of
+ * OrcaSpec alone, so every Orca-owned YAML file is read through this one loader —
+ * `.orca/runtime.yaml` included (see `runtime-overlay.ts`). Only how the document
+ * is NAMED in a diagnostic varies, which is what {@link YamlSubject} carries: a
+ * user told their runtime overlay is malformed must not be sent to fix their spec.
  */
 
 export type YamlResult =
   | { ok: true; value: unknown }
   | { ok: false; diagnostics: Diagnostic[] };
+
+/** How one Orca-owned YAML document is described in its own diagnostics. */
+export interface YamlSubject {
+  /** Sentence-initial name of the document, e.g. `The OrcaSpec document`. */
+  subject: string;
+  /** What a valid document contains; appended to the empty-document diagnostic. */
+  emptyAdvice: string;
+}
+
+const ORCA_SPEC_SUBJECT: YamlSubject = {
+  subject: "The OrcaSpec document",
+  emptyAdvice: "a valid `.orca/orca.yaml` declares the six required top-level sections",
+};
 
 function yamlDiag(reason: string, message: string): Diagnostic {
   // A restricted-YAML violation is a property of the whole document, not of a
@@ -37,7 +56,10 @@ interface TaggedNode {
   tag?: string;
 }
 
-export function parseRestrictedYaml(source: string): YamlResult {
+export function parseRestrictedYaml(
+  source: string,
+  named: YamlSubject = ORCA_SPEC_SUBJECT,
+): YamlResult {
   const diagnostics: Diagnostic[] = [];
 
   let docs: ReturnType<typeof parseAllDocuments>;
@@ -56,7 +78,7 @@ export function parseRestrictedYaml(source: string): YamlResult {
       diagnostics: [
         yamlDiag(
           "yaml.parse_error",
-          `The OrcaSpec document is not valid YAML: ${(err as Error).message}`,
+          `${named.subject} is not valid YAML: ${(err as Error).message}`,
         ),
       ],
     };
@@ -68,7 +90,7 @@ export function parseRestrictedYaml(source: string): YamlResult {
       diagnostics: [
         yamlDiag(
           "yaml.multiple_documents",
-          "The OrcaSpec document must contain exactly one YAML document; multiple documents separated by `---` are not allowed (ADR 0025).",
+          `${named.subject} must contain exactly one YAML document; multiple documents separated by \`---\` are not allowed (ADR 0025).`,
         ),
       ],
     };
@@ -81,7 +103,7 @@ export function parseRestrictedYaml(source: string): YamlResult {
       diagnostics: [
         yamlDiag(
           "yaml.empty",
-          "The OrcaSpec document is empty; a valid `.orca/orca.yaml` declares the six required top-level sections.",
+          `${named.subject} is empty; ${named.emptyAdvice}.`,
         ),
       ],
     };
@@ -100,7 +122,7 @@ export function parseRestrictedYaml(source: string): YamlResult {
       diagnostics.push(
         yamlDiag(
           "yaml.parse_error",
-          `The OrcaSpec document is not valid YAML: ${error.message}`,
+          `${named.subject} is not valid YAML: ${error.message}`,
         ),
       );
     }

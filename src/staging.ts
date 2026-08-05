@@ -61,6 +61,9 @@ export const CHECKOUTS_DIR = "worktrees";
 /** The subdirectory of the state root holding patches preserved as evidence. */
 export const PATCHES_DIR = "patches";
 
+/** The subdirectory of the state root holding preserved validator output. */
+export const VALIDATOR_OUTPUT_DIR = "validators";
+
 /** The commit message of the synthetic baseline the cumulative diff is taken against. */
 export const BASELINE_MESSAGE = "orca staged baseline (HEAD + dirty overlay)";
 
@@ -106,6 +109,8 @@ export interface StagedWorkspace {
   baselineCommit: string;
   /** Where a patch is preserved when it is not promoted. */
   patchPath: string;
+  /** Where validator output is preserved when the acceptance gate refuses. */
+  validatorOutputPath: string;
   /** Which provider produced this workspace, for diagnostics. */
   provider: string;
 }
@@ -147,11 +152,12 @@ export interface StagingProvider {
   close(workspace: StagedWorkspace): void;
 }
 
-/** Resolve where a delegation's checkout and preserved patch belong. */
+/** Resolve where a delegation's checkout and its preserved evidence belong. */
 export function stagingPaths(input: OpenStagingInput): {
   stateRoot: string;
   dir: string;
   patchPath: string;
+  validatorOutputPath: string;
 } {
   const stateRoot = input.stateRoot ?? defaultStateRoot();
   const segment = safeSegment(input.delegationId);
@@ -159,6 +165,7 @@ export function stagingPaths(input: OpenStagingInput): {
     stateRoot,
     dir: join(stateRoot, CHECKOUTS_DIR, segment),
     patchPath: join(stateRoot, PATCHES_DIR, `${segment}.patch`),
+    validatorOutputPath: join(stateRoot, VALIDATOR_OUTPUT_DIR, `${segment}.log`),
   };
 }
 
@@ -198,6 +205,68 @@ export function commitStagedBaseline(dir: string): string {
 export type PromotionStatus = "promoted" | "rejected" | "conflict" | "not_attempted";
 
 /**
+ * How one declared validator ended. `unavailable` covers a validator that could
+ * not be started at all (a program that is not on this machine, a declared `cwd`
+ * that does not exist in the checkout); like the other two failures it refuses the
+ * promotion, because a declared check that did not run is not a check that passed.
+ */
+export type ValidatorStatus = "passed" | "failed" | "timed_out" | "unavailable";
+
+/**
+ * One run of one declared validator (`runtime.yaml`, see `validators.ts`).
+ *
+ * Distinct from the `ValidationEvidence` on a checkpoint: that is the agent's own
+ * account of what it verified — advisory metadata, believed only as far as the
+ * agent is honest — while this is the runtime's own observation of a program it
+ * executed itself. Only this one gates a promotion.
+ */
+export interface ValidatorRun {
+  /** The OrcaSpec agent id whose declaration this run came from. */
+  agent: string;
+  program: string;
+  /** Arguments as declared; recorded as an array because that is how they are passed. */
+  args: string[];
+  /** Repository-relative directory it ran in; `""` is the checkout root. */
+  cwd: string;
+  timeoutSeconds: number;
+  status: ValidatorStatus;
+  /** Exit code, when the process ran to completion. */
+  exitCode?: number;
+  /** Terminating signal, when one killed it (including the timeout's). */
+  signal?: string;
+  /** Captured stdout, truncated for evidence. */
+  stdout: string;
+  /** Captured stderr, truncated for evidence. */
+  stderr: string;
+}
+
+/**
+ * What an acceptance gate decided about the staged work as a whole. `ok: false`
+ * refuses the promotion; {@link validations} is recorded either way, so a steward
+ * can see what gated (or cleared) their change.
+ */
+export interface AcceptanceResult {
+  ok: boolean;
+  validations: ValidatorRun[];
+  /** Absolute path of preserved validator output, when any was written. */
+  validatorOutputPath?: string;
+  diagnostics: string[];
+}
+
+/**
+ * The seam through which anything other than authorization can refuse a
+ * promotion. `validators.ts` supplies the only implementation — the programs
+ * `.orca/runtime.yaml` declares — and this module owns WHEN it runs: after every
+ * owner's change is authorized and committed, so the gate sees the sequence's
+ * complete work, and before a single byte reaches the user's checkout.
+ *
+ * A gate may write into the checkout (a test run leaves caches; a formatter
+ * rewrites files) and it does not matter: promotion applies the diff between
+ * COMMITS, so nothing a gate does to the working tree can ride along.
+ */
+export type AcceptanceGate = (workspace: StagedWorkspace) => AcceptanceResult;
+
+/**
  * The steward-facing record of one promotion attempt. {@link appliedPaths} is
  * non-empty only for `promoted`; {@link patchPath} points at the preserved patch
  * whenever a non-empty change was not applied, so the work is recoverable.
@@ -210,6 +279,14 @@ export interface PromotionRecord {
   rejectedPaths: string[];
   /** Absolute path of the preserved patch, when one was written. */
   patchPath?: string;
+  /**
+   * Every declared validator that ran as the acceptance gate, in the order they
+   * ran. Empty when the repository declared none, or when the promotion was
+   * refused before the gate was reached.
+   */
+  validations: ValidatorRun[];
+  /** Absolute path of preserved validator output, when any was written. */
+  validatorOutputPath?: string;
   /** Why the gate reached this status, in the words the steward reads. */
   diagnostics: string[];
 }
@@ -276,6 +353,7 @@ function refused(
   diff: StagedDiff,
   rejectedPaths: string[],
   diagnostics: string[],
+  acceptance?: AcceptanceResult,
 ): PromotionRecord {
   const patchPath = preservePatch(workspace, diff.patch);
   return {
@@ -283,6 +361,8 @@ function refused(
     appliedPaths: [],
     rejectedPaths,
     patchPath,
+    validations: acceptance?.validations ?? [],
+    validatorOutputPath: acceptance?.validatorOutputPath,
     diagnostics: [
       ...diagnostics,
       patchPath
@@ -402,9 +482,16 @@ export function commitAuthorizedWork(
  *
  * The patch is the diff between the synthetic baseline and the LAST STAGED COMMIT,
  * not the worktree, so anything a session left uncommitted — including a change no
- * grant authorized — is structurally excluded from what can be promoted. The
- * preserved evidence patch is the worktree view, because evidence should show
- * everything that happened.
+ * grant authorized, and anything the acceptance gate itself wrote — is structurally
+ * excluded from what can be promoted.
+ *
+ * `acceptance` is the optional last word before the patch is applied (Phase 4): the
+ * validators `.orca/runtime.yaml` declares, run in the checkout with the sequence's
+ * complete work in place. It is consulted AFTER the base guard, because a stale base
+ * makes any promotion impossible whatever the validators think, and it is consulted
+ * even when the cumulative diff is empty, so a repository's declared checks report
+ * honestly on a delegation that changed nothing. Without a gate this function
+ * behaves exactly as it did before the phase.
  *
  * This never throws: a promotion failure must not destroy the delegation's
  * outcome, so an unexpected git error becomes a `rejected` record with the reason
@@ -413,6 +500,7 @@ export function commitAuthorizedWork(
 export function promoteStagedCommits(
   workspace: StagedWorkspace,
   staged: readonly StagedCommitRecord[],
+  acceptance?: AcceptanceGate,
 ): PromotionRecord {
   const refusedSteps = staged.filter((step) => step.status !== "committed");
   if (refusedSteps.length > 0) {
@@ -438,6 +526,7 @@ export function promoteStagedCommits(
       status: "rejected",
       appliedPaths: [],
       rejectedPaths: [],
+      validations: [],
       diagnostics: [
         `Orca could not compute the staged change for promotion (${gitFailure(error)}). ` +
           "Nothing was applied; your checkout is unchanged.",
@@ -455,11 +544,28 @@ export function promoteStagedCommits(
     ]);
   }
 
+  const gate = acceptance?.(workspace);
+  if (gate && !gate.ok) {
+    return refused(
+      workspace,
+      "rejected",
+      diff,
+      [],
+      [
+        "Orca refused to promote this delegation: a validator this repository declares in " +
+          "`.orca/runtime.yaml` did not pass.",
+        ...gate.diagnostics,
+      ],
+      gate,
+    );
+  }
+
   if (diff.patch.length === 0) {
     return {
       status: "promoted",
       appliedPaths: [],
       rejectedPaths: [],
+      validations: gate?.validations ?? [],
       diagnostics: ["The delegation changed no files, so there was nothing to promote."],
     };
   }
@@ -470,25 +576,39 @@ export function promoteStagedCommits(
     diff.patch,
   );
   if (!check.ok) {
-    return refused(workspace, "rejected", diff, [], [
-      "Orca refused to promote this delegation: the staged patch does not apply cleanly to your " +
-        `checkout (git apply --check failed: ${check.reason}).`,
-    ]);
+    return refused(
+      workspace,
+      "rejected",
+      diff,
+      [],
+      [
+        "Orca refused to promote this delegation: the staged patch does not apply cleanly to your " +
+          `checkout (git apply --check failed: ${check.reason}).`,
+      ],
+      gate,
+    );
   }
 
   const applied = tryGit(workspace.repoRoot, ["apply", "--whitespace=nowarn"], diff.patch);
   if (!applied.ok) {
-    return refused(workspace, "rejected", diff, [], [
-      `Orca could not apply the staged patch to your checkout (${applied.reason}).`,
-    ]);
+    return refused(
+      workspace,
+      "rejected",
+      diff,
+      [],
+      [`Orca could not apply the staged patch to your checkout (${applied.reason}).`],
+      gate,
+    );
   }
 
   return {
     status: "promoted",
     appliedPaths: diff.paths,
     rejectedPaths: [],
+    validations: gate?.validations ?? [],
     diagnostics: [
       `Promoted ${diff.paths.length} authorized path(s) to your checkout as unstaged changes.`,
+      ...(gate ? gate.diagnostics : []),
     ],
   };
 }
@@ -508,6 +628,7 @@ export function abandonStagedWork(workspace: StagedWorkspace, reason: string): P
       status: "not_attempted",
       appliedPaths: [],
       rejectedPaths: [],
+      validations: [],
       diagnostics: [reason, `The staged change could not be read (${gitFailure(error)}).`],
     };
   }
@@ -517,6 +638,7 @@ export function abandonStagedWork(workspace: StagedWorkspace, reason: string): P
     appliedPaths: [],
     rejectedPaths: [],
     patchPath,
+    validations: [],
     diagnostics: [
       reason,
       patchPath
@@ -535,6 +657,10 @@ export function abandonStagedWork(workspace: StagedWorkspace, reason: string): P
  * actually applied — a path an owner created and a later owner deleted nets out and
  * is not claimed. On any refusal every owner reports the same refusal, because
  * that is what happened to all of them: nothing was applied.
+ *
+ * The validator runs are carried through unnarrowed: the acceptance gate ran over
+ * the whole sequence's work, so every owner's entry answers the same question with
+ * the same evidence — which declared checks decided this promotion.
  */
 export function stepPromotion(
   sequence: PromotionRecord,
@@ -546,6 +672,8 @@ export function stepPromotion(
     status: "promoted",
     appliedPaths: applied,
     rejectedPaths: [],
+    validations: sequence.validations,
+    validatorOutputPath: sequence.validatorOutputPath,
     diagnostics: [
       `Promoted ${applied.length} path(s) from this owner to your checkout, as part of the ` +
         `sequence's single promotion of ${sequence.appliedPaths.length} path(s).`,

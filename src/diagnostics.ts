@@ -7,8 +7,13 @@
  * activates no governance (ADR 0028).
  */
 
-/** Which validation stage produced a diagnostic. */
-export type DiagnosticPhase = "yaml" | "structural" | "semantic";
+/**
+ * Which validation stage produced a diagnostic. `yaml`, `structural`, and
+ * `semantic` are the OrcaSpec load phases; `overlay` is Orca's own runtime
+ * overlay (`.orca/runtime.yaml`, see `runtime-overlay.ts`), which is not part of
+ * OrcaSpec and therefore carries its own `overlay.*` reason codes.
+ */
+export type DiagnosticPhase = "yaml" | "structural" | "semantic" | "overlay";
 
 /**
  * A single actionable validation problem.

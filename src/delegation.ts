@@ -22,12 +22,15 @@ import {
   commitAuthorizedWork,
   promoteStagedCommits,
   stepPromotion,
+  type AcceptanceGate,
   type PromotionRecord,
   type StagedCommitRecord,
   type StagedWorkspace,
   type StagingProvider,
 } from "./staging";
 import { gitWorktreeStaging } from "./staging-worktree";
+import { overlayRefusalDiagnostics, readRuntimeOverlay } from "./runtime-overlay";
+import { createAcceptanceGate } from "./validators";
 import {
   CONTEXT_BUDGET_BYTES,
   resolveSources,
@@ -162,12 +165,17 @@ export interface DelegationSessionConfig {
 export type BuildFailureKind = "unknown_owner" | "required_missing" | "oversized";
 
 /**
- * Why a delegation never reached a child session. Assembly failures plus
- * `staging_unavailable`, which covers a repository that cannot be staged at all
- * (see `staging.ts`) — the delegation is refused rather than degraded to an
- * ungoverned in-place edit.
+ * Why a delegation never reached a child session. Assembly failures plus two
+ * pre-spawn refusals, both of which fail closed rather than degrading:
+ * `staging_unavailable` covers a repository that cannot be staged at all (see
+ * `staging.ts`), so work is never edited in place ungoverned;
+ * `invalid_runtime_overlay` covers a `.orca/runtime.yaml` that cannot be trusted
+ * (see `runtime-overlay.ts`), so work is never promoted unvalidated.
  */
-export type RunFailureKind = BuildFailureKind | "staging_unavailable";
+export type RunFailureKind =
+  | BuildFailureKind
+  | "staging_unavailable"
+  | "invalid_runtime_overlay";
 
 /** Assembly outcome: a spawnable config, or a pre-spawn failure with diagnostics. */
 export type BuildResult =
@@ -702,6 +710,37 @@ function stagingIdFor(inputs: DelegationInputs): string {
 }
 
 /**
+ * The acceptance gate a delegation must clear before promotion, or the refusal
+ * that stops it from starting.
+ *
+ * Both halves matter. A repository that declares validators gets a gate; one that
+ * declares none gets `undefined` and the untouched Phase 3 promotion path. A
+ * repository whose overlay is present but unusable gets neither: the delegation is
+ * refused BEFORE anything spawns, because the alternative is spending a model's
+ * time on work that would be promoted while quietly skipping the repository's own
+ * checks (see `runtime-overlay.ts`).
+ */
+type AcceptancePreparation =
+  | { ok: true; acceptance?: AcceptanceGate }
+  | { ok: false; diagnostics: string[] };
+
+function prepareAcceptance(
+  cwd: string,
+  document: OrcaSpecDocument,
+  owners: readonly string[],
+): AcceptancePreparation {
+  const overlay = readRuntimeOverlay(cwd, document);
+  if (overlay.kind === "invalid") {
+    return { ok: false, diagnostics: overlayRefusalDiagnostics(cwd, overlay.diagnostics) };
+  }
+  return {
+    ok: true,
+    acceptance:
+      overlay.kind === "loaded" ? createAcceptanceGate(overlay.overlay, owners) : undefined,
+  };
+}
+
+/**
  * Assemble and run one single-owner delegation end-to-end IN STAGING.
  *
  * Before anything is assembled, the delegation gets its own `git worktree`
@@ -723,6 +762,16 @@ function stagingIdFor(inputs: DelegationInputs): string {
  * promote, and clean up identically. The worktree is removed on every exit path.
  */
 export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Promise<RunResult> {
+  const acceptance = prepareAcceptance(inputs.cwd, inputs.document, [inputs.owner]);
+  if (!acceptance.ok) {
+    return {
+      ok: false,
+      kind: "invalid_runtime_overlay",
+      diagnostics: acceptance.diagnostics,
+      warnings: [],
+    };
+  }
+
   const staging = deps.staging ?? gitWorktreeStaging;
   const staged = staging.open({
     cwd: inputs.cwd,
@@ -745,7 +794,7 @@ export async function runDelegation(inputs: DelegationInputs, deps: RunDeps): Pr
       return { ok: false, kind: result.kind, diagnostics: result.diagnostics, warnings: result.warnings };
     }
     const pending: PendingStep[] = [{ kind: "staged", step: result.step }];
-    const promotion = promoteSequence(workspace, pending);
+    const promotion = promoteSequence(workspace, pending, acceptance.acceptance);
     return { ok: true, outcome: toOutcome(result.step, stepPromotion(promotion, result.step.staged)) };
   } catch (error) {
     preserveOnCrash(workspace, error);
@@ -913,14 +962,21 @@ function blockerFor(pending: readonly PendingStep[]): string | undefined {
 }
 
 /**
- * The sequence's ONE promotion (staged-promotion plan, Phase 3). Every step
- * completed means the accumulated authorized staged commits are offered to the
- * user's checkout as a single cumulative patch; anything else means nothing is
- * applied and the cumulative patch is preserved as evidence instead.
+ * The sequence's ONE promotion (staged-promotion plan, Phase 3, gated since Phase
+ * 4). Every step completed means the accumulated authorized staged commits are
+ * offered to the user's checkout as a single cumulative patch — if the acceptance
+ * gate clears them; anything else means nothing is applied and the cumulative patch
+ * is preserved as evidence instead.
+ *
+ * The declared validators run only on the path where a promotion is actually
+ * possible. A sequence that already cannot commit is refused without spawning them:
+ * they would answer a question nobody asked, on top of work that is being thrown
+ * away either way.
  */
 function promoteSequence(
   workspace: StagedWorkspace,
   pending: readonly PendingStep[],
+  acceptance?: AcceptanceGate,
 ): PromotionRecord {
   const staged = pending.flatMap((slot) => (slot.kind === "staged" ? [slot.step.staged] : []));
   // An owner whose own change was refused is the sharpest thing that went wrong, so
@@ -931,7 +987,7 @@ function promoteSequence(
   }
   const blocker = blockerFor(pending);
   if (blocker) return abandonStagedWork(workspace, blocker);
-  return promoteStagedCommits(workspace, staged);
+  return promoteStagedCommits(workspace, staged, acceptance);
 }
 
 /** Project the pending slots onto their final form, once the promotion is known. */
@@ -966,6 +1022,7 @@ function unstagedPromotion(reason: string): PromotionRecord {
     status: "not_attempted",
     appliedPaths: [],
     rejectedPaths: [],
+    validations: [],
     diagnostics: [reason, "Your checkout is unchanged; nothing was staged to promote."],
   };
 }
@@ -1325,22 +1382,40 @@ export async function runDelegationSequence(
 
   const staging = deps.staging ?? gitWorktreeStaging;
   let workspace: StagedWorkspace | undefined;
-  let stagingRefusal: string[] | undefined;
+  let acceptance: AcceptanceGate | undefined;
+  let refusal: { kind: RunFailureKind; diagnostics: string[] } | undefined;
   /**
-   * Open the sequence's shared checkout on first use, and remember a refusal so a
-   * repository that cannot be staged is diagnosed once rather than per owner. Every
-   * owner in a sequence works on the same repository, so the first one's `cwd`
-   * locates it for all of them.
+   * Prepare the sequence on first use — validate the runtime overlay, then open the
+   * shared checkout — and remember a refusal so a repository that cannot be
+   * delegated in is diagnosed once rather than per owner. Every owner in a sequence
+   * works on the same repository, so the first one's `cwd` locates it for all of
+   * them, and every owner runs under the same overlay.
+   *
+   * The overlay is validated FIRST: a sequence that cannot be validated must not
+   * even create a checkout, let alone spawn a child into it.
    */
   const openWorkspace = (): StagedWorkspace | undefined => {
-    if (workspace || stagingRefusal) return workspace;
+    if (workspace || refusal) return workspace;
+    const prepared = prepareAcceptance(
+      executionInputs[0].cwd,
+      executionInputs[0].document,
+      assignmentGraph.executionOrder,
+    );
+    if (!prepared.ok) {
+      refusal = { kind: "invalid_runtime_overlay", diagnostics: prepared.diagnostics };
+      return undefined;
+    }
     const opened = staging.open({
       cwd: executionInputs[0].cwd,
       delegationId: sequenceStagingId(executionInputs),
       stateRoot: deps.stateRoot,
     });
-    if (opened.ok) workspace = opened.workspace;
-    else stagingRefusal = opened.diagnostics;
+    if (!opened.ok) {
+      refusal = { kind: "staging_unavailable", diagnostics: opened.diagnostics };
+      return undefined;
+    }
+    workspace = opened.workspace;
+    acceptance = prepared.acceptance;
     return workspace;
   };
 
@@ -1453,8 +1528,8 @@ export async function runDelegationSequence(
         ? await runStagedStep(inputs, stepDeps, shared)
         : {
             ok: false,
-            kind: "staging_unavailable",
-            diagnostics: stagingRefusal ?? [],
+            kind: refusal?.kind ?? "staging_unavailable",
+            diagnostics: refusal?.diagnostics ?? [],
             warnings: [],
           };
       // A cancellation observed during this delegation (its session was aborted and
@@ -1509,7 +1584,7 @@ export async function runDelegationSequence(
 
     // The single promotion for the whole sequence, decided once every owner is done.
     const promotion = workspace
-      ? promoteSequence(workspace, pending)
+      ? promoteSequence(workspace, pending, acceptance)
       : unstagedPromotion(blockerFor(pending) ?? "Promotion was not attempted.");
     const steps = toSequenceSteps(pending, promotion);
     return finishSequence(steps, promotion, {
