@@ -1,6 +1,11 @@
 import { approvalStateOf, isSettled, type GovernanceApproval } from "./approval";
 import type { ResolvedDelegation, Resolution, TargetReasoning } from "./resolver";
-import { GOVERNANCE_SCOPE, type HeldGovernance, type PromotionStatus } from "./staging";
+import {
+  GOVERNANCE_SCOPE,
+  type AcceptedWork,
+  type HeldGovernance,
+  type PromotionStatus,
+} from "./staging";
 
 /**
  * Shared rendering for the two routing-preview tools. `orca_resolve` (model
@@ -37,6 +42,13 @@ export interface PromotionView {
   driftedPaths: string[];
   patchPath?: string;
   heldGovernance?: HeldGovernance;
+  /**
+   * The reusable accepted work a `needs_scope` stop preserved (hardening plan, Phase
+   * 5). Rendered from the structured record for the same reason the hold is: the two
+   * preserved patches mean different things, and a steward who cannot tell which is
+   * which will either apply the wrong one or apply neither.
+   */
+  acceptedWork?: AcceptedWork;
   /**
    * What the user decided about {@link heldGovernance} afterwards (hardening plan,
    * Phase 3), when they have decided anything. It is not part of the promotion — the
@@ -119,17 +131,57 @@ function heldGovernanceLines(
 }
 
 /**
+ * The reusable accepted work, in the words both surfaces use (hardening plan, Phase
+ * 5), and what tells it apart from the cumulative patch named just above it.
+ *
+ * Both artifacts are patches in the same directory with almost the same name, and the
+ * difference is the whole point: one is EVIDENCE of an attempt that did not land, the
+ * other is a SUBSET of it that was accepted and is worth reusing. So these lines say
+ * which owners it covers, that it holds nothing from the owner that stopped, and what
+ * `git apply` will and will not do with it. Nothing here promises the patch still
+ * applies — no stale-base machinery guards it — so the hint says what base it was
+ * generated against and leaves the decision with the user.
+ */
+function acceptedWorkLines(accepted: AcceptedWork, indent: string): string[] {
+  return [
+    `${indent}REUSABLE ACCEPTED WORK — the ${accepted.owners.length} owner(s) that completed before the ` +
+      `stop (${accepted.owners.join(", ")}) had ${accepted.paths.length} path(s) authorized and accepted ` +
+      `in staging, preserved as their own patch at ${accepted.patchPath}: ${accepted.paths.join(", ")}.`,
+    `${indent}That patch holds ONLY that accepted work — nothing from the owner that stopped the ` +
+      "sequence, not even its edits to the same files. The cumulative patch named above is the other " +
+      "thing: evidence of the whole attempt, unfinished work included.",
+    ...(accepted.excludedGovernancePaths.length > 0
+      ? [
+          `${indent}Left out of it: ${accepted.excludedGovernancePaths.length} governance path(s) under ` +
+            `\`${GOVERNANCE_SCOPE}\` (${accepted.excludedGovernancePaths.join(", ")}). Promotion would ` +
+            "have held those for your approval rather than applying them, so a patch offered for reuse " +
+            "does not carry them; they remain in the cumulative patch.",
+        ]
+      : []),
+    `${indent}To reuse it: \`git apply ${accepted.patchPath}\` — it was generated against ` +
+      `${accepted.baseCommit}, the base captured when the delegation was staged, and it is ordinary git ` +
+      "from here: nothing re-checks that base for you, and Orca will not apply it or reseed a follow-up " +
+      "delegation on its own.",
+  ];
+}
+
+/**
  * Why the promotion ended that way, in the gate's own words, LED by anything held
  * for approval — a pending decision outranks an explanation of what already
  * happened. The drifted paths and the preserved patch are not repeated as separate
  * lines: the gate's diagnostics already name both, and a conflict's recovery hint is
  * one of them.
+ *
+ * Reusable accepted work comes AFTER the diagnostics rather than before them, unlike a
+ * hold: it is an option, not a pending decision, and it is only legible once the
+ * cumulative patch it is a subset of has been named.
  */
 export function promotionDetailLines(promotion: PromotionView, indent = "  "): string[] {
   const lines = promotion.heldGovernance
     ? heldGovernanceLines(promotion.heldGovernance, promotion.governanceApproval, indent)
     : [];
   for (const diagnostic of promotion.diagnostics) lines.push(`${indent}${diagnostic}`);
+  if (promotion.acceptedWork) lines.push(...acceptedWorkLines(promotion.acceptedWork, indent));
   if (promotion.rejectedPaths.length > 0) {
     lines.push(`${indent}Unauthorized paths in the staged change: ${promotion.rejectedPaths.join(", ")}`);
   }
