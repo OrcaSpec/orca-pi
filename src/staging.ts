@@ -961,6 +961,14 @@ export function commitAuthorizedWork(
  * grant authorized, and anything the acceptance gate itself wrote — is structurally
  * excluded from what can be promoted.
  *
+ * At the apply stage the patch SPLITS (hardening plan, Phase 2): the governance half
+ * is held for the user ({@link GOVERNANCE_SCOPE}) and only the rest is applied. The
+ * split is the last thing that happens, deliberately — every guard above it sees the
+ * change whole, so a governance path still fails an unauthorized step, still drifts,
+ * still conflicts, and is still preserved as evidence exactly as before the phase. A
+ * hold is therefore something only a promotion that would otherwise have SUCCEEDED
+ * can produce.
+ *
  * `acceptance` is the optional last word before the patch is applied (Phase 4): the
  * validators `.orca/runtime.yaml` declares, run in the checkout with the sequence's
  * complete work in place. It is consulted AFTER the base guard, because a stale base

@@ -266,6 +266,30 @@ describe("holding never replaces the authorization it follows", () => {
     expect(readFileSync(join(repo, ".orca", "runtime.yaml"), "utf8")).toBe("the user's own edit\n");
   });
 
+  it("conflicts on governance drift that happens while the acceptance gate runs", async () => {
+    const { repo, stateRoot } = fixture();
+    const workspace = open(repo, stateRoot);
+    writeFileSync(join(workspace.dir, ".orca", "runtime.yaml"), AGENT_OVERLAY);
+
+    // The gate is arbitrary programs taking arbitrary time, and the user edits their
+    // own files throughout. This one stands in for that window: the base was sound
+    // when the gate started and is stale by the time it returns, and the post-gate
+    // re-check is the only thing between that and a hold nobody can apply.
+    const record = await promoteStagedCommits(
+      workspace,
+      [commitAuthorizedWork(workspace, governanceGrant, "governance")],
+      async () => {
+        writeFileSync(join(repo, ".orca", "runtime.yaml"), "the user's own edit\n");
+        return { ok: true, validations: [], diagnostics: [] };
+      },
+    );
+
+    expect(record.status).toBe("conflict");
+    expect(record.driftedPaths).toEqual([".orca/runtime.yaml"]);
+    expect(record.heldGovernance).toBeUndefined();
+    expect(existsSync(join(stateRoot, "patches", "d1.governance.patch"))).toBe(false);
+  });
+
   it("holds nothing for a delegation that never reached the gate", () => {
     const { repo, stateRoot } = fixture();
     const workspace = open(repo, stateRoot);
