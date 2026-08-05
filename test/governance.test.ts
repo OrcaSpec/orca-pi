@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import * as orcaspec from "orcaspec";
 import type { OrcaSpecDocument } from "orcaspec";
-import { classifyDiscovery, classifyWrite } from "../src/governance";
+import { classifyBrokenSpec, classifyDiscovery, classifyWrite } from "../src/governance";
+import { loadSpec } from "../src/load";
+import type { InvalidSpecState, UnsupportedSpecVersionState } from "../src/state";
 
 /**
  * Pure steward-governance decisions: the full enforce/advisory matrix over the
@@ -123,5 +125,115 @@ describe("classifyDiscovery", () => {
     expect(classifyDiscovery(doc2, "advisory", { path: "secrets/x", symlink: false }).verdict).toBe(
       "block",
     );
+  });
+});
+
+/**
+ * A real broken state, built from an OrcaSpec fixture through the real loader —
+ * no filesystem, no hand-written diagnostics. `cwd`/`specPath` are the two fields
+ * `detectRepositoryState` adds around the load outcome.
+ */
+function invalidSpecStateFor(fixture: string): InvalidSpecState {
+  const outcome = loadSpec(orcaspec.loadFixtureSource(fixture));
+  if (outcome.kind !== "invalid_spec") throw new Error(`fixture ${fixture} is ${outcome.kind}`);
+  return { ...outcome, kind: "invalid_spec", cwd: "/repo", specPath: "/repo/.orca/orca.yaml" };
+}
+
+function unsupportedVersionStateFor(fixture: string): UnsupportedSpecVersionState {
+  const outcome = loadSpec(orcaspec.loadFixtureSource(fixture));
+  if (outcome.kind !== "unsupported_spec_version") {
+    throw new Error(`fixture ${fixture} is ${outcome.kind}`);
+  }
+  return {
+    ...outcome,
+    kind: "unsupported_spec_version",
+    cwd: "/repo",
+    specPath: "/repo/.orca/orca.yaml",
+  };
+}
+
+describe("classifyBrokenSpec", () => {
+  // --- invalid_spec: writes fail closed in both modes ----------------------
+
+  it("blocks write and edit in invalid_spec, carrying the spec path and a diagnostic", () => {
+    const state = invalidSpecStateFor("duplicate-agent-id");
+    for (const tool of ["write", "edit"] as const) {
+      const decision = classifyBrokenSpec(state, tool);
+      expect(decision.verdict, `${tool} verdict`).toBe("block");
+      expect(decision.owner, `${tool} owner`).toBeNull();
+      expect(decision.reason, `${tool} names the state`).toContain("invalid_spec");
+      expect(decision.reason, `${tool} names the spec file`).toContain("/repo/.orca/orca.yaml");
+      expect(decision.reason, `${tool} carries a diagnostic`).toContain(
+        state.diagnostics[0].message,
+      );
+      expect(decision.reason, `${tool} carries a diagnostic code`).toContain(
+        state.diagnostics[0].reason,
+      );
+    }
+  });
+
+  // --- unsupported_spec_version: names found vs supported version ----------
+
+  it("blocks a write in unsupported_spec_version, naming the found and supported versions", () => {
+    const state = unsupportedVersionStateFor("unsupported-spec-version");
+    const decision = classifyBrokenSpec(state, "write");
+    expect(decision.verdict).toBe("block");
+    expect(decision.reason).toContain("unsupported_spec_version");
+    // Both versions appear in their correct ROLES: naming them in the wrong order
+    // would send the reader to fix the wrong end of the mismatch.
+    expect(decision.reason).toContain(`declares spec_version '${state.foundVersion}'`);
+    expect(decision.reason).toContain(`supports '${state.supportedVersion}'`);
+    expect(state.foundVersion).not.toBe(state.supportedVersion);
+    expect(decision.reason).toContain(state.diagnostics[0].message);
+  });
+
+  // --- discovery reads stay available so the spec can be diagnosed ----------
+
+  it("allows every discovery tool in both broken states so the user can diagnose", () => {
+    const states = [
+      invalidSpecStateFor("duplicate-agent-id"),
+      unsupportedVersionStateFor("unsupported-spec-version"),
+    ];
+    for (const state of states) {
+      for (const tool of ["read", "grep", "find", "ls"] as const) {
+        const decision = classifyBrokenSpec(state, tool);
+        expect(decision.verdict, `${state.kind} ${tool} verdict`).toBe("allow");
+        expect(decision.reason, `${state.kind} ${tool} reason`).toBe("");
+        expect(decision.owner, `${state.kind} ${tool} owner`).toBeNull();
+      }
+    }
+  });
+
+  it("blocks any tool outside the four discovery tools (allowlist, not a write denylist)", () => {
+    // Discovery is allowlisted, so a governed tool introduced later fails closed
+    // here by default instead of passing through unnoticed.
+    const state = invalidSpecStateFor("duplicate-agent-id");
+    expect(classifyBrokenSpec(state, "bash" as never).verdict).toBe("block");
+  });
+
+  // --- decided edges of the diagnostics payload ----------------------------
+
+  it("still blocks when the state carries no diagnostics at all", () => {
+    // The loader always reports at least one, but failing closed must not depend
+    // on that: no diagnostics is not a reason to allow the write.
+    const state: InvalidSpecState = { ...invalidSpecStateFor("duplicate-agent-id"), diagnostics: [] };
+    const decision = classifyBrokenSpec(state, "write");
+    expect(decision.verdict).toBe("block");
+    expect(decision.reason).toContain("none were reported");
+  });
+
+  it("truncates a long diagnostic list and points at /orca for the rest", () => {
+    const one = invalidSpecStateFor("duplicate-agent-id").diagnostics[0];
+    const state: InvalidSpecState = {
+      ...invalidSpecStateFor("duplicate-agent-id"),
+      diagnostics: Array.from({ length: 9 }, (_, index) => ({ ...one, message: `problem ${index}` })),
+    };
+    const decision = classifyBrokenSpec(state, "write");
+    expect(decision.verdict).toBe("block");
+    expect(decision.reason).toContain("Spec diagnostics (9):");
+    expect(decision.reason).toContain("problem 0");
+    expect(decision.reason).toContain("problem 4");
+    expect(decision.reason).not.toContain("problem 5");
+    expect(decision.reason).toContain("and 4 more");
   });
 });

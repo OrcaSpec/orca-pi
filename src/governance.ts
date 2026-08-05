@@ -1,7 +1,9 @@
 import type { OrcaSpecDocument } from "orcaspec";
+import { formatDiagnostic } from "./diagnostics";
 import type { OperatingMode } from "./mode";
 import { matchesAny } from "./paths";
 import { resolve } from "./resolver";
+import type { BrokenSpecState } from "./state";
 
 /**
  * Pure steward-governance decisions (ADR 0080, 0022, 0012, 0015, 0032).
@@ -24,6 +26,10 @@ import { resolve } from "./resolver";
  *   0068 "Protected denies override discovery permission"). The PRD's blanket
  *   "advisory blocks nothing" does not carve this out; see the report's
  *   spec-gaps.
+ * - **Broken specs** ({@link classifyBrokenSpec}, ADR 0028): a present but
+ *   unusable spec blocks every write in both modes, because there is no validated
+ *   ownership map to authorize against. Only `unmanaged` (no spec at all) is
+ *   pass-through.
  *
  * Symlink traversal follows the mode split explicitly per ADR 0032 (enforce
  * blocks, advisory reports).
@@ -62,6 +68,79 @@ export interface DiscoveryTarget {
 
 const enforceBlocks = (mode: OperatingMode): "block" | "flag" =>
   mode === "enforce" ? "block" : "flag";
+
+/** The discovery tools that stay available while a spec is broken. */
+const DISCOVERY_TOOLS: readonly GovernedTool[] = ["read", "grep", "find", "ls"];
+
+/**
+ * How many diagnostics a single block reason carries. A badly broken document can
+ * produce dozens; the first few identify the problem, and `/orca` holds the rest,
+ * so the model-visible reason stays bounded.
+ */
+const MAX_BLOCK_DIAGNOSTICS = 5;
+
+function diagnosticLines(state: BrokenSpecState): string[] {
+  // The loader always reports at least one diagnostic for a broken outcome, but the
+  // block does not depend on that: an empty set still blocks, and says so plainly
+  // rather than printing an empty list.
+  if (state.diagnostics.length === 0) {
+    return ["Spec diagnostics: none were reported — inspect the document directly."];
+  }
+  const shown = state.diagnostics.slice(0, MAX_BLOCK_DIAGNOSTICS);
+  const lines = [`Spec diagnostics (${state.diagnostics.length}):`];
+  for (const diagnostic of shown) lines.push(`  - ${formatDiagnostic(diagnostic)}`);
+  const hidden = state.diagnostics.length - shown.length;
+  if (hidden > 0) lines.push(`  - … and ${hidden} more; run /orca for the full list.`);
+  return lines;
+}
+
+/**
+ * Decide a parent tool call while the spec is present but broken — `invalid_spec`
+ * or `unsupported_spec_version` (ADR 0028). Governance FAILS CLOSED here: with no
+ * validated ownership map there is nothing to authorize a write against, so
+ * `write`/`edit` are blocked in advisory and enforce alike, and the reason carries
+ * the state's own diagnostics so the user can fix the document. Discovery reads
+ * (`read`/`grep`/`find`/`ls`) proceed unscoped — the steward's read surface is
+ * itself declared in the unusable spec, and blocking reads would leave the user
+ * unable to inspect the file that is blocking them.
+ *
+ * Only `unmanaged` (no spec at all) is pass-through; a repository that opted into
+ * Orca and then broke its spec does not silently revert to ungoverned writes.
+ *
+ * Discovery is an explicit ALLOWLIST, not a write denylist: any tool that is not
+ * one of the four discovery tools blocks, so a governed tool added later fails
+ * closed here by default rather than slipping through unnoticed.
+ */
+export function classifyBrokenSpec(state: BrokenSpecState, tool: GovernedTool): GovernanceDecision {
+  if (DISCOVERY_TOOLS.includes(tool)) {
+    return { verdict: "allow", reason: "", owner: null };
+  }
+
+  const problem =
+    state.kind === "unsupported_spec_version"
+      ? `declares spec_version '${state.foundVersion}', but this runtime supports ` +
+        `'${state.supportedVersion}' (unsupported_spec_version)`
+      : "is present but failed validation (invalid_spec)";
+
+  const remedy =
+    state.kind === "unsupported_spec_version"
+      ? "Update the document to a supported spec_version, or run a runtime that supports the declared one."
+      : "Fix the diagnostics below in the document.";
+
+  return {
+    verdict: "block",
+    owner: null,
+    reason: [
+      `Orca governance is blocked: \`${state.specPath}\` ${problem}. This \`${tool}\` is blocked in ` +
+        "advisory and enforce modes alike — with no validated ownership map there is nothing to " +
+        "authorize a write against, so a broken spec fails closed rather than reverting to ungoverned " +
+        "writes (ADR 0028).",
+      `${remedy} Discovery reads (read, grep, find, ls) still work, so you can inspect the spec; ` +
+        "`/orca` shows the full state. Delegation is blocked for the same reason.",
+      ...diagnosticLines(state),
+    ].join("\n"),
+  };
+}
 
 /**
  * Decide a parent `write`/`edit` call. The steward has no implicit write

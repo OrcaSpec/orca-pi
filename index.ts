@@ -27,6 +27,7 @@ import {
 import { RouteLog } from "./src/routelog";
 import { ViolationLog } from "./src/violations";
 import {
+  classifyBrokenSpec,
   classifyDiscovery,
   classifyWrite,
   type DiscoveryTarget,
@@ -35,7 +36,7 @@ import {
   type GovernedTool,
   type GovernedWriteTool,
 } from "./src/governance";
-import { composeStewardPrompt } from "./src/steward";
+import { composeBrokenSpecNote, composeStewardPrompt } from "./src/steward";
 import type {
   DelegationProgress,
   DelegationSession,
@@ -85,13 +86,19 @@ import { linesComponent } from "./src/tui";
  * - **Steward identity**: `before_agent_start` appends a root-first trusted
  *   system-prompt block (`steward.ts`) — role, mode, discovery scope, delegation
  *   directive, four-state context — appended to pi's own prompt, never replacing it.
+ *   A broken spec gets the short fail-closed note instead.
  * - **Tool surface**: the steward gains `orca_delegate` (full lifecycle — statuses,
  *   scope expansion, multi-owner splits, unowned handling, cancellation). The
  *   parent session never receives `orca_checkpoint`.
  *
- * Governance activates ONLY in the `active` state; unmanaged and blocked
- * repositories see zero interception (every handler returns early), preserving
- * normal pi behavior. Handlers are registered once in the factory body, so the
+ * Only the `unmanaged` state (no `.orca/orca.yaml` at all) sees zero interception,
+ * preserving normal pi behavior. A spec that is present but unusable
+ * (`invalid_spec`, `unsupported_spec_version`) FAILS CLOSED: `write`/`edit` are
+ * blocked with the state's diagnostics and `orca_delegate` is unavailable in both
+ * modes, while discovery reads proceed so the document can be inspected and fixed
+ * (ADR 0028; `classifyBrokenSpec` in `governance.ts`).
+ *
+ * Handlers are registered once in the factory body, so the
  * `/reload` flow (which rebuilds a fresh extension instance) cannot accumulate
  * duplicate handlers or double-govern a call.
  */
@@ -317,17 +324,44 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
     }
   });
 
-  // Steward governance. Runs on every parent tool call but returns immediately
-  // unless the repository is under active governance — unmanaged and blocked
-  // states get zero interception, preserving normal pi behavior.
+  // Steward governance. Runs on every parent tool call. Only `unmanaged` (no spec
+  // at all) gets zero interception; a spec that is present but broken fails closed
+  // (see below), and `active` runs the full decision matrix.
   pi.on("tool_call", async (event, ctx): Promise<ToolCallEventResult | undefined> => {
     const state = detectRepositoryState(ctx.cwd, requestedMode);
-    if (state.kind !== "active") return undefined;
-    const { document, effectiveMode } = state;
+    if (state.kind === "unmanaged") return undefined;
 
     let write: { tool: GovernedWriteTool; raw: string } | undefined;
     if (isToolCallEventType("write", event)) write = { tool: "write", raw: event.input.path };
     else if (isToolCallEventType("edit", event)) write = { tool: "edit", raw: event.input.path };
+
+    let read: { tool: GovernedReadTool; raw: string | undefined } | undefined;
+    if (isToolCallEventType("read", event)) read = { tool: "read", raw: event.input.path };
+    else if (isToolCallEventType("grep", event)) read = { tool: "grep", raw: event.input.path };
+    else if (isToolCallEventType("find", event)) read = { tool: "find", raw: event.input.path };
+    else if (isToolCallEventType("ls", event)) read = { tool: "ls", raw: event.input.path };
+
+    const governed = write ?? read;
+    if (!governed) return undefined;
+
+    // A present but unusable spec (invalid_spec / unsupported_spec_version) fails
+    // closed regardless of the requested mode: writes are blocked with the state's
+    // diagnostics, discovery reads proceed so the user can fix the document
+    // (ADR 0028). The recorded mode is the requested one — there is no effective
+    // mode without a validated spec, and the block does not depend on it.
+    if (state.kind !== "active") {
+      const decision = classifyBrokenSpec(state, governed.tool);
+      return applyDecision(
+        ctx,
+        event.toolCallId,
+        governed.tool,
+        displayOf(governed.raw),
+        requestedMode,
+        decision,
+      );
+    }
+
+    const { document, effectiveMode } = state;
     if (write) {
       const norm = normalizeTarget(write.raw, ctx.cwd);
       const decision = classifyWrite(document, effectiveMode, norm.ok ? norm.path : null);
@@ -341,11 +375,6 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
       );
     }
 
-    let read: { tool: GovernedReadTool; raw: string | undefined } | undefined;
-    if (isToolCallEventType("read", event)) read = { tool: "read", raw: event.input.path };
-    else if (isToolCallEventType("grep", event)) read = { tool: "grep", raw: event.input.path };
-    else if (isToolCallEventType("find", event)) read = { tool: "find", raw: event.input.path };
-    else if (isToolCallEventType("ls", event)) read = { tool: "ls", raw: event.input.path };
     if (read) {
       const target = resolveDiscoveryTarget(read.raw, ctx.cwd);
       const decision = classifyDiscovery(document, effectiveMode, target);
@@ -374,11 +403,15 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
   });
 
   // Steward identity: append the root-first trusted governance block to pi's
-  // system prompt, only while active. Absent in unmanaged and blocked states.
+  // system prompt while active, or the short broken-spec note when the spec is
+  // present but unusable, so the session knows writes are blocked and why. Absent
+  // only in the unmanaged state.
   pi.on("before_agent_start", async (event, ctx) => {
     const state = detectRepositoryState(ctx.cwd, requestedMode);
-    if (state.kind !== "active") return undefined;
-    return { systemPrompt: `${event.systemPrompt}\n\n${composeStewardPrompt(state)}` };
+    if (state.kind === "unmanaged") return undefined;
+    const block =
+      state.kind === "active" ? composeStewardPrompt(state) : composeBrokenSpecNote(state);
+    return { systemPrompt: `${event.systemPrompt}\n\n${block}` };
   });
 
   pi.registerCommand("orca", {

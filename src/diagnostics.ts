@@ -42,3 +42,20 @@ export interface Diagnostic {
   /** Extra structured detail (e.g. the duplicated id or conflicting scope). */
   detail?: Record<string, unknown>;
 }
+
+/**
+ * One diagnostic as a single readable line: `[reason] at location: message`, with
+ * the location omitted when the problem cannot be anchored to a node. Shared by
+ * every surface that shows diagnostics — `/orca` status, the broken-spec block
+ * reason, and the steward note — so a user reading a block message and a user
+ * reading `/orca` see the same text for the same problem.
+ */
+export function formatDiagnostic(diagnostic: Diagnostic): string {
+  const location =
+    diagnostic.pointer !== undefined && diagnostic.pointer !== ""
+      ? ` at ${diagnostic.pointer}`
+      : diagnostic.path
+        ? ` at ${diagnostic.path}`
+        : "";
+  return `[${diagnostic.reason}]${location}: ${diagnostic.message}`;
+}

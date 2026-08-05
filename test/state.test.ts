@@ -78,6 +78,23 @@ describe("detectRepositoryState", () => {
     }
   });
 
+  it("states what a broken spec actually enforces, so status cannot contradict behavior", () => {
+    // `/orca` reads these lines; `classifyBrokenSpec` implements them. Both broken
+    // states make the same claim: writes blocked in both modes, reads available.
+    for (const fixture of ["duplicate-agent-id", "unsupported-spec-version"] as const) {
+      writeSpec(dir, orcaspec.loadFixtureSource(fixture));
+      const lines = formatStatusLines(detectRepositoryState(dir)).join("\n");
+      expect(lines, `${fixture}: names the block`).toContain("write and edit are BLOCKED");
+      expect(lines, `${fixture}: covers delegation`).toContain("orca_delegate is unavailable");
+      expect(lines, `${fixture}: covers both modes`).toContain(
+        "advisory and enforce modes alike",
+      );
+      expect(lines, `${fixture}: reads proceed`).toContain(
+        "Discovery reads (read, grep, find, ls) proceed",
+      );
+    }
+  });
+
   it("reports unsupported_spec_version identically in both modes", () => {
     writeSpec(dir, orcaspec.loadFixtureSource("unsupported-spec-version"));
     const advisory = detectRepositoryState(dir, "advisory");

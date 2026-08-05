@@ -128,13 +128,24 @@ function text(body: string, details: ResolveToolDetails): AgentToolResult<Resolv
   return { content: [{ type: "text", text: body }], details };
 }
 
+/**
+ * The result when governance is not active. `unmanaged` is simply nothing to route
+ * against; a broken spec is a BLOCK — the same fail-closed decision the `tool_call`
+ * handler applies to a direct write (ADR 0028) — so it leads with that rather than
+ * with unavailability, and the delegation never spawns a session. Either way the
+ * full status lines follow, so the reason and `/orca` agree.
+ */
 function inactiveResult(state: RepositoryState): AgentToolResult<ResolveToolDetails> {
-  const body = [
-    "Orca routing is unavailable: the repository is not under active governance.",
-    "",
-    ...formatStatusLines(state),
-  ].join("\n");
-  return text(body, { kind: "inactive", state: state.kind });
+  const lead =
+    state.kind === "unmanaged"
+      ? "Orca routing is unavailable: the repository is not under active governance."
+      : `Orca blocked this call: the OrcaSpec document is present but unusable (${state.kind}), so no ` +
+        "owner can be resolved and no write can be authorized. Delegation is blocked in advisory and " +
+        "enforce modes alike; discovery reads still work, so read the spec and report what is wrong.";
+  return text([lead, "", ...formatStatusLines(state)].join("\n"), {
+    kind: "inactive",
+    state: state.kind,
+  });
 }
 
 function invalidResult(
@@ -333,6 +344,7 @@ function manifestLine(paths: string[]): string {
     ? `Observed changed paths (${paths.length}): ${paths.join(", ")}`
     : "Observed changed paths: (none).";
 }
+
 
 /**
  * Render how the steward re-delegates after a `needs_scope` outcome (ADR 0008).

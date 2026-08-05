@@ -332,12 +332,186 @@ describe("steward governance handlers", () => {
     expect(read).toBeUndefined();
   });
 
-  it("intercepts nothing in a blocked (invalid_spec) repository", async () => {
+  it("intercepts nothing across every governed tool when unmanaged, and records no event", async () => {
+    // Only the absence of a spec is pass-through. This is the boundary the
+    // fail-closed broken-spec states must NOT creep across.
     const { pi, registered } = makeApi();
     orcaPi(pi as never);
-    writeSpec("duplicate-agent-id"); // invalid_spec
-    const result = await only(registered, "tool_call")(writeEvent("apps/web/app.tsx"), makeCtx(dir));
-    expect(result).toBeUndefined();
+    const handler = only(registered, "tool_call");
+    const ctx = makeCtx(dir);
+    for (const event of [
+      writeEvent("secrets/prod.key"),
+      editEvent("apps/web/app.tsx"),
+      { type: "tool_call", toolName: "read", toolCallId: "r", input: { path: "secrets/prod.key" } },
+      { type: "tool_call", toolName: "grep", toolCallId: "g", input: { pattern: "x", path: "secrets" } },
+      { type: "tool_call", toolName: "find", toolCallId: "f", input: { pattern: "*", path: "secrets" } },
+      { type: "tool_call", toolName: "ls", toolCallId: "l", input: {} },
+    ]) {
+      expect(await handler(event, ctx), (event as { toolName: string }).toolName).toBeUndefined();
+    }
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+
+    const statusCtx = makeCtx(dir);
+    await registered.commands.get("orca")!.handler("", statusCtx);
+    const status = (statusCtx.ui.setWidget.mock.calls[0]?.[1] as string[]).join("\n");
+    expect(status).toContain("no tool interception");
+    expect(status).not.toContain("Governance events");
+  });
+
+  // --- Fail-closed governance on a broken spec (Phase 1) -------------------
+
+  it("blocks a write in invalid_spec in BOTH requested modes, carrying a spec diagnostic", async () => {
+    for (const requested of ["advisory", "enforce"] as const) {
+      const { pi, registered } = makeApi();
+      orcaPi(pi as never);
+      writeSpec("duplicate-agent-id"); // invalid_spec
+      const handler = only(registered, "tool_call");
+      // advisory is the default requested mode; enforce is set through /orca.
+      if (requested === "enforce") {
+        await registered.commands.get("orca")!.handler("mode enforce", makeCtx(dir));
+      }
+      const ctx = makeCtx(dir);
+      const result = (await handler(writeEvent("apps/web/app.tsx"), ctx)) as {
+        block?: boolean;
+        reason?: string;
+      };
+      expect(result?.block, `${requested}: blocked`).toBe(true);
+      expect(result?.reason, `${requested}: names the state`).toContain("invalid_spec");
+      // At least one diagnostic from the state reaches the model.
+      expect(result?.reason, `${requested}: carries a diagnostic`).toContain(
+        "semantic.duplicate_agent_id",
+      );
+      expect(ctx.ui.notify, `${requested}: notifies the human`).toHaveBeenCalled();
+    }
+  });
+
+  it("blocks an edit in unsupported_spec_version in BOTH modes, naming found vs supported version", async () => {
+    for (const requested of ["advisory", "enforce"] as const) {
+      const { pi, registered } = makeApi();
+      orcaPi(pi as never);
+      writeSpec("unsupported-spec-version"); // declares 0.2; runtime supports 0.1
+      const handler = only(registered, "tool_call");
+      if (requested === "enforce") {
+        await registered.commands.get("orca")!.handler("mode enforce", makeCtx(dir));
+      }
+      const result = (await handler(editEvent("apps/web/app.tsx"), makeCtx(dir))) as {
+        block?: boolean;
+        reason?: string;
+      };
+      expect(result?.block, `${requested}: blocked`).toBe(true);
+      expect(result?.reason, `${requested}: names the state`).toContain("unsupported_spec_version");
+      expect(result?.reason, `${requested}: names the found version`).toContain(
+        "declares spec_version '0.2'",
+      );
+      expect(result?.reason, `${requested}: names the supported version`).toContain("supports '0.1'");
+    }
+  });
+
+  it("lets discovery reads proceed in both broken states so the spec can be diagnosed", async () => {
+    for (const fixture of ["duplicate-agent-id", "unsupported-spec-version"] as const) {
+      const { pi, registered } = makeApi();
+      orcaPi(pi as never);
+      writeSpec(fixture);
+      const handler = only(registered, "tool_call");
+      for (const event of [
+        { type: "tool_call", toolName: "read", toolCallId: "r", input: { path: ".orca/orca.yaml" } },
+        { type: "tool_call", toolName: "grep", toolCallId: "g", input: { pattern: "x", path: "." } },
+        { type: "tool_call", toolName: "find", toolCallId: "f", input: { pattern: "*", path: "." } },
+        { type: "tool_call", toolName: "ls", toolCallId: "l", input: { path: "." } },
+      ]) {
+        const result = await handler(event, makeCtx(dir));
+        expect(result, `${fixture} ${event.toolName}`).toBeUndefined();
+      }
+    }
+  });
+
+  it("records a broken-spec block under /orca so status and enforcement agree", async () => {
+    const { pi, registered } = makeApi();
+    orcaPi(pi as never);
+    writeSpec("duplicate-agent-id");
+    await only(registered, "tool_call")(writeEvent("apps/web/app.tsx"), makeCtx(dir));
+
+    const statusCtx = makeCtx(dir);
+    await registered.commands.get("orca")!.handler("", statusCtx);
+    const status = (statusCtx.ui.setWidget.mock.calls[0]?.[1] as string[]).join("\n");
+    // The status claims writes are blocked and reads proceed; the block above is
+    // the same behavior, recorded as a governance event.
+    expect(status).toContain("invalid_spec");
+    expect(status).toContain("write and edit are BLOCKED");
+    expect(status).toContain("Discovery reads");
+    expect(status).toContain("Governance events");
+    expect(status).toContain("blocked write");
+  });
+
+  it("blocks writes on a spec that is empty, malformed, or not a mapping (not just a bad fixture)", async () => {
+    // A hand-broken file is the common real case; each one must land in a blocked
+    // state and fail closed rather than throwing out of the handler.
+    for (const source of ["", "   \n\n", "- just\n- a\n- list\n", "  not yaml: [[[\n"]) {
+      const { pi, registered } = makeApi();
+      orcaPi(pi as never);
+      mkdirSync(join(dir, ".orca"), { recursive: true });
+      writeFileSync(join(dir, ".orca", "orca.yaml"), source);
+      const handler = only(registered, "tool_call");
+      const label = JSON.stringify(source);
+      const result = (await handler(writeEvent("a.txt"), makeCtx(dir))) as { block?: boolean };
+      expect(result?.block, `${label}: in-repo write blocked`).toBe(true);
+      // A write whose path escapes the repository is blocked for the same reason;
+      // there is no spec to authorize it against either way.
+      const escaping = (await handler(writeEvent("../../etc/passwd"), makeCtx(dir))) as {
+        block?: boolean;
+      };
+      expect(escaping?.block, `${label}: escaping write blocked`).toBe(true);
+      // Reads stay available so the user can look at the broken file.
+      const read = await handler(
+        { type: "tool_call", toolName: "read", toolCallId: "r", input: { path: ".orca/orca.yaml" } },
+        makeCtx(dir),
+      );
+      expect(read, `${label}: read proceeds`).toBeUndefined();
+    }
+  });
+
+  it("does not intercept bash in a broken state, exactly as it does not when active", async () => {
+    // Decided out of scope for fail-closed governance: the parent's bash is not
+    // governed by this handler in ANY state, so a broken spec must not claim to
+    // block shell-mediated writes it cannot see. Parity with `active` is the point.
+    const bash = {
+      type: "tool_call",
+      toolName: "bash",
+      toolCallId: "b",
+      input: { command: "echo hi > a.txt" },
+    };
+    for (const fixture of ["duplicate-agent-id", "multi-owner"] as const) {
+      const { pi, registered } = makeApi();
+      orcaPi(pi as never);
+      writeSpec(fixture);
+      expect(await only(registered, "tool_call")(bash, makeCtx(dir)), fixture).toBeUndefined();
+    }
+  });
+
+  it("orca_delegate returns a blocked result in both broken states rather than crashing", async () => {
+    for (const fixture of ["duplicate-agent-id", "unsupported-spec-version"] as const) {
+      const { pi, registered } = makeApi();
+      orcaPi(pi as never);
+      writeSpec(fixture);
+      const result = await registered.tools.get("orca_delegate")!.execute(
+        "d-broken",
+        { task: "restyle the button", paths: ["apps/web/app.tsx"] },
+        undefined,
+        undefined,
+        { cwd: dir },
+      );
+      const body = result.content.map((c) => c.text).join("\n");
+      const kind = fixture === "duplicate-agent-id" ? "invalid_spec" : "unsupported_spec_version";
+      // The result LEADS with the block, naming the state — not with a generic
+      // "routing unavailable", which would read like an unmanaged repository.
+      const lead = body.split("\n")[0];
+      expect(lead, `${fixture}: leads with the block`).toContain("blocked");
+      expect(lead, `${fixture}: lead names the state`).toContain(kind);
+      expect(body, `${fixture}: explains both modes`).toContain("advisory and enforce modes alike");
+      expect(result.details?.kind, `${fixture}: details kind`).toBe("inactive");
+      // No session was spawned and nothing was written.
+      expect(existsSync(join(dir, "apps", "web", "app.tsx")), `${fixture}: no write`).toBe(false);
+    }
   });
 
   // --- Steward identity composition ---------------------------------------
@@ -358,13 +532,36 @@ describe("steward governance handlers", () => {
     );
   });
 
-  it("injects no steward prompt in unmanaged or blocked states", async () => {
+  it("injects no steward prompt in an unmanaged repository", async () => {
     const { pi, registered } = makeApi();
     orcaPi(pi as never);
     const handler = only(registered, "before_agent_start");
-    expect(await handler({ systemPrompt: "BASE" }, makeCtx(dir))).toBeUndefined(); // unmanaged
-    writeSpec("duplicate-agent-id");
-    expect(await handler({ systemPrompt: "BASE" }, makeCtx(dir))).toBeUndefined(); // invalid_spec
+    expect(await handler({ systemPrompt: "BASE" }, makeCtx(dir))).toBeUndefined();
+  });
+
+  it("appends a short broken-spec note (not the full steward prompt) in both broken states", async () => {
+    for (const fixture of ["duplicate-agent-id", "unsupported-spec-version"] as const) {
+      const { pi, registered } = makeApi();
+      orcaPi(pi as never);
+      writeSpec(fixture);
+      const result = (await only(registered, "before_agent_start")(
+        { systemPrompt: "BASE PROMPT" },
+        makeCtx(dir),
+      )) as { systemPrompt?: string };
+      const prompt = result.systemPrompt ?? "";
+      expect(prompt.startsWith("BASE PROMPT"), `${fixture}: appends to pi's prompt`).toBe(true);
+      expect(prompt, `${fixture}: names the state`).toContain(
+        fixture === "duplicate-agent-id" ? "invalid_spec" : "unsupported_spec_version",
+      );
+      expect(prompt, `${fixture}: states writes are blocked`).toContain("write");
+      expect(prompt, `${fixture}: states reads still work`).toContain("read");
+      // The full active-governance steward prompt does NOT apply: there is no
+      // validated ownership map to describe.
+      expect(prompt, `${fixture}: no discovery-scope section`).not.toContain(
+        "## Discovery read scope",
+      );
+      expect(prompt, `${fixture}: no delegation directive`).not.toContain("## Delegation directive");
+    }
   });
 
   // --- Tool surface --------------------------------------------------------
