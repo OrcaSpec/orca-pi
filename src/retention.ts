@@ -1,5 +1,7 @@
 import { lstatSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import type { OrcaSpecDocument } from "orcaspec";
+import { readRuntimeOverlay, type RuntimeOverlayResult } from "./runtime-overlay";
 import {
   ACCEPTED_PATCH_SUFFIX,
   EVIDENCE_PATCH_SUFFIX,
@@ -9,10 +11,70 @@ import {
   VALIDATOR_OUTPUT_SUFFIX,
 } from "./staging";
 
-/** Age-based evidence retention (hardening plan, Phase 6). */
+/**
+ * Age-based evidence retention (hardening plan, Phase 6).
+ *
+ * The state directory accumulates. A delegation that does not land preserves its
+ * cumulative patch, a `needs_scope` stop preserves the completed owners' reusable one,
+ * a refused acceptance gate preserves its validator output, and a crash leaves whatever
+ * it had written. All of it is EVIDENCE — useful for exactly as long as something can
+ * still point a user at it — so this module expires it on two conditions that must both
+ * hold: the file is past a window, and no retained history entry references it.
+ *
+ * Both halves matter, and the second is the load-bearing one. Age alone would delete
+ * the patch a `/orca` history line is still offering as a recovery route, so
+ * reference-safety is what makes the sweep unable to leave a dangling pointer;
+ * `DelegationHistory.referencedArtifacts` is the operative definition of "referenced",
+ * and age only ever reclaims ORPHANS — crash leftovers, and the artifacts of sessions
+ * whose entries have aged past the history's capacity.
+ *
+ * Two things are exempt on principle rather than by age. Held governance patches are
+ * never swept, whatever their age and whether or not any history remembers the hold:
+ * they are outstanding proposals, and a rule that depended on remembering would delete
+ * one precisely when the runtime had forgotten it was owed. And a `worktrees/` checkout
+ * is not retention's to remove — staging already deletes it on every exit path and
+ * reclaims a crashed one on the next run.
+ *
+ * The sweep is OPPORTUNISTIC and its failures are inert: it runs at extension
+ * activation (`index.ts`), where no delegation is in flight, so "a sweep failure never
+ * blocks a delegation" is a fact about where it is called from rather than a promise
+ * about how carefully it handles errors. Nothing here throws, either way.
+ *
+ * One residual worth stating: {@link defaultStateRoot} is pi's agent directory, which is
+ * shared across every repository on the machine, while the reference set comes from the
+ * ONE session doing the sweeping. A 30-day-old artifact belonging to another repository's
+ * still-open session is therefore reclaimable. It takes a session left open longer than
+ * the window with the delegation still inside its visible history, it costs a pointer to
+ * evidence rather than anything in a checkout, and an embedding that gives each
+ * repository its own `stateRoot` has no exposure at all.
+ */
 
 /** Milliseconds in one retention day. */
 const DAY_MS = 86_400_000;
+
+/**
+ * How long preserved evidence is kept when a repository does not say otherwise. Thirty
+ * days is long enough that a patch is still there when someone comes back to the work
+ * after a fortnight away, and short enough that the state directory does not grow
+ * without bound.
+ */
+export const DEFAULT_RETENTION_DAYS = 30;
+
+/**
+ * The window in force for a repository, or `undefined` when nothing may be swept.
+ *
+ * An UNUSABLE overlay is the interesting case, and it does not sweep. The window is
+ * configured in the very file that failed to validate, so the runtime does not know
+ * whether the user widened it; and since an invalid overlay already refuses every
+ * delegation (`runtime-overlay.ts`), nothing new is accumulating to justify guessing.
+ * Deleting evidence is the one action here that cannot be taken back, so the unreadable
+ * case declines to take it.
+ */
+export function retentionDaysFor(overlay: RuntimeOverlayResult): number | undefined {
+  if (overlay.kind === "invalid") return undefined;
+  if (overlay.kind === "absent") return DEFAULT_RETENTION_DAYS;
+  return overlay.overlay.retention?.days ?? DEFAULT_RETENTION_DAYS;
+}
 
 /**
  * One directory of the state root retention owns, and which of its files it may
@@ -122,4 +184,62 @@ export function sweepPreservedArtifacts(input: RetentionSweepInput): RetentionSw
     }
   }
   return { removed: removed.sort(), failures };
+}
+
+/** What an activation-time sweep needs to know about the repository it is sweeping for. */
+export interface RetentionSweepRequest {
+  /** The user's checkout, where the overlay carrying the window is read from. */
+  cwd: string;
+  /** The validated document the overlay is checked against (`runtime-overlay.ts`). */
+  document: OrcaSpecDocument;
+  /** Root of the runtime state directory holding the artifacts. */
+  stateRoot: string;
+  now: number;
+  /** Every artifact the visible history can still point at; see `delegation-entry.ts`. */
+  referenced: Iterable<string>;
+}
+
+/**
+ * The whole sweep as activation performs it: read the window, apply it, and never let
+ * any of it reach the caller as a throw. `undefined` means no sweep happened — the
+ * overlay was unusable, so no window could be trusted (see {@link retentionDaysFor}).
+ *
+ * The overlay read is inside the guard on purpose. `readRuntimeOverlay` touches the
+ * filesystem, and a `.orca/runtime.yaml` that exists but cannot be read would otherwise
+ * throw out of a `session_start` handler and break activation over housekeeping.
+ */
+export function runRetentionSweep(request: RetentionSweepRequest): RetentionSweep | undefined {
+  try {
+    const retainDays = retentionDaysFor(readRuntimeOverlay(request.cwd, request.document));
+    if (retainDays === undefined) return undefined;
+    return sweepPreservedArtifacts({
+      stateRoot: request.stateRoot,
+      now: request.now,
+      retainDays,
+      referenced: request.referenced,
+    });
+  } catch (error) {
+    return {
+      removed: [],
+      failures: [`the retention sweep could not run (${messageOf(error)})`],
+    };
+  }
+}
+
+/**
+ * The one line a sweep contributes to `/orca`, or nothing.
+ *
+ * Silent unless something actually happened, which is the common case by a wide margin:
+ * most activations find every artifact either young or referenced, and a status surface
+ * that announced "expired 0 files" on every session start would be pure noise. When
+ * files did go, or when the sweep could not do its job, the user gets exactly one line
+ * — enough to explain a missing patch or a state directory that is not shrinking.
+ */
+export function retentionSweepLine(sweep: RetentionSweep | undefined): string | undefined {
+  if (!sweep) return undefined;
+  if (sweep.removed.length === 0 && sweep.failures.length === 0) return undefined;
+  const expired = `expired ${sweep.removed.length} preserved artifact(s) past the retention window`;
+  const failed =
+    sweep.failures.length > 0 ? `; ${sweep.failures.length} could not be removed` : "";
+  return `Retention: ${expired}${failed}.`;
 }

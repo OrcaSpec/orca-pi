@@ -60,6 +60,42 @@ describe("a usable overlay normalizes to exactly what the runner needs", () => {
     expect(result.overlay.validations).toEqual({});
   });
 
+  it("carries a declared retention window through, and reports none when absent", () => {
+    const configured = load("schema_version: 1\nretention:\n  days: 7\n");
+    const silent = load("schema_version: 1\n");
+
+    expect(configured.kind).toBe("loaded");
+    if (configured.kind !== "loaded") return;
+    expect(configured.overlay.retention, "a declared window is the user's number").toEqual({
+      days: 7,
+    });
+    expect(silent.kind).toBe("loaded");
+    if (silent.kind !== "loaded") return;
+    expect(
+      silent.overlay.retention,
+      "an absent section is absent, not a window the loader invented",
+    ).toBeUndefined();
+  });
+
+  it("loads a retention window alongside validators", () => {
+    const result = load(
+      [
+        "schema_version: 1",
+        "retention:",
+        "  days: 90",
+        "validations:",
+        "  web:",
+        "    - program: npm",
+        "      timeout_seconds: 30",
+      ].join("\n"),
+    );
+
+    expect(result.kind).toBe("loaded");
+    if (result.kind !== "loaded") return;
+    expect(result.overlay.retention).toEqual({ days: 90 });
+    expect(result.overlay.validations.web.length, "retention does not disturb validators").toBe(1);
+  });
+
   it("defaults the optional fields: no args, and the checkout root as cwd", () => {
     const result = load(
       ["schema_version: 1", "validations:", "  web:", "    - program: ./bin/test", "      timeout_seconds: 30"].join("\n"),
@@ -279,6 +315,55 @@ describe("an unusable overlay is refused with an actionable diagnostic", () => {
     {
       name: "a quoted timeout",
       source: 'schema_version: 1\nvalidations:\n  web:\n    - program: t\n      timeout_seconds: "5"\n',
+      reason: "overlay.invalid_type",
+    },
+    // Shape: the retention window (hardening plan, Phase 6). Retention is configured
+    // in the same closed schema as everything else, so a misspelled or nonsensical
+    // window is refused exactly as a misspelled timeout is — and, like every other
+    // unusable overlay, it blocks the delegation rather than being quietly ignored.
+    {
+      name: "a retention section that configures nothing",
+      source: "schema_version: 1\nretention: {}\n",
+      reason: "overlay.missing_required",
+    },
+    {
+      name: "a misspelled retention field",
+      source: "schema_version: 1\nretention:\n  day: 7\n",
+      reason: "overlay.unknown_field",
+    },
+    {
+      name: "an unknown field beside a valid window",
+      source: "schema_version: 1\nretention:\n  days: 7\n  sweep: false\n",
+      reason: "overlay.unknown_field",
+    },
+    {
+      name: "a retention window of zero days",
+      source: "schema_version: 1\nretention:\n  days: 0\n",
+      reason: "overlay.invalid_type",
+    },
+    {
+      name: "a negative retention window",
+      source: "schema_version: 1\nretention:\n  days: -7\n",
+      reason: "overlay.invalid_type",
+    },
+    {
+      name: "a fractional retention window",
+      source: "schema_version: 1\nretention:\n  days: 1.5\n",
+      reason: "overlay.invalid_type",
+    },
+    {
+      name: "a quoted retention window",
+      source: 'schema_version: 1\nretention:\n  days: "7"\n',
+      reason: "overlay.invalid_type",
+    },
+    {
+      name: "a retention window beyond the maximum",
+      source: "schema_version: 1\nretention:\n  days: 100000\n",
+      reason: "overlay.invalid_type",
+    },
+    {
+      name: "retention as a scalar",
+      source: "schema_version: 1\nretention: 7\n",
       reason: "overlay.invalid_type",
     },
     // Meaning: the overlay against the document that will run, and the checkout.

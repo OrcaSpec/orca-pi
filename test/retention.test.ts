@@ -2,7 +2,14 @@ import { chmodSync, existsSync, mkdirSync, utimesSync, writeFileSync } from "nod
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeStateRoot } from "./git-fixture";
-import { sweepPreservedArtifacts } from "../src/retention";
+import type { OrcaSpecDocument } from "orcaspec";
+import {
+  DEFAULT_RETENTION_DAYS,
+  retentionDaysFor,
+  retentionSweepLine,
+  runRetentionSweep,
+  sweepPreservedArtifacts,
+} from "../src/retention";
 
 /**
  * The one double in this file, standing in for the FILESYSTEM — a boundary the
@@ -281,5 +288,171 @@ describe("a held governance patch is exempt whatever its age", () => {
     expect(existsSync(held), "the held patch survives a sweep that could not see its hold").toBe(
       true,
     );
+  });
+});
+
+describe("which window applies, and when there is no sweeping at all", () => {
+  it("uses the default window when the repository declared no overlay", () => {
+    expect(retentionDaysFor({ kind: "absent" })).toBe(DEFAULT_RETENTION_DAYS);
+  });
+
+  it("uses the default window when an overlay configures no retention", () => {
+    expect(
+      retentionDaysFor({ kind: "loaded", overlay: { schemaVersion: 1, validations: {} } }),
+      "declaring validators is not declaring a retention policy",
+    ).toBe(DEFAULT_RETENTION_DAYS);
+  });
+
+  it("uses the window the overlay declares", () => {
+    expect(
+      retentionDaysFor({
+        kind: "loaded",
+        overlay: { schemaVersion: 1, validations: {}, retention: { days: 7 } },
+      }),
+    ).toBe(7);
+  });
+
+  it("does not sweep at all while the overlay is unusable", () => {
+    // The overlay being invalid already refuses the delegation (`runtime-overlay.ts`),
+    // so nothing new accumulates; what must not happen is deleting evidence under a
+    // window the user may have widened in the very file that failed to parse.
+    expect(
+      retentionDaysFor({ kind: "invalid", diagnostics: [] }),
+      "a window Orca could not read is not a reason to delete anything",
+    ).toBeUndefined();
+  });
+});
+
+/**
+ * The activation-time sweep: everything `index.ts` calls in one place, so the promise
+ * that a sweep can never break a session start is pinned at the seam that makes it.
+ */
+describe("the sweep as activation runs it", () => {
+  /** A document with one agent, so an overlay has something valid to name. */
+  function document(): OrcaSpecDocument {
+    return {
+      spec_version: "0.1",
+      repository: { id: "018f4f72-0000-7000-8000-0000000000aa" },
+      administration: { approvers: [{ provider: "orca-local", principal: "test" }] },
+      steward: { discovery: { read: { allow: ["**"], deny: [] } } },
+      protected_denies: {},
+      agents: [
+        {
+          id: "web",
+          name: "web",
+          description: "Owns apps/web/**.",
+          ownership: ["apps/web/**"],
+          permissions: { edit: { allow: ["apps/web/**"] } },
+        },
+      ],
+    };
+  }
+
+  /** A repository whose `.orca/runtime.yaml` holds `source`, or none when omitted. */
+  function repository(source?: string): string {
+    const dir = makeStateRoot();
+    if (source !== undefined) {
+      mkdirSync(join(dir, ".orca"), { recursive: true });
+      writeFileSync(join(dir, ".orca", "runtime.yaml"), source);
+    }
+    return dir;
+  }
+
+  function sweep(cwd: string, stateRoot: string, referenced: string[] = []) {
+    return runRetentionSweep({ cwd, document: document(), stateRoot, now: NOW, referenced });
+  }
+
+  it("expires an artifact past the window the overlay declares", () => {
+    const cwd = repository("schema_version: 1\nretention:\n  days: 5\n");
+    const stateRoot = makeStateRoot();
+    const expired = evidencePatch(stateRoot, "expired", 6);
+    const withinWindow = evidencePatch(stateRoot, "within", 4);
+
+    const result = sweep(cwd, stateRoot);
+
+    expect(result?.removed, "the declared window is the one applied").toEqual([expired]);
+    expect(existsSync(withinWindow)).toBe(true);
+  });
+
+  it("applies the default window when the repository has no overlay", () => {
+    const cwd = repository();
+    const stateRoot = makeStateRoot();
+    const expired = evidencePatch(stateRoot, "expired", DEFAULT_RETENTION_DAYS + 1);
+    const withinWindow = evidencePatch(stateRoot, "within", DEFAULT_RETENTION_DAYS - 1);
+
+    const result = sweep(cwd, stateRoot);
+
+    expect(result?.removed).toEqual([expired]);
+    expect(existsSync(withinWindow)).toBe(true);
+  });
+
+  it("does not sweep while the overlay is invalid", () => {
+    const cwd = repository("schema_version: 1\nretention:\n  days: 0\n");
+    const stateRoot = makeStateRoot();
+    const ancient = evidencePatch(stateRoot, "ancient", 900);
+
+    const result = sweep(cwd, stateRoot);
+
+    expect(result, "an unusable overlay means no sweep happened").toBeUndefined();
+    expect(existsSync(ancient), "nothing is deleted under a window Orca could not read").toBe(true);
+  });
+
+  it("keeps an artifact the caller's reference set names, whatever its age", () => {
+    const cwd = repository();
+    const stateRoot = makeStateRoot();
+    const referenced = evidencePatch(stateRoot, "referenced", 900);
+
+    const result = sweep(cwd, stateRoot, [referenced]);
+
+    expect(result?.removed).toEqual([]);
+    expect(existsSync(referenced)).toBe(true);
+  });
+
+  it("reports rather than throws when the overlay itself cannot be read", () => {
+    const cwd = repository("schema_version: 1\n");
+    const overlay = join(cwd, ".orca", "runtime.yaml");
+    chmodSync(overlay, 0o000);
+    const stateRoot = makeStateRoot();
+    const ancient = evidencePatch(stateRoot, "ancient", 900);
+
+    let result: ReturnType<typeof sweep>;
+    expect(() => {
+      result = sweep(cwd, stateRoot);
+    }, "activation must survive anything the sweep hits").not.toThrow();
+
+    chmodSync(overlay, 0o644);
+    if (existsSync(ancient)) {
+      expect(result!.failures.length, "the reason is reported, not swallowed").toBe(1);
+      expect(result!.removed).toEqual([]);
+    }
+  });
+});
+
+describe("what the sweep says on the status surface", () => {
+  it("says nothing at all when it removed nothing and hit nothing", () => {
+    expect(
+      retentionSweepLine({ removed: [], failures: [] }),
+      "housekeeping that found no work is not news",
+    ).toBeUndefined();
+    expect(retentionSweepLine(undefined), "a sweep that did not run says nothing").toBeUndefined();
+  });
+
+  it("reports the count in one line when it expired something", () => {
+    const line = retentionSweepLine({
+      removed: ["/state/patches/a.patch", "/state/validators/a.log"],
+      failures: [],
+    });
+
+    expect(line).toBe("Retention: expired 2 preserved artifact(s) past the retention window.");
+  });
+
+  it("names what it could not do in the same one line", () => {
+    const line = retentionSweepLine({
+      removed: ["/state/patches/a.patch"],
+      failures: ["/state/patches could not be listed (EACCES)"],
+    });
+
+    expect(line, "one line, both halves").toContain("expired 1 preserved artifact(s)");
+    expect(line).toContain("1 could not be removed");
   });
 });

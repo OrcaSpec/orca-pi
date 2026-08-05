@@ -22,8 +22,9 @@ import { parseRestrictedYaml, type YamlSubject } from "./yaml";
  * - Because it is runtime configuration, the overlay can NARROW or CONFIGURE what
  *   a delegation must satisfy, and can never expand it. There is no field through
  *   which an overlay could grant a path, an operation, or an agent — it names
- *   programs to run and nothing else, so a compiled grant is unaffected by its
- *   presence (`resolver.ts` never reads it).
+ *   programs to run and tunes how long the runtime keeps its own evidence
+ *   (`retention`, Phase 6), so a compiled grant is unaffected by its presence
+ *   (`resolver.ts` never reads it).
  *
  * Loading mirrors the OrcaSpec pipeline in `load.ts`, phase for phase, so a user
  * who has debugged one file already knows how the other behaves: restricted-YAML
@@ -44,6 +45,11 @@ import { parseRestrictedYaml, type YamlSubject } from "./yaml";
  * - `timeout_seconds` is REQUIRED. A validator with no declared time budget is
  *   exactly the ambiguity fail-closed governance must not have: it can hang a
  *   promotion forever, and no default this module invents would be the user's.
+ * - `retention.days` is REQUIRED once a `retention` section exists, for the same
+ *   reason: a section that configures nothing is a typo, not a request for the
+ *   default. Omitting the section entirely is how a repository asks for the default,
+ *   and it is the only way — which keeps "the user wrote a window" and "the user said
+ *   nothing" distinguishable rather than collapsing into one value.
  * - `cwd` is optional, repository-relative, and must resolve inside the checkout.
  *   A validator runs in the STAGED checkout, where its own writes are inert
  *   (promotion applies committed work only). A `cwd` that escaped — `..`, or an
@@ -62,6 +68,13 @@ export const RUNTIME_OVERLAY_SCHEMA_VERSION = 1;
 
 /** Upper bound on a declared timeout, so a typo cannot wedge a promotion for a day. */
 export const MAX_TIMEOUT_SECONDS = 3600;
+
+/**
+ * Upper bound on a declared retention window (ten years). Not a policy about how long
+ * evidence is worth keeping — it is the same guard as {@link MAX_TIMEOUT_SECONDS}, so a
+ * mistyped `days: 100000` is refused as a typo rather than silently meaning "forever".
+ */
+export const MAX_RETENTION_DAYS = 3650;
 
 /** How the overlay names itself in restricted-YAML diagnostics. */
 const OVERLAY_SUBJECT: YamlSubject = {
@@ -82,11 +95,28 @@ export interface ValidatorDeclaration {
   timeoutSeconds: number;
 }
 
+/**
+ * How long preserved evidence is kept (hardening plan, Phase 6). The only knob in the
+ * overlay that configures ORCA rather than naming a program to run, which is why it
+ * lives at the root beside `validations` rather than inside it: a retention window is
+ * one fact about the state directory, not something an agent can have its own of.
+ */
+export interface RetentionSettings {
+  /** The window in whole days; the sweep expires an artifact older than this. */
+  days: number;
+}
+
 /** The validated overlay: validators per declared OrcaSpec agent id. */
 export interface RuntimeOverlay {
   schemaVersion: typeof RUNTIME_OVERLAY_SCHEMA_VERSION;
   /** Declaration-ordered validators, keyed by the agent id that owns them. */
   validations: Record<string, ValidatorDeclaration[]>;
+  /**
+   * The declared retention window, or absent when the repository did not configure one
+   * — absent rather than defaulted, so the loader reports what the user WROTE and the
+   * default belongs to the one module that applies it (`retention.ts`).
+   */
+  retention?: RetentionSettings;
 }
 
 /**
@@ -120,6 +150,14 @@ const overlaySchema = {
   required: ["schema_version"],
   properties: {
     schema_version: { type: "integer" },
+    retention: {
+      type: "object",
+      additionalProperties: false,
+      required: ["days"],
+      properties: {
+        days: { type: "integer", exclusiveMinimum: 0, maximum: MAX_RETENTION_DAYS },
+      },
+    },
     validations: {
       type: "object",
       additionalProperties: {
@@ -147,6 +185,7 @@ const overlaySchema = {
 /** The overlay exactly as authored, once the schema has accepted its shape. */
 interface RawOverlay {
   schema_version: number;
+  retention?: { days: number };
   validations?: Record<
     string,
     Array<{ program: string; args?: string[]; cwd?: string; timeout_seconds: number }>
@@ -196,7 +235,10 @@ function toDiagnostic(error: ErrorObject): Diagnostic {
         `Required field \`${missing}\` is missing at ${at}. ` +
           (missing === "timeout_seconds"
             ? "Every validator must declare its own time budget; Orca does not invent one."
-            : "See `.orca/runtime.yaml` in the Orca documentation for the declaration shape."),
+            : missing === "days"
+              ? "A `retention` section must state its window in days; a section that configures " +
+                "nothing is a mistake, not a request for the default."
+              : "See `.orca/runtime.yaml` in the Orca documentation for the declaration shape."),
         error.instancePath,
       );
     }
@@ -360,7 +402,14 @@ export function loadRuntimeOverlay(
       };
     });
   }
-  return { kind: "loaded", overlay: { schemaVersion: RUNTIME_OVERLAY_SCHEMA_VERSION, validations } };
+  return {
+    kind: "loaded",
+    overlay: {
+      schemaVersion: RUNTIME_OVERLAY_SCHEMA_VERSION,
+      validations,
+      retention: raw.retention && { days: raw.retention.days },
+    },
+  };
 }
 
 /**
