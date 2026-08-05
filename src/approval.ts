@@ -110,6 +110,18 @@ export function governanceHoldLine(hold: GovernanceHold, position?: number): str
   return `${marker} ${hold.held.paths.join(", ")} — "${hold.task}"${state} — patch: ${hold.held.patchPath}`;
 }
 
+/**
+ * One approval attempt as a transcript entry: the durable, visible trace of the user's
+ * decision, in the same words the action reported it in.
+ */
+export function approvalRecordLines(approval: GovernanceApproval): string[] {
+  return [
+    `Orca governance approval — ${approvalStateOf(approval)}: ${approval.paths.join(", ")}.`,
+    `Patch: ${approval.patchPath}`,
+    ...(approval.detail ? [`Git said: ${approval.detail}`] : []),
+  ];
+}
+
 /** One approval attempt in a few words: what it did, and when. */
 export function approvalStateOf(approval: GovernanceApproval): string {
   const verb = isSettled(approval)

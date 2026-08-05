@@ -1,11 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as orcaspec from "orcaspec";
 import orcaPi, { installOrca } from "../index";
-import { makeGitRepo, makeStateRoot } from "./git-fixture";
-import { DELEGATION_ENTRY_TYPE } from "../src/delegation-entry";
+import { git, makeGitRepo, makeStateRoot, snapshotTree } from "./git-fixture";
+import { APPROVAL_ENTRY_TYPE, DELEGATION_ENTRY_TYPE } from "../src/delegation-entry";
 import type { DelegationSession, DelegationSessionConfig } from "../src/delegation";
 
 // A minimal ExtensionAPI double that captures registrations. The extension's
@@ -384,6 +384,156 @@ describe("orca-pi extension entry", () => {
     } finally {
       rmSync(bare, { recursive: true, force: true });
     }
+  });
+
+  // --- Phase 3 (hardening): the explicit governance approval action -----------
+
+  /**
+   * A session that really writes its files through the grant-wrapped `write` tool, so
+   * the delegation produces a real held governance patch rather than a recorded claim.
+   */
+  function writingCreateSession(files: Record<string, string>) {
+    return async (config: DelegationSessionConfig): Promise<DelegationSession> => ({
+      prompt: async () => {
+        for (const [path, content] of Object.entries(files)) {
+          const write = config.tools.find((t) => t.name === "write")!;
+          await write.execute("t", { path, content } as never, undefined, undefined, {
+            cwd: config.cwd,
+          } as never);
+        }
+        const checkpoint = config.tools.find((t) => t.name === "orca_checkpoint")!;
+        await checkpoint.execute(
+          "t",
+          { status: "completed", summary: "overlay tightened" } as never,
+          undefined,
+          undefined,
+          { cwd: config.cwd } as never,
+        );
+      },
+      abort: () => {},
+    });
+  }
+
+  const USER_OVERLAY = "schema_version: 1\nvalidations: {}\n";
+  const AGENT_OVERLAY = "schema_version: 1\nvalidations: {}\n# tightened by the agent\n";
+
+  /** A managed repository whose one agent owns everything, governance included. */
+  function writeGovernedRepo(): void {
+    writeSpec("root-recursive-owner");
+    writeFileSync(join(dir, ".orca", "runtime.yaml"), USER_OVERLAY);
+    git(dir, "add", "-A");
+    git(dir, "-c", "user.name=F", "-c", "user.email=f@localhost", "commit", "-q", "-m", "seed");
+  }
+
+  /** Delegate a change to the governance overlay; it comes back held, never applied. */
+  async function delegateGovernanceChange(registered: Registered, ctx: unknown): Promise<void> {
+    await registered.tools.get("orca_delegate")!.execute(
+      "d1",
+      { task: "tighten the governance overlay", paths: [".orca/runtime.yaml"] },
+      undefined,
+      undefined,
+      ctx,
+    );
+  }
+
+  it("/orca lists a held governance change with the selector that approves it", async () => {
+    const { pi, registered } = makeApi();
+    installOrca(pi as never, {
+      createSession: writingCreateSession({ ".orca/runtime.yaml": AGENT_OVERLAY }),
+      stateRoot,
+    });
+    writeGovernedRepo();
+    await delegateGovernanceChange(registered, makeCtx(dir, true));
+
+    const statusCtx = makeCtx(dir, true);
+    await registered.commands.get("orca")!.handler("", statusCtx);
+    const status = orcaText(statusCtx);
+    expect(status).toContain("Governance changes awaiting your approval (1)");
+    expect(status).toContain("/orca approve");
+    expect(status).toContain(".orca/runtime.yaml");
+  });
+
+  it("/orca approve lands the held patch, persists the decision, and stops asking", async () => {
+    const { pi, registered } = makeApi();
+    installOrca(pi as never, {
+      createSession: writingCreateSession({ ".orca/runtime.yaml": AGENT_OVERLAY }),
+      stateRoot,
+    });
+    writeGovernedRepo();
+    await delegateGovernanceChange(registered, makeCtx(dir, true));
+
+    // The delegation is over and the governance document is untouched: the ONLY thing
+    // that lands it is the command below.
+    expect(readFileSync(join(dir, ".orca", "runtime.yaml"), "utf8")).toBe(USER_OVERLAY);
+
+    const approveCtx = makeCtx(dir, true);
+    await registered.commands.get("orca")!.handler("approve", approveCtx);
+
+    expect(readFileSync(join(dir, ".orca", "runtime.yaml"), "utf8")).toBe(AGENT_OVERLAY);
+    expect((approveCtx.ui.notify.mock.calls[0]?.[0] as string)).toContain(".orca/runtime.yaml");
+    // The decision is persisted as its own entry, so a resumed session recovers it.
+    const approvals = registered.appended.filter((e) => e.customType === APPROVAL_ENTRY_TYPE);
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0].data).toMatchObject({ outcome: "applied", v: 1 });
+
+    const statusCtx = makeCtx(dir, true);
+    await registered.commands.get("orca")!.handler("", statusCtx);
+    expect(orcaText(statusCtx)).not.toContain("awaiting your approval");
+    expect(orcaText(statusCtx)).toContain("APPROVED");
+  });
+
+  it("/orca approve refuses when the checkout moved, and says nothing landed", async () => {
+    const { pi, registered } = makeApi();
+    installOrca(pi as never, {
+      createSession: writingCreateSession({ ".orca/runtime.yaml": AGENT_OVERLAY }),
+      stateRoot,
+    });
+    writeGovernedRepo();
+    await delegateGovernanceChange(registered, makeCtx(dir, true));
+    // The user edits the governance file themselves before deciding.
+    writeFileSync(join(dir, ".orca", "runtime.yaml"), "schema_version: 1\n# mine\n");
+
+    const approveCtx = makeCtx(dir, true);
+    await registered.commands.get("orca")!.handler("approve", approveCtx);
+
+    expect(readFileSync(join(dir, ".orca", "runtime.yaml"), "utf8")).toBe(
+      "schema_version: 1\n# mine\n",
+    );
+    expect((approveCtx.ui.notify.mock.calls[0]?.[0] as string)).toMatch(/does not apply/i);
+    expect(approveCtx.ui.notify.mock.calls[0]?.[1]).toBe("warning");
+    // A refused attempt is recorded too — and the hold is still offered for approval.
+    const approvals = registered.appended.filter((e) => e.customType === APPROVAL_ENTRY_TYPE);
+    expect(approvals[0].data).toMatchObject({ outcome: "does_not_apply" });
+    const statusCtx = makeCtx(dir, true);
+    await registered.commands.get("orca")!.handler("", statusCtx);
+    expect(orcaText(statusCtx)).toContain("awaiting your approval");
+  });
+
+  it("/orca approve says so when nothing is held, and touches the repository not at all", async () => {
+    const { pi, registered } = makeApi();
+    orcaPi(pi as never);
+    writeGovernedRepo();
+    const before = snapshotTree(dir);
+
+    const ctx = makeCtx(dir, true);
+    await registered.commands.get("orca")!.handler("approve", ctx);
+
+    expect((ctx.ui.notify.mock.calls[0]?.[0] as string)).toMatch(/nothing is held/i);
+    expect(snapshotTree(dir)).toEqual(before);
+  });
+
+  it("registers a renderer for governance approval entries", () => {
+    const { pi, registered } = makeApi();
+    orcaPi(pi as never);
+    expect(registered.entryRenderers.has(APPROVAL_ENTRY_TYPE)).toBe(true);
+  });
+
+  it("does not give the model an approval tool — approval is the user's alone", () => {
+    const { pi, registered } = makeApi();
+    orcaPi(pi as never);
+    // The hold exists because an agent must not change the documents that govern the
+    // agents. A tool would let the very agent whose change was held approve it.
+    expect([...registered.tools.keys()]).toEqual(["orca_resolve", "orca_explain", "orca_delegate"]);
   });
 
   it("drives a full delegation headless without any UI calls", async () => {

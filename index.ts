@@ -48,11 +48,15 @@ import {
 } from "./src/session-runner";
 import { formatEnforcementSummary } from "./src/enforcement";
 import {
+  APPROVAL_ENTRY_TYPE,
   DELEGATION_ENTRY_TYPE,
   DelegationHistory,
   renderRecordLines,
+  toPersistedApproval,
   type PersistedDelegationRecord,
+  type PersistedGovernanceApproval,
 } from "./src/delegation-entry";
+import { approvalRecordLines, runApprovalAction } from "./src/approval";
 import {
   inflightFromProgress,
   progressLine,
@@ -197,6 +201,10 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
     // promotion gating is "not applicable" while it is gating every delegation.
     if (state.kind === "active") lines.push("", ...formatEnforcementSummary("1.1"));
     const sections = [
+      // A held governance change leads every other section: it is the one thing in the
+      // status surface that is waiting on the user to act, and the numbered list it prints
+      // is the list `/orca approve [n]` counts through (hardening plan, Phase 3).
+      history.pendingHoldLines(),
       routeLog.statusLines(),
       violations.statusLines(),
       history.statusLines(),
@@ -426,9 +434,34 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
 
   pi.registerCommand("orca", {
     description:
-      "Show Orca governance status, or set the requested mode: /orca mode advisory|enforce",
+      "Show Orca governance status, set the requested mode (/orca mode advisory|enforce), or land a " +
+      "held governance change (/orca approve [n])",
     handler: async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
       const [subcommand, ...rest] = args.trim().split(/\s+/).filter(Boolean);
+
+      // The explicit approval action (hardening plan, Phase 3): the ONLY runtime path
+      // from a held governance patch to the user's checkout, and deliberately a COMMAND
+      // rather than a tool — a tool would let the agent whose change was held approve it.
+      //
+      // The whole remainder is the selector, not just the first word, so a patch path
+      // containing a space still addresses its hold.
+      if (subcommand === "approve") {
+        const result = runApprovalAction({
+          cwd: ctx.cwd,
+          selector: rest.length > 0 ? rest.join(" ") : undefined,
+          holds: history.holds(),
+          now: Date.now(),
+        });
+        // Every attempt that reached git is persisted, refusals included: the decision (or
+        // the failed decision) belongs to the durable trail, and the history rebuild reads
+        // exactly these back. A selector that matched nothing produced no attempt.
+        if (result.approval) {
+          pi.appendEntry(APPROVAL_ENTRY_TYPE, toPersistedApproval(result.approval));
+          history.recordApproval(result.approval);
+        }
+        new Surface(ctx).notify(result.lines.join("\n"), result.level);
+        return;
+      }
 
       if (subcommand === "mode") {
         const requested = rest[0];
@@ -461,7 +494,18 @@ export function installOrca(pi: ExtensionAPI, overrides: OrcaOverrides = {}): vo
   // sole record of prior delegations. The renderer is pure over `entry.data`.
   pi.registerEntryRenderer<PersistedDelegationRecord>(DELEGATION_ENTRY_TYPE, (entry) => {
     const record = entry.data;
-    return record ? linesComponent(renderRecordLines(record)) : undefined;
+    // The approval is layered on from the live history rather than read off the entry: the
+    // delegation entry was written before the user decided, and the decision is its own
+    // entry (hardening plan, Phase 3).
+    return record
+      ? linesComponent(renderRecordLines(record, history.approvalFor(record)))
+      : undefined;
+  });
+
+  // The user's decision about a held governance change, rendered where they made it.
+  pi.registerEntryRenderer<PersistedGovernanceApproval>(APPROVAL_ENTRY_TYPE, (entry) => {
+    const approval = entry.data;
+    return approval ? linesComponent(approvalRecordLines(approval)) : undefined;
   });
 
   pi.registerTool(createResolveTool(toolDeps));
