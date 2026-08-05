@@ -10,7 +10,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { normalizeTarget } from "./paths";
 import { resolve, resolveEffective, type Resolution } from "./resolver";
-import { renderExplain, renderResolvePreview, summarizeResolution } from "./render";
+import {
+  promotionDetailLines,
+  promotionHeadline,
+  renderExplain,
+  renderResolvePreview,
+  summarizeResolution,
+} from "./render";
 import { formatStatusLines, type ActiveState, type RepositoryState } from "./state";
 import type { OperatingMode } from "./mode";
 import type { CheckpointStatus } from "./checkpoint";
@@ -366,20 +372,9 @@ function promotionLines(
   promotion: PromotionRecord,
   options: { label?: string; detail?: boolean } = {},
 ): string[] {
-  const label = options.label ?? "Promotion";
-  const headline: Record<PromotionRecord["status"], string> = {
-    promoted: `${label}: promoted — ${promotion.appliedPaths.length} path(s) applied to your checkout.`,
-    rejected: `${label}: REJECTED — nothing was applied; your checkout is unchanged.`,
-    conflict: `${label}: CONFLICT — nothing was applied; your checkout is unchanged.`,
-    not_attempted: `${label}: not attempted — nothing was applied; your checkout is unchanged.`,
-  };
-  const lines = [headline[promotion.status]];
+  const lines = [promotionHeadline(promotion, options.label)];
   if (options.detail === false) return lines;
-  for (const diagnostic of promotion.diagnostics) lines.push(`  ${diagnostic}`);
-  if (promotion.rejectedPaths.length > 0) {
-    lines.push(`  Unauthorized paths in the staged change: ${promotion.rejectedPaths.join(", ")}`);
-  }
-  return lines;
+  return [...lines, ...promotionDetailLines(promotion)];
 }
 
 /**

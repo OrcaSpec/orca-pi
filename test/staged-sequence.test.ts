@@ -563,6 +563,47 @@ describe("edges of the staged sequence", () => {
     expect(patch).toContain("apps/web/app.tsx");
   });
 
+  it("reports a conflict naming the file the user edited mid-sequence", async () => {
+    // The user has uncommitted work when the sequence starts — the state the children
+    // are staged from — and keeps editing it while they run (Phase 5).
+    writeFileSync(join(repo, "notes.md"), "my uncommitted draft\n");
+    const before = snapshotTree(repo);
+    const { createSession } = sessions({
+      billing: async (config) => {
+        await callTool(config, "write", { path: "services/billing/x.rb", content: "mine\n" });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      },
+      web: async (config) => {
+        writeFileSync(join(repo, "notes.md"), "my uncommitted draft, revised\n");
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "mine\n" });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      },
+    });
+
+    const sequence = await runDelegationSequence(
+      orderedFor(repo, ["apps/web/app.tsx", "services/billing/x.rb"]),
+      { createSession, stateRoot },
+    );
+
+    // Every owner completed, and the transaction still promotes nothing: the base it
+    // was computed against is gone.
+    expect(sequence.allCompleted).toBe(true);
+    expect(sequence.promotion.status).toBe("conflict");
+    expect(sequence.promotion.driftedPaths).toEqual(["notes.md"]);
+    expect(sequence.promotion.diagnostics.join("\n")).toContain("notes.md");
+    expect(snapshotTree(repo)).toEqual({ ...before, "notes.md": expect.any(String) });
+    // Both owners' work is recoverable from the one preserved patch, and each owner's
+    // own entry reports the sequence's conflict rather than a promotion of its share.
+    const patch = readFileSync(sequence.promotion.patchPath!, "utf8");
+    expect(patch).toContain("services/billing/x.rb");
+    expect(patch).toContain("apps/web/app.tsx");
+    for (const step of sequence.steps) {
+      if (step.kind !== "delegated") continue;
+      expect(step.outcome.promotion.status).toBe("conflict");
+      expect(step.outcome.promotion.appliedPaths).toEqual([]);
+    }
+  });
+
   it("stages nothing for a sequence with no owners at all", async () => {
     const { createSession, captured } = sessions({});
 

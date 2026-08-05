@@ -1,4 +1,5 @@
-import { rmSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as orcaspec from "orcaspec";
 import type { Model } from "@earendil-works/pi-ai";
@@ -251,6 +252,123 @@ describe("DelegationHistory rebuild from entries alone", () => {
     history.rebuildFrom([asEntry(a)]);
     history.rebuildFrom([asEntry(a)]);
     expect(history.count()).toBe(1);
+  });
+});
+
+describe("the promotion a record carries (staged-promotion plan, Phase 5)", () => {
+  let dir: string;
+  let stateRoot: string;
+  beforeEach(() => {
+    dir = makeGitRepo("orca-pi-promo-");
+    stateRoot = makeStateRoot();
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  async function recordFor(
+    paths: string[],
+    createSession: Parameters<typeof runDelegationSequence>[1]["createSession"],
+  ): Promise<PersistedDelegationRecord> {
+    const ordered = orderedFor(dir, paths);
+    const sequence = await runDelegationSequence(ordered, { createSession, stateRoot });
+    return buildDelegationRecord({
+      task: "align the buttons and bill for it",
+      targets: paths,
+      grantDigest: digestGrants(ordered.map((input) => input.grant)),
+      sequence,
+      startedAt: 1,
+      endedAt: 2,
+    });
+  }
+
+  it("records what reached the user's files, so a resumed session can still say", async () => {
+    const record = await recordFor(["apps/web/app.tsx"], completingSessions());
+
+    expect(record.promotion).toMatchObject({
+      status: "promoted",
+      appliedPaths: [],
+      driftedPaths: [],
+    });
+    expect(JSON.parse(JSON.stringify(record))).toEqual(record);
+  });
+
+  it("carries a conflict's drifted paths, patch pointer, and recovery hint", async () => {
+    // The user edits their own uncommitted file while the delegation runs.
+    writeFileSync(join(dir, "notes.md"), "my uncommitted draft\n");
+    const record = await recordFor(["apps/web/app.tsx"], async (config) => ({
+      prompt: async () => {
+        writeFileSync(join(dir, "notes.md"), "my uncommitted draft, revised\n");
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "delegated\n" });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      },
+      abort: () => {},
+    }));
+
+    expect(record.promotion).toMatchObject({
+      status: "conflict",
+      appliedPaths: [],
+      driftedPaths: ["notes.md"],
+    });
+    const patchPath = record.promotion!.patchPath!;
+    expect(existsSync(patchPath)).toBe(true);
+    // The durable record survives the session, and so must the route back to the work:
+    // it round-trips as plain JSON and still names the patch and how to apply it.
+    const persisted = JSON.parse(JSON.stringify(record)) as PersistedDelegationRecord;
+    expect(persisted.promotion).toEqual(record.promotion);
+    expect(persisted.promotion!.diagnostics.join("\n")).toContain(`git apply ${patchPath}`);
+  });
+
+  it("shows a conflict in the `/orca` history rather than letting it read as success", async () => {
+    writeFileSync(join(dir, "notes.md"), "my uncommitted draft\n");
+    const record = await recordFor(["apps/web/app.tsx"], async (config) => ({
+      prompt: async () => {
+        writeFileSync(join(dir, "notes.md"), "my uncommitted draft, revised\n");
+        await callTool(config, "write", { path: "apps/web/app.tsx", content: "delegated\n" });
+        await callTool(config, "orca_checkpoint", { status: "completed", summary: "done" });
+      },
+      abort: () => {},
+    }));
+
+    // Rebuilt from the persisted entry alone, exactly as a resumed session does.
+    const history = new DelegationHistory();
+    history.rebuildFrom([
+      { type: "custom", customType: DELEGATION_ENTRY_TYPE, data: JSON.parse(JSON.stringify(record)) },
+    ]);
+
+    // The compact line cannot read as a success: the owner completed and nothing landed.
+    const summary = history.statusLines().join("\n");
+    expect(summary).toContain("web=completed");
+    expect(summary).toContain("promotion: conflict");
+    // The detail names the drift, the preserved patch, and the way back to the work.
+    const detail = history.lastDetailLines().join("\n");
+    expect(detail).toContain("CONFLICT");
+    expect(detail).toContain("notes.md");
+    expect(detail).toContain(record.promotion!.patchPath!);
+    expect(detail).toMatch(/git apply /);
+  });
+
+  it("keeps a record from before promotions were persisted renderable", () => {
+    const legacy: PersistedDelegationRecord = {
+      v: DELEGATION_ENTRY_VERSION,
+      task: "an older delegation",
+      owners: ["web"],
+      targets: ["apps/web/app.tsx"],
+      grantDigest: "abc123",
+      steps: [
+        { owner: "web", status: "completed", summary: "done", changedPaths: ["apps/web/app.tsx"] },
+      ],
+      usage: usageOf(0, 0),
+      startedAt: 1,
+      endedAt: 2,
+    };
+
+    // No promotion field at all: the history says nothing about promotion rather than
+    // inventing a status for a delegation that never recorded one.
+    const rendered = renderRecordLines(legacy).join("\n");
+    expect(rendered).not.toMatch(/Promotion/);
+    expect(recordSummaryLine(legacy)).not.toMatch(/promotion/);
   });
 });
 

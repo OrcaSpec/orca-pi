@@ -1,4 +1,5 @@
 import type { ResolvedDelegation, Resolution, TargetReasoning } from "./resolver";
+import type { PromotionStatus } from "./staging";
 
 /**
  * Shared rendering for the two routing-preview tools. `orca_resolve` (model
@@ -20,6 +21,49 @@ export function formatGrant(delegation: ResolvedDelegation, indent = "    "): st
     `${indent}write.allow: ${list(write.allow)}`,
     `${indent}write.deny:  ${list(write.deny)}`,
   ];
+}
+
+/**
+ * The promotion facts every surface renders: the live {@link PromotionRecord} from
+ * a just-finished delegation and the flattened one a `/orca` history entry was
+ * rebuilt from both satisfy this shape, so both render through the two functions
+ * below and cannot disagree about what happened to the user's files.
+ */
+export interface PromotionView {
+  status: PromotionStatus;
+  appliedPaths: string[];
+  rejectedPaths: string[];
+  driftedPaths: string[];
+  patchPath?: string;
+  diagnostics: string[];
+}
+
+/**
+ * The one-line answer to "what reached my files". Every refusal says the same two
+ * things — nothing applied, checkout unchanged — because that is the fact a steward
+ * needs before any explanation of why.
+ */
+export function promotionHeadline(promotion: PromotionView, label = "Promotion"): string {
+  const headline: Record<PromotionStatus, string> = {
+    promoted: `${label}: promoted — ${promotion.appliedPaths.length} path(s) applied to your checkout.`,
+    rejected: `${label}: REJECTED — nothing was applied; your checkout is unchanged.`,
+    conflict: `${label}: CONFLICT — your checkout moved; nothing was applied.`,
+    not_attempted: `${label}: not attempted — nothing was applied; your checkout is unchanged.`,
+  };
+  return headline[promotion.status];
+}
+
+/**
+ * Why the promotion ended that way, in the gate's own words. The drifted paths and
+ * the preserved patch are not repeated as separate lines: the gate's diagnostics
+ * already name both, and a conflict's recovery hint is one of them.
+ */
+export function promotionDetailLines(promotion: PromotionView, indent = "  "): string[] {
+  const lines = promotion.diagnostics.map((diagnostic) => `${indent}${diagnostic}`);
+  if (promotion.rejectedPaths.length > 0) {
+    lines.push(`${indent}Unauthorized paths in the staged change: ${promotion.rejectedPaths.join(", ")}`);
+  }
+  return lines;
 }
 
 function delegationHeader(delegation: ResolvedDelegation): string {

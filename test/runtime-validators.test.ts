@@ -7,10 +7,12 @@ import type { DomainAgent, OrcaSpecDocument } from "orcaspec";
 import { compileGrant } from "../src/resolver";
 import {
   runDelegation,
+  runDelegationSequence,
   type DelegationInputs,
   type DelegationSession,
   type DelegationSessionConfig,
 } from "../src/delegation";
+import { buildDelegationRecord, digestGrants, renderRecordLines } from "../src/delegation-entry";
 import { git, makeGitRepo, makeStateRoot, snapshotTree } from "./git-fixture";
 
 /**
@@ -839,6 +841,59 @@ describe("a validator runs where the overlay says", () => {
       if (!result.ok) return;
       expect(result.outcome.promotion.validations[0].status).toBe("unavailable");
       expect(result.outcome.promotion.status).toBe("rejected");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("what a validator decided outlives the session", () => {
+  it("persists its identity and verdict into the record the `/orca` history renders", async () => {
+    const repo = repoWithApp();
+    const stateRoot = makeStateRoot();
+    try {
+      writeOverlay(repo, {
+        schema_version: 1,
+        validations: {
+          // The failure text is assembled at runtime so it exists ONLY in the
+          // validator's output, never in the declaration the record persists.
+          web: [nodeValidator("process.stderr.write('2 tests'+' failed');process.exit(3);")],
+        },
+      });
+      const { createSession } = sessions(writeAndComplete);
+      const ordered = [inputsFor(repo)];
+
+      const sequence = await runDelegationSequence(ordered, { createSession, stateRoot });
+      const record = buildDelegationRecord({
+        task: "restyle the button",
+        targets: ["apps/web/app.tsx"],
+        grantDigest: digestGrants(ordered.map((input) => input.grant)),
+        sequence,
+        startedAt: 1,
+        endedAt: 2,
+      });
+
+      expect(record.promotion).toMatchObject({ status: "rejected", appliedPaths: [] });
+      expect(record.promotion!.validations).toEqual([
+        {
+          agent: "web",
+          program: process.execPath,
+          args: ["-e", "process.stderr.write('2 tests'+' failed');process.exit(3);"],
+          status: "failed",
+          exitCode: 3,
+        },
+      ]);
+      // The durable record keeps the verdict, not the output: what a program printed is
+      // unbounded, so the record points at the preserved log instead of embedding it.
+      expect(JSON.stringify(record)).not.toContain("2 tests failed");
+      expect(existsSync(record.promotion!.validatorOutputPath!)).toBe(true);
+
+      const rendered = renderRecordLines(record).join("\n");
+      expect(rendered).toContain("REJECTED");
+      expect(rendered).toContain(`Validator (web): ${process.execPath} -e`);
+      expect(rendered).toContain("— failed (exit 3)");
+      expect(rendered).toContain(record.promotion!.validatorOutputPath!);
     } finally {
       rmSync(repo, { recursive: true, force: true });
       rmSync(stateRoot, { recursive: true, force: true });

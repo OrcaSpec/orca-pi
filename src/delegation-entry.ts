@@ -18,6 +18,8 @@ import {
   type UpstreamHandoff,
 } from "./delegation";
 import type { CapabilitySummary } from "./enforcement";
+import type { PromotionRecord, PromotionStatus, ValidatorStatus } from "./staging";
+import { promotionDetailLines, promotionHeadline } from "./render";
 
 /**
  * The persistent, versioned delegation record and the in-memory history rebuilt
@@ -49,6 +51,49 @@ export const DELEGATION_EVIDENCE_SCHEMA_VERSION = "1.1" as const;
 
 export interface PersistedShellActivity {
   commandDigest: string;
+}
+
+/**
+ * One declared validator's run, flattened for the durable record (staged-promotion
+ * plan, Phase 4, persisted in Phase 5). Identity and verdict only: the captured
+ * stdout/stderr are deliberately left out — they are unbounded and can contain
+ * anything the program printed — and {@link PersistedPromotion.validatorOutputPath}
+ * points at the preserved output instead.
+ */
+export interface PersistedValidatorRun {
+  agent: string;
+  program: string;
+  args: string[];
+  status: ValidatorStatus;
+  exitCode?: number;
+}
+
+/**
+ * The sequence's single promotion, flattened to plain JSON.
+ *
+ * This is what makes the durable record answer the question a steward actually has
+ * when they come back to a session: not "what did the agent do" but "what happened
+ * to MY files, and where is the work if it did not land". A `conflict` therefore
+ * persists both halves of its recovery — {@link driftedPaths} names what moved, and
+ * {@link diagnostics} carries the gate's own wording including the `git apply` hint
+ * pointing at {@link patchPath} — because the preserved patch outlives the session
+ * that produced it while nothing else remembers where it is.
+ *
+ * Only the SEQUENCE promotion is persisted, not each owner's view of it: a sequence
+ * promotes once, and a per-step copy would be the same record narrowed, which is
+ * derivable from the applied paths already on the steps.
+ */
+export interface PersistedPromotion {
+  status: PromotionStatus;
+  appliedPaths: string[];
+  rejectedPaths: string[];
+  driftedPaths: string[];
+  /** Where the patch was preserved when nothing was applied; absolute. */
+  patchPath?: string;
+  validations: PersistedValidatorRun[];
+  /** Where preserved validator output was written; absolute. */
+  validatorOutputPath?: string;
+  diagnostics: string[];
 }
 
 /** One owner's slot in a persisted sequence, flattened to plain JSON. */
@@ -107,6 +152,13 @@ export interface PersistedDelegationRecord {
   sequenceId?: string;
   assignmentGraph?: AssignmentGraph;
   integration?: IntegrationRecord;
+  /**
+   * What the sequence's one promotion did to the user's files. Optional because
+   * records written before promotions were persisted have none, and a record that
+   * never carried a promotion must render as silent rather than as some invented
+   * status ({@link renderRecordLines}).
+   */
+  promotion?: PersistedPromotion;
 }
 
 /**
@@ -176,6 +228,26 @@ function toPersistedStep(step: SequenceStep): PersistedStep {
   }
 }
 
+/** Flatten the sequence's promotion for the durable record. */
+function toPersistedPromotion(promotion: PromotionRecord): PersistedPromotion {
+  return {
+    status: promotion.status,
+    appliedPaths: [...promotion.appliedPaths],
+    rejectedPaths: [...promotion.rejectedPaths],
+    driftedPaths: [...promotion.driftedPaths],
+    patchPath: promotion.patchPath,
+    validations: promotion.validations.map((run) => ({
+      agent: run.agent,
+      program: run.program,
+      args: [...run.args],
+      status: run.status,
+      exitCode: run.exitCode,
+    })),
+    validatorOutputPath: promotion.validatorOutputPath,
+    diagnostics: [...promotion.diagnostics],
+  };
+}
+
 /** Inputs needed to persist one completed delegation sequence. */
 export interface BuildRecordInput {
   task: string;
@@ -214,6 +286,7 @@ export function buildDelegationRecord(input: BuildRecordInput): PersistedDelegat
     sequenceId: input.sequenceId,
     assignmentGraph: input.sequence.assignmentGraph,
     integration: input.integration,
+    promotion: toPersistedPromotion(input.sequence.promotion),
   };
 }
 
@@ -262,7 +335,14 @@ export function formatUsage(usage: DelegationUsage): string {
 export function recordSummaryLine(record: PersistedDelegationRecord): string {
   const statuses = record.steps.map((step) => `${step.owner}=${step.status}`).join(", ");
   const changed = record.steps.reduce((sum, step) => sum + step.changedPaths.length, 0);
-  return `  - "${truncate(record.task)}" — ${statuses} (${changed} changed; ${formatUsage(record.usage)})`;
+  // The promotion belongs on the compact line too: every owner can read `completed`
+  // while nothing at all reached the user's files, and a one-line history that omits
+  // that reads as a success it was not.
+  const promotion = record.promotion ? `promotion: ${record.promotion.status}; ` : "";
+  return (
+    `  - "${truncate(record.task)}" — ${statuses} ` +
+    `(${changed} changed; ${promotion}${formatUsage(record.usage)})`
+  );
 }
 
 /**
@@ -280,6 +360,24 @@ export function renderRecordLines(record: PersistedDelegationRecord): string[] {
     `Grant digest: ${record.grantDigest}`,
   ];
   if (record.sequenceId) lines.push(`Sequence identity: ${record.sequenceId}`);
+  // What happened to the user's own files comes before the per-owner detail: it is
+  // the sequence-level answer, and on a conflict it is also the only place the route
+  // back to the preserved work is written down. Rendered through the same helpers as
+  // the delegate tool's own output (`render.ts`), so the live report a steward reads
+  // when a delegation ends and the history they read afterwards cannot disagree.
+  if (record.promotion) {
+    lines.push(promotionHeadline(record.promotion));
+    lines.push(...promotionDetailLines(record.promotion));
+    for (const run of record.promotion.validations) {
+      lines.push(
+        `  Validator (${run.agent}): ${[run.program, ...run.args].join(" ")} — ${run.status}` +
+          `${run.exitCode === undefined ? "" : ` (exit ${run.exitCode})`}`,
+      );
+    }
+    if (record.promotion.validatorOutputPath) {
+      lines.push(`  Preserved validator output: ${record.promotion.validatorOutputPath}`);
+    }
+  }
   for (const step of record.steps) {
     const synth = step.synthesized ? " (synthesized checkpoint)" : "";
     lines.push(`  ${step.owner}: ${step.status}${synth}`);
